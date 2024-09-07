@@ -4,7 +4,7 @@ from typing import Any
 from agent import Agent
 
 
-class BaseLogistic(ABC):
+class Logistic(ABC):
     def __init__(self, service_agent:Agent):
         self.service_agent = service_agent
 

@@ -9,7 +9,6 @@ import uuid
 from broker import BrokerType
 from broker.notifier import BrokerNotifier
 from broker.broker_maker import BrokerMaker
-from logistic.base_logistic import BaseLogistic
 import system_config
 
 
@@ -21,30 +20,43 @@ class Agent(BrokerNotifier):
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         self.config = config
         self.name = f'<{self.__class__.__name__}>'
-        self.head_agents = []
-        self.body_agents = []
-        self.logistics = {}
+        self.interval_seconds = 0
         
         self._message_broker = None
-        self._run_interval_seconds = 1
-        self._topic_handlers = {}
+        self.__topic_handlers[str, function] = {}
+        self._parent = None
+        self._is_head = False
 
-
+        self.__head_agents = []
+        self.__body_agents = []
+        
+        
     @final
-    def register_logistic(self, logistic:BaseLogistic):
-        if not logistic.job_topic:
-            raise Exception("Logistic must define the job topic.")
-        self.logistics[logistic.job_topic] = logistic
-
+    def add_head_agent(self, agent:Agent):
+        agent._set_parent(self, True)
+        self.__head_agents.append(agent)
+        
+        
+    @final
+    def add_body_agent(self, agent:Agent):
+        agent._set_parent(self)
+        self.__body_agents.append(agent)
+    
+    
+    @final
+    def _set_parent(self, parent:Agent, is_head=False):
+        self._parent = parent
+        self._is_head = True
+        
         
     @final
     def start_process(self):
         self.__agent_proc = Process(target=self.__activate, args=(self.config,))
         self.__agent_proc.start()
         
-        for a in self.head_agents:
+        for a in self.__head_agents:
             a.start()
-        for a in self.body_agents:
+        for a in self.__body_agents:
             a.start()
 
         
@@ -53,15 +65,15 @@ class Agent(BrokerNotifier):
         self.__agent_proc = threading.Thread(target=self.__activate, args=(self.config,))
         self.__agent_proc.start()
         
-        for a in self.head_agents:
+        for a in self.__head_agents:
             a.start()
-        for a in self.body_agents:
+        for a in self.__body_agents:
             a.start()
 
 
-# ===========================
-#  Body of Process or Thread
-# ===========================
+# ==================
+#  Agent Activating
+# ==================
         
         
     def get_broker_type(self) -> BrokerType:
@@ -73,22 +85,65 @@ class Agent(BrokerNotifier):
     
     def get_config(self, key:str, default=None):
         return self.config.get(key, default)
+
+
+    def is_active(self):
+        return not self.__terminate_lock.is_set()
+
+
+    def on_activate(self):
+        pass
+
+
+    def on_terminating(self):
+        pass
+
+
+    def on_terminated(self):
+        pass
+
+
+    def on_begining(self):
+        pass
+
+
+    def on_began(self):
+        pass
+
+
+    def on_interval(self):
+        pass
         
     
     def set_config(self, key:str, value):
         self.config[key] = value
+        
+        
+    def start_interval_loop(self, interval_seconds):
+        logger.debug(f"{self.agent_id}> Start interval loop.")
+        self.interval_seconds = interval_seconds
+
+        def interval_loop():
+            while self.is_active() and self.interval_seconds > 0:
+                self.on_interval()
+                time.sleep(self.interval_seconds)
+            self.interval_seconds = 0
+        threading.Thread(target=interval_loop).start()
+        
+        
+    def stop_interval_loop(self):
+        self.interval_seconds = 0
 
 
     def __activate(self, config):
         self.config = config
         
-        self.__run_begin()
-        self.__running()
-        self.__run_end()
+        self.__activating()
+        self.on_active()
+        self.__deactivating()
 
 
-    def __run_begin(self):
-
+    def __activating(self):
         # Handle Ctrl-C to terminate agents
         def signal_handler(signal, frame):
             logger.warning(f"{self.short_id}> {self.name} Ctrl-C: {self.__class__.__name__}")
@@ -99,30 +154,84 @@ class Agent(BrokerNotifier):
         self.__databox = {}
         self.__databox_lock = threading.Lock()
         self.__terminate_lock = threading.Event()
-        short_id = self.agent_id[:-6]
             
         self.on_begining()
         
         # Create broker
-        logger.debug(f"{short_id}> Create broker.")
+        logger.debug(f"{self.agent_id}, Create broker.")
         if broker_type := self.get_broker_type():
             self._broker = BrokerMaker().create_broker(broker_type, self)
             self._broker.start(options=self.config)
+
+
+    def __deactivating(self):        
+        self.on_terminating()
         
-        # Start interval loop
-        logger.debug(f"{short_id}> Start interval loop.")
-        def interval_loop():
-            while not self.__terminate_lock.is_set():
-                self.on_interval()
-                time.sleep(self.__run_interval_seconds)
-        threading.Thread(target=interval_loop).start()
+        while self.is_active():
+            self.__terminate_lock.wait(1)
             
-        self.on_began()
+        self._broker.stop()
+        
+        self.on_terminated()
+        
+
+    @final
+    def terminate(self):
+        logger.warn(f"{self.agent_id}, {self.name}.")
+        self.__terminate_lock.set()
 
 
-    def is_running(self):
-        return not self._terminate_lock.is_set()
+# =====================
+#  Publish / Subscribe
+# =====================
+    def __get_inbound_topic(self, topic):
+        if self._parent:
+            return f'{topic}.{self._parent.agent_id}'
+        else:
+            return topic
 
+
+    def __get_outbound_topic(self, topic):
+        if self._parent:
+            if self._parent._parent:
+                return f'{topic}.{self._parent._parent.agent_id}'
+            else:
+                return topic
+        else:
+            return topic
+
+
+    @final
+    def _pubout(self, topic, data=None):
+        topic_concrete = self.__get_outbound_topic()
+        return self._broker.publish(topic_concrete, data)
+
+
+    @final
+    def _subout(self, topic, data_type="str", topic_handler=None):
+        topic_concrete = f'{topic}.{self._parent.agent_id}' if self._parent else topic
+        if topic_handler:
+            self.__topic_handlers[topic_concrete] = topic_handler
+        return self._broker.subscribe(topic_concrete, data_type)
+
+
+    @final
+    def _pubin(self, topic, data=None):
+        topic_concrete = f'{topic}.{self._parent.agent_id}' if self._parent else topic
+        return self._broker.publish(topic_concrete, data)
+
+
+    @final
+    def _subin(self, topic, data_type="str", topic_handler=None):
+        topic_concrete = f'{topic}.{self._parent.agent_id}' if self._parent else topic
+        if topic_handler:
+            self.__topic_handlers[topic] = topic_handler
+        return self._broker.subscribe(topic_concrete, data_type)
+        
+        
+    def _on_connect(self):
+        pass
+        
 
 # ==========
 #  Data Box
