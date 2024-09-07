@@ -34,7 +34,7 @@ class Agent(BrokerNotifier):
     @final
     def add_head_agent(self, agent:Agent):
         agent._set_parent(self, True)
-        self.__head_agents.append(agent)
+        self.__head_agents.append(HeadAgent(agent))
         
         
     @final
