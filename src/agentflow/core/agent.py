@@ -1,4 +1,5 @@
-import logging
+import inspect
+from logging import Logger
 from multiprocessing import Process
 import signal
 import threading
@@ -6,36 +7,46 @@ import time
 from typing import final
 import uuid
 
-from broker import BrokerType
-from broker.notifier import BrokerNotifier
-from broker.broker_maker import BrokerMaker
-import system_config
-
-
-logger = logging.getLogger(system_config.LOGGER_NAME)
-default_config = {
-    'start_method': 'process'
-}
+logger:Logger = __import__('agentflow').get_logger()
+from ..broker import BrokerType
+from ..broker.notifier import BrokerNotifier
+from ..broker.broker_maker import BrokerMaker
+from . import config
 
 
 class Agent(BrokerNotifier):
-    def __init__(self, config:dict):
+
+    def __init__(self, agent_config:dict={}):
+        logger.debug(f'self: {self}')
         self.agent_id = str(uuid.uuid4()).replace("-", "")
-        self.config = default_config.copy()
-        self.config.update(config)
+        self.__init_config(agent_config)
         self.name = f'<{self.__class__.__name__}>'
         self.interval_seconds = 0
         
         self._message_broker = None
-        self.__topic_handlers[str, function] = {}
+        self.__topic_handlers: dict[str, function] = {}
+        
+        
+    def __init_config(self, agent_config):
+        self.config = config.default_config.copy()
+        self.config.update(agent_config)
+        logger.debug(f'self.config: {self.config}')
+        
+        if proc := self.get_config(config.ON_ACTIVATE):
+            self.on_activate = proc
         
         
     @final
     def start(self):
-        if 'process' == self.config.get('start_method', 'process'):
-            self.__agent_proc = Process(target=self.__activate, args=(self.config,))
+        logger.debug(f'self: {self}')
+        logger.debug(f'self.config: {self.config}')
+        logger.verbose(f"__activate: {self._activate}")
+        logger.verbose(f"on_activate: {self.on_activate}")
+        
+        if 'process' == self.config.get(config.START_METHOD, 'process'):
+            self.__agent_proc = Process(target=self._activate, args=(self.config,))
         else:
-            self.__agent_proc = threading.Thread(target=self.__activate, args=(self.config,))
+            self.__agent_proc = threading.Thread(target=self._activate, args=(self.config,))
             
         self.__agent_proc.start()
 
@@ -102,12 +113,20 @@ class Agent(BrokerNotifier):
         self.interval_seconds = 0
 
 
-    def __activate(self, config):
+    def _activate(self, config):
         self.config = config
         
-        self.__activating()
-        self.on_active()
-        self.__deactivating()
+        # self.__activating()
+        
+        sig = inspect.signature(self.on_activate)
+        if len(sig.parameters) == 0:
+            self.on_activate()
+        elif isinstance(sig.parameters.get('self'), Agent):
+            self.on_activate(self)
+        else:
+            self.on_activate(self.config)
+
+        # self.__deactivating()
 
 
     def __activating(self):

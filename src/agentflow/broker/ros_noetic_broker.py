@@ -1,14 +1,12 @@
-import logging
-
 import rospy
 from std_msgs.msg import String, Int32, UInt8MultiArray
 
-from .. import system_config
-from broker.message_broker import MessageBroker
-from broker.notifier import BrokerNotifier
+from .. import LOGGER_NAME
+from .message_broker import MessageBroker
+from .notifier import BrokerNotifier
 
 
-logger = logging.getLogger(AbdiConfig.LOGGER_NAME)
+logger = __import__('agentflow').get_logger()
 
 
 class RosNoeticBroker(MessageBroker):

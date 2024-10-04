@@ -1,19 +1,11 @@
-import logging
-
-from .. import system_config
-from broker.message_broker import MessageBroker
-from broker.notifier import BrokerNotifier
+logger = __import__('agentflow').get_logger()
+from .message_broker import MessageBroker
+from .notifier import BrokerNotifier
 
 
-logger = logging.getLogger(AbdiConfig.LOGGER_NAME)
-
-
-class RosBroker(MessageBroker):
+class EmptyBroker(MessageBroker):
     def __init__(self, notifier:BrokerNotifier):
-        logger.info(f"Initialize...")
-        
         super().__init__(notifier=notifier)
-
 
 
     ###################################
@@ -22,11 +14,11 @@ class RosBroker(MessageBroker):
     
     
     def start(self, options:dict):
-        logger.info(f"Ros broker is starting...")
+        logger.info(f"Empty broker is starting. options:{options}")
        
 
     def stop(self):
-        logger.info(f"Ros broker is stopping...")
+        logger.info(f"Empty broker is stopping...")
 
 
     def publish(self, topic:str, payload):
@@ -34,4 +26,4 @@ class RosBroker(MessageBroker):
         
     
     def subscribe(self, topic:str, data_type):
-        logger.info(f"topic: {topic}")
+        logger.info(f"topic: {topic}, data_type: {data_type}")

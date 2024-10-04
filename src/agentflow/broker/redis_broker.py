@@ -1,11 +1,6 @@
-import logging
-
-from .. import system_config
-from broker.message_broker import MessageBroker
-from broker.notifier import BrokerNotifier
-
-
-logger = logging.getLogger(AbdiConfig.LOGGER_NAME)
+logger = __import__('agentflow').get_logger()
+from .message_broker import MessageBroker
+from .notifier import BrokerNotifier
 
 
 class RedisBroker(MessageBroker):

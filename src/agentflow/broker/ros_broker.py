@@ -1,16 +1,14 @@
-import logging
-
-from broker.message_broker import MessageBroker
-from broker.notifier import BrokerNotifier
-import system_config
+logger = __import__('agentflow').get_logger()
+from .message_broker import MessageBroker
+from .notifier import BrokerNotifier
 
 
-logger = logging.getLogger(system_config.LOGGER_NAME)
-
-
-class EmptyBroker(MessageBroker):
+class RosBroker(MessageBroker):
     def __init__(self, notifier:BrokerNotifier):
+        logger.info(f"Initialize...")
+        
         super().__init__(notifier=notifier)
+
 
 
     ###################################
@@ -19,11 +17,11 @@ class EmptyBroker(MessageBroker):
     
     
     def start(self, options:dict):
-        logger.info(f"Empty broker is starting. options:{options}")
+        logger.info(f"Ros broker is starting...")
        
 
     def stop(self):
-        logger.info(f"Empty broker is stopping...")
+        logger.info(f"Ros broker is stopping...")
 
 
     def publish(self, topic:str, payload):
@@ -31,4 +29,4 @@ class EmptyBroker(MessageBroker):
         
     
     def subscribe(self, topic:str, data_type):
-        logger.info(f"topic: {topic}, data_type: {data_type}")
+        logger.info(f"topic: {topic}")

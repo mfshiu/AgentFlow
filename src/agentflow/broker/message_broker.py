@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from broker.notifier import BrokerNotifier
+from .notifier import BrokerNotifier
 
 
 class MessageBroker(ABC):
