@@ -28,7 +28,7 @@ def _init_logging(logger, log_path: str, log_level):
 
     # 設定 Formatter
     formatter = logging.Formatter(
-        '%(levelname)1.1s %(asctime)s %(module)15s:%(lineno)03d %(funcName)15s) %(message)s',
+        '%(levelname)1.1s %(asctime)s.%(msecs)03d %(module)15s:%(lineno)03d %(funcName)15s) %(message)s',
         datefmt='%H:%M:%S')
 
     # File handler

@@ -1,5 +1,6 @@
 from . import BrokerType
 from .empty_broker import EmptyBroker
+from .message_broker import MessageBroker
 from .mqtt_broker import MqttBroker
 from .redis_broker import RedisBroker
 from .ros_broker import RosBroker
@@ -8,7 +9,7 @@ from .notifier import BrokerNotifier
 
 
 class BrokerMaker():
-    def create_broker(self, broker_type:BrokerType, notifier:BrokerNotifier):
+    def create_broker(self, broker_type:BrokerType, notifier:BrokerNotifier) -> MessageBroker:
         if broker_type is BrokerType.Redis:
             return RedisBroker(notifier)
         elif broker_type is BrokerType.MQTT:

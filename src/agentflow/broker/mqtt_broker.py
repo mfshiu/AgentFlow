@@ -40,13 +40,13 @@ class MqttBroker(MessageBroker):
         
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
-        if username := options.get("username"):
-            self._client.username_pw_set(username, options.get("password"))
         
-        self.host = options.get("host")
+        self.host = options.get("host", "localhost")
         self.port = options.get("port")
         self.keepalive = options.get("keepalive")
         # logger.debug(f"host:{host} port:{port} keep:{keepalive}")
+        if username := options.get("username"):
+            self._client.username_pw_set(username, options.get("password"))
         self._client.connect(self.host, self.port, self.keepalive)
         
         self._client.loop_start()
