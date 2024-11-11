@@ -5,43 +5,33 @@ import time
 logger = __import__('helper').get_logger()
 from agentflow.core.agent import Agent
 from agentflow.core import config
-from agentflow.core.config import ConfigName
+from agentflow.core.config import ConfigName, EventHandler
+from test_config import test_config
 
 
 def on_activate_a1(config):
     logger.verbose(f'config: {config}')
     
-    
+
 def on_activate_a2():
     logger.verbose(f'..')
-    
-    
-test_config = {
-    'version': '2',
-    "broker_type": "MQTT",
-    'username': 'eric',
-    'password': 'eric123',
-    'host': 'localhost',
-    'port': 1884,
-    "keepalive": 60,
-    # ConfigName.START_METHOD: 'thread'
-}
-    
+
+
     
 class AgentA(Agent):
     def __init__(self):
-        cfg = {ConfigName.ON_ACTIVATE: on_activate_a1}
-        cfg.update(test_config)
+        cfg = {EventHandler.ON_ACTIVATE: on_activate_a1}
+        # cfg.update(test_config)
         super().__init__(name='aaa', agent_config=test_config)
         
         
     def on_activate(self):
+        logger.debug(f'AgentA on_activate')
         def test_notify():
             time.sleep(2)
-            # self._notify_children('張學友 - 吻別 HQ', ('aaa', '222'), target_children=list(self._children.keys())[1], target_child_name='aaa.bbb')
+            self._notify_child(list(self._children.keys())[1], '巴登諾克', ('222', 'rrr'))
             # self._notify_children('張學友 - 吻別 HQ', ('aaa', '222'))
             # self._notify_parents('大獅-修音', {'bbb': 789})
-            self._notify_child(list(self._children.keys())[0], '毛豆', ('333', '2fff22'))
         threading.Thread(target=test_notify).start()
         
         
@@ -54,6 +44,14 @@ class AgentA(Agent):
 class AgentB(Agent):
     def __init__(self):
         super().__init__(name='aaa.bbb', agent_config=test_config)
+        
+        
+    def on_activate(self):
+        logger.debug(f'AgentB on_activate')
+
+
+    def on_parents(self, topic, info):
+        logger.debug(f'topic: {topic}, info: {info}')
     
     
 

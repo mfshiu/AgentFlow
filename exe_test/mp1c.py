@@ -5,7 +5,7 @@ import time
 logger = __import__('helper').get_logger()
 from agentflow.core.agent import Agent
 from agentflow.core import config
-from agentflow.core.config import ConfigName
+from agentflow.core.config import ConfigName, EventHandler
 
 
 def on_activate_a1(config):
@@ -23,13 +23,13 @@ test_config = {
     'host': 'localhost',
     'port': 1884,
     "keepalive": 60,
-    ConfigName.START_METHOD: 'thread'
+    # ConfigName.START_METHOD: 'thread'
 }
     
     
 class AgentParent(Agent):
     def __init__(self):
-        cfg = {ConfigName.ON_ACTIVATE: on_activate_a1}
+        cfg = {EventHandler.ON_ACTIVATE: on_activate_a1}
         cfg.update(test_config)
         super().__init__(name='aaa', agent_config=cfg)
         
@@ -56,7 +56,7 @@ class AgentChild(Agent):
     
     
 if __name__ == '__main__':
-    logger.debug(f'***** Test Multi-Parents Multi-Children *****')
+    logger.debug(f'***** Test Multi-Parents One Child *****')
     
     parents = []        
 
@@ -70,7 +70,8 @@ if __name__ == '__main__':
         a = AgentParent()
         a.start()
         parents.append(a)
-        AgentChild().start()
+    
+    AgentChild().start()
 
     time.sleep(1)
     while parents[0].is_active():

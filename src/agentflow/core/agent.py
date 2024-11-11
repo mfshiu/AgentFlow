@@ -13,7 +13,7 @@ from ..broker import BrokerType
 from ..broker.notifier import BrokerNotifier
 from ..broker.broker_maker import BrokerMaker
 from . import config
-from .config import ConfigName
+from .config import ConfigName, EventHandler
 from .agent_worker import Worker, ProcessWorker, ThreadWorker
 
 
@@ -54,14 +54,15 @@ class Agent(BrokerNotifier):
         self.config.update(agent_config)
         logger.debug(f'self.config: {self.config}')
         
-        if proc := self.get_config(ConfigName.ON_ACTIVATE):
-            # if not hasattr(self.on_activate, '__func__') or self.on_activate.__func__ is Agent.on_activate:
-            self.on_activate = proc
+        self.on_activate = self.get_config(EventHandler.ON_ACTIVATE, self.on_activate)
+        self.on_children = self.get_config(EventHandler.ON_CHILDREN, self.on_children)
+        self.on_parents = self.get_config(EventHandler.ON_PARENTS, self.on_parents)
+
 
     def start(self):
         logger.verbose(self.M())
         
-        if 'process' == self.config.get(ConfigName.START_METHOD, 'process'):
+        if 'process' == self.config.get(ConfigName.CONCURRENCY_TYPE, 'process'):
             self.__agent_worker = ProcessWorker(self)
         else:
             self.__agent_worker = ThreadWorker(self)
@@ -320,10 +321,12 @@ class Agent(BrokerNotifier):
             self._notify_children('register_parent')
             # self._notify_child(child_id, 'register_parent')
             
+        print("ZZZZZZZZZ")
         self.on_children(topic, info)
 
 
     def on_children(self, topic, info):
+        print("SSSSSSS")
         logger.verbose(f"topic: {topic}, info: {info}")
     
     
@@ -350,6 +353,7 @@ class Agent(BrokerNotifier):
 
 
     def on_parents(self, topic, info):
+        logger.debug(self.M(f"WWWWWWW"))
         logger.verbose(f"topic: {topic}, info: {info}")
     
     

@@ -5,7 +5,7 @@ import time
 logger = __import__('helper').get_logger()
 from agentflow.core.agent import Agent
 from agentflow.core import config
-from agentflow.core.config import ConfigName
+from agentflow.core.config import ConfigName, EventHandler
 
 
 def on_activate_a1(config):
@@ -29,14 +29,14 @@ test_config = {
     
 class AgentParent(Agent):
     def __init__(self):
-        cfg = {ConfigName.ON_ACTIVATE: on_activate_a1}
+        cfg = {EventHandler.ON_ACTIVATE: on_activate_a1}
         cfg.update(test_config)
         super().__init__(name='aaa', agent_config=cfg)
         
         
     def on_children(self, topic, info):
         # data = data.decode('utf-8', 'ignore')
-        logger.debug(f'topic: {topic}, info: {info}')
+        logger.debug(self.M(f'topic: {topic}, info: {info}'))
     
     
 
@@ -48,8 +48,9 @@ class AgentChild(Agent):
     def on_activate(self):
         def test_notify():
             time.sleep(2)
-            self._notify_children('張學友 - 吻別 HQ', ('aaa', '222'))
-            self._notify_parents('大獅-修音', {'bbb': 789})
+            self._notify_parent(list(self._parents.keys())[1], '銀杏颱風', {'Date': 'This Wednsday'})
+            # self._notify_children('張學友 - 吻別 HQ', ('aaa', '222'))
+            # self._notify_parents('大獅-修音', {'bbb': 789})
         
         threading.Thread(target=test_notify).start()
     
