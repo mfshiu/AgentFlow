@@ -34,7 +34,7 @@ class AgentParent(Agent):
         super().__init__(name='aaa', agent_config=cfg)
         
         
-    def on_children(self, topic, info):
+    def on_children_message(self, topic, info):
         # data = data.decode('utf-8', 'ignore')
         logger.debug(f'topic: {topic}, info: {info}')
     

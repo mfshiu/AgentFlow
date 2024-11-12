@@ -1,25 +1,27 @@
 from enum import Enum, auto
-
-
-
-class LowercaseStrEnum(Enum):
-    def _generate_next_value_(name, start, count, last_values):
-        return name
     
 
+class StrEnum(Enum):
+    def _generate_next_value_(name, start, count, last_values):
+        # print(name.lower())
+        return name
+        # return str(name).lower()
 
-class ConfigName(LowercaseStrEnum):
-    CONCURRENCY_TYPE = auto()
 
 
-
-class EventHandler(Enum):
+class EventHandler(StrEnum):
     ON_ACTIVATE = auto()
-    ON_PARENTS = auto()
-    ON_CHILDREN = auto()
+    ON_CHILDREN_MESSAGE = auto()
+    ON_PARENTS_MESSAGE = auto()
+    ON_REGISTER_CHILD = auto()
+    ON_REGISTER_PARENT = auto()
 
+
+
+# Config Names
+CONCURRENCY_TYPE = 'CONCURRENCY_TYPE'
 
 
 default_config = {
-    ConfigName.CONCURRENCY_TYPE: ConfigName.CONCURRENCY_TYPE,
+    CONCURRENCY_TYPE: 'process',
 }

@@ -6,11 +6,12 @@ import agentflow  # 假設 agentflow 是您自定義的套件
 
 
 LOGGING_LEVEL_VERBOSE = int(logging.DEBUG / 2)
-# LOGGING_LEVEL = logging.DEBUG
-LOGGING_LEVEL = LOGGING_LEVEL_VERBOSE
 
+LOGGING_LEVEL = LOGGING_LEVEL_VERBOSE
+LOGGING_LEVEL = logging.DEBUG
 
 logging.addLevelName(LOGGING_LEVEL_VERBOSE, "VERBOSE")
+
 
 # Define a helper method for logging at VERBOSE level
 def verbose(self, message, *args, **kwargs):
@@ -51,6 +52,10 @@ def _init_logging(logger, log_path: str, log_level):
     return logger
 
 
+def get_logger():
+    return __logger
+
+
 # 初始化 agentflow 套件的 logger
 def setup_agentflow_logger(logger_name, log_level):
     # 通知 agentflow 使用特定 logger 名稱
@@ -62,9 +67,5 @@ def setup_agentflow_logger(logger_name, log_level):
     return _init_logging(logger, log_path, log_level)
 
 
-__logger = setup_agentflow_logger('Test', LOGGING_LEVEL)
+__logger = setup_agentflow_logger(agentflow.LOGGER_NAME, LOGGING_LEVEL)
 __logger.info(f"Logger initialized, name: {__logger.name}")
-
-
-def get_logger():
-    return __logger

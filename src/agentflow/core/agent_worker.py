@@ -44,7 +44,7 @@ class ProcessWorker(Worker):
         
 
     def start(self):
-        logger.debug(self.initiator_agent.M("Process worker."))
+        logger.debug(self.initiator_agent.M(f"self.initiator_agent: {self.initiator_agent}"))
         self.work_queue = multiprocessing.Queue()
         self.terminate_event = multiprocessing.Event()
         

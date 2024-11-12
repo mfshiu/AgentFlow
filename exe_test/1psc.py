@@ -35,7 +35,7 @@ class AgentA(Agent):
         threading.Thread(target=test_notify).start()
         
         
-    def on_children(self, topic, info):
+    def on_children_message(self, topic, info):
         # data = data.decode('utf-8', 'ignore')
         logger.debug(f'topic: {topic}, info: {info}')
     
@@ -50,7 +50,7 @@ class AgentB(Agent):
         logger.debug(f'AgentB on_activate')
 
 
-    def on_parents(self, topic, info):
+    def on_parents_message(self, topic, info):
         logger.debug(f'topic: {topic}, info: {info}')
     
     
@@ -60,7 +60,7 @@ class AgentC(Agent):
         super().__init__(name='aaa.bbb.ccc', agent_config=test_config)
         
         
-    def on_parents(self, topic, info):
+    def on_parents_message(self, topic, info):
         # data = data.decode('utf-8', 'ignore')
         logger.debug(f'topic: {topic}, info: {info}')
     

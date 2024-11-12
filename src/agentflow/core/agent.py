@@ -13,7 +13,7 @@ from ..broker import BrokerType
 from ..broker.notifier import BrokerNotifier
 from ..broker.broker_maker import BrokerMaker
 from . import config
-from .config import ConfigName, EventHandler
+from .config import EventHandler
 from .agent_worker import Worker, ProcessWorker, ThreadWorker
 
 
@@ -23,6 +23,7 @@ logger:Logger = __import__('agentflow').get_logger()
 
 class Agent(BrokerNotifier):
 
+
     def __init__(self, name:str, agent_config:dict={}):
         logger.debug(f'name: {name}, agent_config: {agent_config}')
         
@@ -30,8 +31,8 @@ class Agent(BrokerNotifier):
         logger.debug(f'agent_id: {self.agent_id}')
         self.__init_config(agent_config)
         self.name = name
-        self.tag = f'{self.agent_id[-4:]}'
-        self.long_tag = f'{name}-{self.tag}'
+        self.tag = f'{self.agent_id[:4]}'
+        self.name_tag = f'{name}:{self.tag}'
         self.parent_name = name.rsplit('.', 1)[0] if '.' in name else None
         self.interval_seconds = 0
         self.__agent_worker: Worker = None
@@ -55,24 +56,46 @@ class Agent(BrokerNotifier):
         logger.debug(f'self.config: {self.config}')
         
         self.on_activate = self.get_config(EventHandler.ON_ACTIVATE, self.on_activate)
-        self.on_children = self.get_config(EventHandler.ON_CHILDREN, self.on_children)
-        self.on_parents = self.get_config(EventHandler.ON_PARENTS, self.on_parents)
+        self.on_children_message = self.get_config(EventHandler.ON_CHILDREN_MESSAGE, self.on_children_message)
+        self.on_parents_message = self.get_config(EventHandler.ON_PARENTS_MESSAGE, self.on_parents_message)
+        self.on_register_child = self.get_config(EventHandler.ON_REGISTER_CHILD, self.on_register_child)
+        self.on_register_parent = self.get_config(EventHandler.ON_REGISTER_PARENT, self.on_register_parent)
 
 
     def start(self):
-        logger.verbose(self.M())
-        
-        if 'process' == self.config.get(ConfigName.CONCURRENCY_TYPE, 'process'):
-            self.__agent_worker = ProcessWorker(self)
+        logger.info(self.M(f"self.config: {self.config}"))
+        co_type = self.config.get(config.CONCURRENCY_TYPE, 'process')
+        logger.info(self.M(f"CONCURRENCY_TYPE: {co_type}"))
+        if 'process' == co_type:
+            self.start_process()
         else:
-            self.__agent_worker = ThreadWorker(self)
-            
+            self.start_thread()
+        
+        
+    def start_process(self):
+        logger.info(self.M(f'start_process'))
+        self.__agent_worker = ProcessWorker(self)
+        self.__agent_worker.start()
+        
+        
+    def start_thread(self):
+        logger.info(self.M(f'start_thread'))
+        self.__agent_worker = ThreadWorker(self)
         self.__agent_worker.start()
 
 
     def terminate(self):
-        logger.debug(self.M())
-        self.__agent_worker.stop()
+        logger.info(self.M(f"self.__agent_worker: {self.__agent_worker}"))
+        
+        if self.__agent_worker:
+            self.__agent_worker.stop()
+        else:
+            logger.warning(self.M(f"The agent might not have started yet."))
+        
+        # if self.__agent_worker:
+        #     self.__agent_worker.stop()
+        # else:
+        #     self._terminate()
 
 
 
@@ -259,7 +282,7 @@ class Agent(BrokerNotifier):
 # =====================
     @final
     def _publish(self, topic, data=None):
-        logger.verbose(f"topic: {topic}")
+        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
         
         if isinstance(data, dict):
             try:
@@ -280,6 +303,7 @@ class Agent(BrokerNotifier):
     
     
     def __register_child(self, child_id:str, child_info:dict):
+        child_info['parent_id'] = self.agent_id
         self._children[child_id] = child_info
         logger.info(self.M(f"Add a child: {child_id}, total: {len(self._children)}"))
         self.on_register_child(child_id, child_info)
@@ -290,6 +314,7 @@ class Agent(BrokerNotifier):
     
     
     def __register_parent(self, parent_id:str, parent_info):
+        parent_info['child_id'] = self.agent_id
         self._parents[parent_id] = parent_info
         logger.info(self.M(f"Add a parent: {parent_id}, total: {len(self._parents)}"))
         self.on_register_parent(parent_id, parent_info)
@@ -318,15 +343,12 @@ class Agent(BrokerNotifier):
 
         if "register_child" == info['subject']:
             self.__register_child(child_id, info)
-            self._notify_children('register_parent')
-            # self._notify_child(child_id, 'register_parent')
+            self._notify_child(child_id, 'register_parent')
             
-        print("ZZZZZZZZZ")
-        self.on_children(topic, info)
+        self.on_children_message(topic, info)
 
 
-    def on_children(self, topic, info):
-        print("SSSSSSS")
+    def on_children_message(self, topic, info):
         logger.verbose(f"topic: {topic}, info: {info}")
     
     
@@ -349,11 +371,10 @@ class Agent(BrokerNotifier):
         elif "register_parent" == info['subject']:
             self.__register_parent(info.get('parent_id'), info)
             
-        self.on_parents(topic, info)
+        self.on_parents_message(topic, info)
 
 
-    def on_parents(self, topic, info):
-        logger.debug(self.M(f"WWWWWWW"))
+    def on_parents_message(self, topic, info):
         logger.verbose(f"topic: {topic}, info: {info}")
     
     
@@ -455,5 +476,5 @@ class Agent(BrokerNotifier):
         
         
     def M(self, message=None):
-        return f'{self.long_tag} {message}' if message else self.long_tag
+        return f'{self.name_tag} {message}' if message else self.name_tag
             
