@@ -52,11 +52,14 @@ class Agent(BrokerNotifier):
         self.config.update(agent_config)
         logger.debug(f'self.config: {self.config}')
         
-        self.on_activate = self.get_config(EventHandler.ON_ACTIVATE, self.on_activate)
-        self.on_children_message = self.get_config(EventHandler.ON_CHILDREN_MESSAGE, self.on_children_message)
-        self.on_parents_message = self.get_config(EventHandler.ON_PARENTS_MESSAGE, self.on_parents_message)
-        self.on_register_child = self.get_config(EventHandler.ON_REGISTER_CHILD, self.on_register_child)
-        self.on_register_parent = self.get_config(EventHandler.ON_REGISTER_PARENT, self.on_register_parent)
+        # for event in EventHandler:
+        #     setattr(self, str(event).lower(), self.get_config(event, getattr(self, str(event).lower(), None)))
+        # self.on_activate = self.get_config(EventHandler.ON_ACTIVATE, self.on_activate)
+        # self.on_children_message = self.get_config(EventHandler.ON_CHILDREN_MESSAGE, self.on_children_message)
+        # self.on_message = self.get_config(EventHandler.ON_MESSAGE, self.on_message)
+        # self.on_parents_message = self.get_config(EventHandler.ON_PARENTS_MESSAGE, self.on_parents_message)
+        # self.on_register_child = self.get_config(EventHandler.ON_REGISTER_CHILD, self.on_register_child)
+        # self.on_register_parent = self.get_config(EventHandler.ON_REGISTER_PARENT, self.on_register_parent)
 
 
     def start(self):
@@ -278,7 +281,7 @@ class Agent(BrokerNotifier):
 # =====================
     @final
     def _publish(self, topic, data=None):
-        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
+        logger.debug(self.M(f"topic: {topic}, data: {data}"))
         
         if isinstance(data, dict):
             try:
@@ -292,7 +295,7 @@ class Agent(BrokerNotifier):
 
     @final
     def _subscribe(self, topic, data_type:str="str", topic_handler=None):
-        logger.debug(f"topic: {topic}, data_type:{data_type}")
+        logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
         
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
@@ -445,6 +448,10 @@ class Agent(BrokerNotifier):
         
         
     def _on_connect(self):
+        for event in EventHandler:
+            attr_name = str(event).lower()[len('EventHandler.'):]
+            setattr(self, attr_name, self.get_config(event, getattr(self, attr_name, None)))
+
         self._subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children)  # All the parents were notified by the children.
         self._subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children)  # I was the only parent notified by a child.  
         
@@ -473,7 +480,7 @@ class Agent(BrokerNotifier):
 
 
     def on_connected(self):
-        pass
+        logger.debug(self.M('on_connected'))
 
 
     def on_message(self, topic:str, data):

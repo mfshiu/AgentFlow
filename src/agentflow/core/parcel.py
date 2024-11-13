@@ -2,7 +2,7 @@ import json
 import pickle
 
 
-VERSION = "1"
+VERSION = "2"
 
 
 class Parcel():
@@ -26,6 +26,18 @@ class Parcel():
         
     def __wrap_json(self):
         return json.dumps(self.managed_data)
+    
+    
+    def from_bytes(payload):
+        parcel = Parcel()
+        parcel.load_bytes(payload)
+        return parcel
+    
+    
+    def from_text(payload):
+        parcel = Parcel()
+        parcel.load_text(payload)
+        return parcel
     
     
     def load_bytes(self, payload):

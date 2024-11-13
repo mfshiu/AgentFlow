@@ -12,6 +12,8 @@ class StrEnum(Enum):
 class EventHandler(StrEnum):
     ON_ACTIVATE = auto()
     ON_CHILDREN_MESSAGE = auto()
+    ON_CONNECTED = auto()
+    ON_MESSAGE = auto()
     ON_PARENTS_MESSAGE = auto()
     ON_REGISTER_CHILD = auto()
     ON_REGISTER_PARENT = auto()

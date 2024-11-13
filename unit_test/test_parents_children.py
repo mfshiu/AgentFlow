@@ -10,8 +10,7 @@ from agentflow.core.config import EventHandler
 from unit_test.config_test import config_test
 
 from logging import Logger
-from AgentFlow import log_helper
-logger:Logger = log_helper.get_logger()
+logger:Logger = __import__('AgentFlow').get_logger()
 
 
 
