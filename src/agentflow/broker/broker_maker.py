@@ -8,8 +8,15 @@ from .ros_broker import RosBroker
 from .notifier import BrokerNotifier
 
 
+from logging import Logger
+logger:Logger = __import__('agentflow').get_logger()
+
+
+
 class BrokerMaker():
     def create_broker(self, broker_type:BrokerType, notifier:BrokerNotifier) -> MessageBroker:
+        logger.debug(f'broker_type: {broker_type}')
+        
         if broker_type is BrokerType.Redis:
             return RedisBroker(notifier)
         elif broker_type is BrokerType.MQTT:

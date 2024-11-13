@@ -2,7 +2,7 @@ import logging
 import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-import agentflow  # 假設 agentflow 是您自定義的套件
+import agentflow
 
 
 LOGGING_LEVEL_VERBOSE = int(logging.DEBUG / 2)
@@ -52,20 +52,12 @@ def _init_logging(logger, log_path: str, log_level):
     return logger
 
 
+logger_name = os.getenv("LOGGER_NAME", agentflow.LOGGER_NAME)
+__logger = _init_logging(logging.getLogger(logger_name), 
+                         f'./_log/{logger_name}.log', 
+                         LOGGING_LEVEL)
+__logger.info(f"Logger initialized, name: {__logger.name}")
+
+
 def get_logger():
     return __logger
-
-
-# 初始化 agentflow 套件的 logger
-def setup_agentflow_logger(logger_name, log_level):
-    # 通知 agentflow 使用特定 logger 名稱
-    agentflow.initialize_logger(logger_name)
-    
-    # 創建對應的 logger
-    logger = logging.getLogger(logger_name)
-    log_path = f'./_log/{logger_name}.log'
-    return _init_logging(logger, log_path, log_level)
-
-
-__logger = setup_agentflow_logger(agentflow.LOGGER_NAME, LOGGING_LEVEL)
-__logger.info(f"Logger initialized, name: {__logger.name}")

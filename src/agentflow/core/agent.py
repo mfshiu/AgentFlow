@@ -1,8 +1,6 @@
-import importlib
 import inspect
 import json
 from logging import Logger
-import multiprocessing
 import queue
 import threading
 import time 
@@ -22,9 +20,8 @@ logger:Logger = __import__('agentflow').get_logger()
 
 
 class Agent(BrokerNotifier):
-
-
     def __init__(self, name:str, agent_config:dict={}):
+        print(agent_config)
         logger.debug(f'name: {name}, agent_config: {agent_config}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
@@ -102,21 +99,20 @@ class Agent(BrokerNotifier):
 # ==================
 #  Agent Activating
 # ==================
-
-
-    def get_broker_type(self) -> BrokerType:
-        if broker_type := self.get_config("broker_type"):
-            return BrokerType(broker_type.lower())
-        else:
-            return BrokerType.Empty
-        
-    
     def get_config(self, key:str, default=None):
         return self.config.get(key, default)
         
     
     def set_config(self, key:str, value):
         self.config[key] = value
+        
+    
+    def get_config2(self, key:str, key2:str, default=None):
+        return self.config[key].get(key2, default)
+        
+    
+    def set_config2(self, key:str, key2:str, value):
+        self.config[key][key2] = value
 
 
     def is_active(self):
@@ -172,20 +168,20 @@ class Agent(BrokerNotifier):
         self.on_begining()
 
         # Create broker
-        logger.debug(f"{self.agent_id}, Create broker.")
+        broker_config = self.get_config("broker", {'broker_type': BrokerType.Empty})
+        logger.debug(self.M(f"broker_config: {broker_config}"))
+        self._broker = BrokerMaker().create_broker(BrokerType(broker_config['broker_type'].lower()), self)
         is_success = True
-        if broker_type := self.get_broker_type():
-            self._broker = BrokerMaker().create_broker(broker_type, self)
-            try:
-                logger.debug(self.M("Ready to start broker.."))
-                self._broker.start(options=self.config)
-            except ConnectionRefusedError:
-                logger.error(self.M("Broker startup failed."))
-                is_success = False
-            except Exception as ex:
-                logger.exception(ex)
-                logger.error(self.M("Broker startup failed."))
-                is_success = False
+        try:
+            logger.debug(self.M("Ready to start broker.."))
+            self._broker.start(options=broker_config)
+        except ConnectionRefusedError:
+            logger.error(self.M("Broker startup failed."))
+            is_success = False
+        except Exception as ex:
+            logger.exception(ex)
+            logger.error(self.M("Broker startup failed."))
+            is_success = False
                 
         logger.verbose(self.M("end"))
         return is_success
@@ -295,8 +291,12 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def _subscribe(self, topic, data_type="str", topic_handler=None):
-        logger.verbose(f"topic: {topic}")
+    def _subscribe(self, topic, data_type:str="str", topic_handler=None):
+        logger.debug(f"topic: {topic}, data_type:{data_type}")
+        
+        if not isinstance(data_type, str):
+            raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
+        
         if topic_handler:
             self.__topic_handlers[topic] = topic_handler
         return self._broker.subscribe(topic, data_type)
@@ -395,7 +395,7 @@ class Agent(BrokerNotifier):
         logger.debug(self.M(f"subject: {subject}, data: {data}"))
         
         if not self._children:
-            logger.warning(self.M('No child.'))
+            logger.verbose(self.M('No child.'))
             return
         
         topic = f'to_child.{self.name}'
@@ -454,12 +454,17 @@ class Agent(BrokerNotifier):
             self._subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
             self._subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
-            
-        self.on_connected()
+        
+        try:
+            self.on_connected()
+        except Exception as ex:
+            logger.exception(ex)
 
 
     @final
     def _on_message(self, topic:str, data):
+        logger.verbose(self.M(f"topic: {topic}, __topic_handlers: {self.__topic_handlers}"))
+        
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
         if topic_handler:
             topic_handler(topic, data)

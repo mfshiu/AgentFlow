@@ -112,7 +112,7 @@ class TestAgent(unittest.TestCase):
 
 
     def test_1(self):
-        time.sleep(2)
+        time.sleep(3)
 
         try:
             self._do_test_1()
