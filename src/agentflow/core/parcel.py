@@ -6,13 +6,15 @@ VERSION = "2"
 
 
 class Parcel():
-    def __init__(self, content=None):
+    def __init__(self, content=None, home_topic=None):
         self.managed_data = {
             'version': VERSION,
             'content': content,
-            'home_topic': None
+            'home_topic': home_topic
         }
         
+        self.content = content
+        self.home_topic = home_topic
         self.wrap = self.__wrap_binary if content and Parcel.__is_binary_content(content) else self.__wrap_json
         
         
@@ -52,3 +54,9 @@ class Parcel():
 
     def payload(self):
         return self.wrap()
+    
+    def get(self, key, default=None):
+        return self.managed_data.get(key, default)
+    
+    def set(self, key, value):
+        return self.managed_data.set(key, value)
