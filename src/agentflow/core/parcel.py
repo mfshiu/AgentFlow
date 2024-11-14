@@ -7,15 +7,23 @@ VERSION = "2"
 
 class Parcel():
     def __init__(self, content=None, home_topic=None):
-        self.managed_data = {
+        self.managed_data = dict()
+        self.content = None
+        self.home_topic:str = None
+        self.wrap = self.__wrap_json
+
+        self.__set_managed_data({
             'version': VERSION,
             'content': content,
             'home_topic': home_topic
-        }
+        })        
         
-        self.content = content
-        self.home_topic = home_topic
-        self.wrap = self.__wrap_binary if content and Parcel.__is_binary_content(content) else self.__wrap_json
+        
+    def __set_managed_data(self, managed_data):
+        self.managed_data = managed_data
+        self.content = managed_data.get('content')
+        self.home_topic = managed_data.get('home_topic')
+        self.wrap = self.__wrap_binary if self.content and Parcel.__is_binary_content(self.content) else self.__wrap_json
         
         
     def __is_binary_content(content):
@@ -43,20 +51,20 @@ class Parcel():
     
     
     def load_bytes(self, payload):
-        self.managed_data = pickle.loads(payload)  
-        self.wrap = self.__wrap_binary
+        self.__set_managed_data(pickle.loads(payload))
 
 
     def load_text(self, payload):
-        self.managed_data = json.loads(payload)  
-        self.wrap = self.__wrap_json
+        self.__set_managed_data(json.loads(payload))
 
 
     def payload(self):
         return self.wrap()
     
+    
     def get(self, key, default=None):
         return self.managed_data.get(key, default)
     
+    
     def set(self, key, value):
-        return self.managed_data.set(key, value)
+        self.managed_data[key] = value

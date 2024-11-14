@@ -281,7 +281,7 @@ class Agent(BrokerNotifier):
 # =====================
     @final
     def _publish(self, topic, data=None):
-        logger.debug(self.M(f"topic: {topic}, data: {data}"))
+        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
         
         if isinstance(data, dict):
             try:
