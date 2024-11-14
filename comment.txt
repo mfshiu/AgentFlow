@@ -1,5 +1,7 @@
 python -m unittest discover -s unit_test
+python -m unittest unit_test/test_parents_children_count.py
 python -m unittest unit_test/test_parents_children.py
+python -m unittest unit_test/test_parcel.py
 
 
 test_config_bulldog = {
