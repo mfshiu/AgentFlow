@@ -72,7 +72,7 @@ class TestAgent(unittest.TestCase):
                 TestAgent.children_count = int(data)
             else:
                 TestAgent.parents_count = int(data)
-        
+
 
 
     def setUp(self):

@@ -51,37 +51,36 @@ class Agent(BrokerNotifier):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
         logger.debug(f'self.config: {self.config}')
+            
+            
+    def __create_worker(self):
+        if 'process' == self.config[config.CONCURRENCY_TYPE]:
+            return ProcessWorker(self)
+        else:
+            return ThreadWorker(self)
         
-        # for event in EventHandler:
-        #     setattr(self, str(event).lower(), self.get_config(event, getattr(self, str(event).lower(), None)))
-        # self.on_activate = self.get_config(EventHandler.ON_ACTIVATE, self.on_activate)
-        # self.on_children_message = self.get_config(EventHandler.ON_CHILDREN_MESSAGE, self.on_children_message)
-        # self.on_message = self.get_config(EventHandler.ON_MESSAGE, self.on_message)
-        # self.on_parents_message = self.get_config(EventHandler.ON_PARENTS_MESSAGE, self.on_parents_message)
-        # self.on_register_child = self.get_config(EventHandler.ON_REGISTER_CHILD, self.on_register_child)
-        # self.on_register_parent = self.get_config(EventHandler.ON_REGISTER_PARENT, self.on_register_parent)
+        
+    def _get_worker(self):
+        if not self.__agent_worker:
+            self.__agent_worker = self.__create_worker()
+        return self.__agent_worker
 
 
     def start(self):
+        if not config.CONCURRENCY_TYPE in self.config:
+            self.config[config.CONCURRENCY_TYPE] = 'process'
         logger.info(self.M(f"self.config: {self.config}"))
-        co_type = self.config.get(config.CONCURRENCY_TYPE, 'process')
-        logger.info(self.M(f"CONCURRENCY_TYPE: {co_type}"))
-        if 'process' == co_type:
-            self.start_process()
-        else:
-            self.start_thread()
+        self._get_worker().start()
         
         
     def start_process(self):
-        logger.info(self.M(f'start_process'))
-        self.__agent_worker = ProcessWorker(self)
-        self.__agent_worker.start()
+        self.config[config.CONCURRENCY_TYPE] = 'process'
+        self.start()
         
         
     def start_thread(self):
-        logger.info(self.M(f'start_thread'))
-        self.__agent_worker = ThreadWorker(self)
-        self.__agent_worker.start()
+        self.config[config.CONCURRENCY_TYPE] = 'thread'
+        self.start()
 
 
     def terminate(self):
@@ -91,11 +90,6 @@ class Agent(BrokerNotifier):
             self.__agent_worker.stop()
         else:
             logger.warning(self.M(f"The agent might not have started yet."))
-        
-        # if self.__agent_worker:
-        #     self.__agent_worker.stop()
-        # else:
-        #     self._terminate()
 
 
 
@@ -279,6 +273,13 @@ class Agent(BrokerNotifier):
 # =====================
 #  Publish / Subscribe
 # =====================
+    class DataEvent:
+        def __init__(self, event):
+            self.event = event
+            self.data = None
+
+
+
     @final
     def _publish(self, topic, data=None):
         logger.verbose(self.M(f"topic: {topic}, data: {data}"))
@@ -294,6 +295,28 @@ class Agent(BrokerNotifier):
 
 
     @final
+    def _publish_sync(self, topic, data, topic_wait, timeout=10):
+        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
+        
+        data_event = Agent.DataEvent(self._get_worker().create_event())
+        
+        def handle_response(topic_resp, data_resp):
+            logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {data_resp}"))
+            data_event.data = data_resp
+            data_event.event.set()
+            
+        self._subscribe(topic_wait, topic_handler=handle_response)
+        self._publish(topic, data)
+        
+        logger.verbose(self.M(f"Waitting for event: {data_event}"))
+        if data_event.event.wait(timeout):
+            logger.verbose(self.M(f"Waitted the event: {data_event}, event.data: {data_event.data}"))
+            return data_event.data
+        else:
+            raise TimeoutError(f"No response received within timeout period for topic: {topic_wait}.")
+
+
+    @final
     def _subscribe(self, topic, data_type:str="str", topic_handler=None):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
         
@@ -301,7 +324,10 @@ class Agent(BrokerNotifier):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
         
         if topic_handler:
+            if topic in self.__topic_handlers:
+                logger.warning(self.M(f"Exist the handler for topic: {topic}"))
             self.__topic_handlers[topic] = topic_handler
+
         return self._broker.subscribe(topic, data_type)
     
     
@@ -461,11 +487,12 @@ class Agent(BrokerNotifier):
             self._subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
             self._subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
-        
-        try:
-            self.on_connected()
-        except Exception as ex:
-            logger.exception(ex)
+
+        threading.Thread(target=self.on_connected).start()
+        # try:
+        #     self.on_connected()
+        # except Exception as ex:
+        #     logger.exception(ex)
 
 
     @final
@@ -474,9 +501,12 @@ class Agent(BrokerNotifier):
         
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
         if topic_handler:
-            topic_handler(topic, data)
+            logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
+            threading.Thread(target=topic_handler, args=(topic, data)).start()
+            # topic_handler(topic, data)
         else:
-            self.on_message(topic, data)
+            threading.Thread(target=self.on_message, args=(topic, data)).start()
+            # self.on_message(topic, data)
 
 
     def on_connected(self):

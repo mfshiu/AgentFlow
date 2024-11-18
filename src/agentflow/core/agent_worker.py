@@ -15,6 +15,10 @@ logger:Logger = __import__('agentflow').get_logger()
 class Worker:
     def __init__(self, initiator_agent):
         self.initiator_agent = initiator_agent
+        
+        
+    def create_event(self):
+        return None
     
     
     def is_working(self):
@@ -41,6 +45,10 @@ class Worker:
 class ProcessWorker(Worker):
     def __init__(self, initiator_agent):
         super().__init__(initiator_agent)
+        
+        
+    def create_event(self):
+        return multiprocessing.Event()
         
 
     def start(self):
@@ -71,6 +79,10 @@ class ProcessWorker(Worker):
 class ThreadWorker(Worker):
     def __init__(self, initiator_agent):
         super().__init__(initiator_agent)
+        
+        
+    def create_event(self):
+        return threading.Event()
 
 
     def start(self):
