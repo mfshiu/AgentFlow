@@ -7,6 +7,8 @@ import time
 from typing import final
 import uuid
 
+from agentflow.core.parcel import Parcel
+
 from ..broker import BrokerType
 from ..broker.notifier import BrokerNotifier
 from ..broker.broker_maker import BrokerMaker
@@ -284,36 +286,57 @@ class Agent(BrokerNotifier):
     def _publish(self, topic, data=None):
         logger.verbose(self.M(f"topic: {topic}, data: {data}"))
         
-        if isinstance(data, dict):
-            try:
-                data = json.dumps(data)
-                self._broker.publish(topic, data)
-            except Exception as ex:
-                logger.exception(ex)
-        else:
-            self._broker.publish(topic, data)
+        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)         
+        try:
+            self._broker.publish(topic, pcl.payload())
+        except Exception as ex:
+            logger.exception(ex)
+        
+        # if isinstance(data, dict):
+        #     try:
+        #         data = json.dumps(data)
+        #         self._broker.publish(topic, data)
+        #     except Exception as ex:
+        #         logger.exception(ex)
+        # else:
+        #     self._broker.publish(topic, data)
 
 
     @final
-    def _publish_sync(self, topic, data, topic_wait, timeout=10):
-        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
+    def _publish_sync(self, topic, data, topic_wait=None, timeout=10):
+        logger.verbose(self.M(f"topic: {topic}, data: {data}, topic_wait: {topic_wait}"))
         
+        if isinstance(data, Parcel):
+            pcl = data
+            if pcl.topic_return:
+                if topic_wait:
+                    logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{pcl.topic_return}'.")
+            elif topic_wait:
+                pcl.topic_return = topic_wait
+            else:
+                raise ValueError("If the parameter 'topic_wait' is empty, then `data` must be a `Parcel` and have the `topic_return` attribute.")
+        elif topic_wait:
+            pcl = Parcel.from_content(data)
+            pcl.topic_return = topic_wait
+        else:
+            raise ValueError("If the parameter 'topic_wait' is empty, then `data` must be a `Parcel` and have the `topic_return` attribute.")
+                
         data_event = Agent.DataEvent(self._get_worker().create_event())
-        
+
         def handle_response(topic_resp, data_resp):
             logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {data_resp}"))
             data_event.data = data_resp
             data_event.event.set()
-            
-        self._subscribe(topic_wait, topic_handler=handle_response)
-        self._publish(topic, data)
-        
+
+        self._subscribe(pcl.topic_return, topic_handler=handle_response)
+        self._publish(topic, pcl)
+
         logger.verbose(self.M(f"Waitting for event: {data_event}"))
         if data_event.event.wait(timeout):
             logger.verbose(self.M(f"Waitted the event: {data_event}, event.data: {data_event.data}"))
             return data_event.data
         else:
-            raise TimeoutError(f"No response received within timeout period for topic: {topic_wait}.")
+            raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
 
 
     @final
@@ -353,10 +376,8 @@ class Agent(BrokerNotifier):
         logger.verbose(f"parent_id: {parent_id}, parent_info: {parent_info}")
     
     
-    def _handle_children(self, topic, data):
-        logger.debug(f"topic: {topic}, data type: {type(data)}, data: {data}")
-       
-        info = json.loads(data.decode('utf-8', 'ignore'))
+    def _handle_children(self, topic, child:dict):
+        logger.debug(f"topic: {topic}, child: {child}")
         # {
         #     'child_id': agent_id,
         #     'child_name': child.name,
@@ -365,46 +386,45 @@ class Agent(BrokerNotifier):
         #     'target_parents': [parent_id, ..] # optional
         # }
         
-        if target_parents := info.get('target_parents'):
+        if target_parents := child.get('target_parents'):
             if self.agent_id not in target_parents:
                 return
-        child_id = info.get('child_id')
+        child_id = child.get('child_id')
 
-        if "register_child" == info['subject']:
-            self.__register_child(child_id, info)
+        if "register_child" == child['subject']:
+            self.__register_child(child_id, child)
             self._notify_child(child_id, 'register_parent')
             
-        self.on_children_message(topic, info)
+        self.on_children_message(topic, child)
 
 
     def on_children_message(self, topic, info):
         logger.verbose(f"topic: {topic}, info: {info}")
     
     
-    def _handle_parents(self, topic, data):
-        logger.debug(self.M(f"topic: {topic}, data type: {type(data)}, data: {data}"))
-        
-        info = json.loads(data.decode('utf-8', 'ignore'))
+    def _handle_parents(self, topic, parent):
+        logger.debug(self.M(f"topic: {topic}, data type: {type(parent)}, data: {parent}"))
         # {
         #     'parent_id': agent_id,
         #     'subject': subject,
         #     'data': data,
         #     'target_children': [child_id, ..]
         # }
-        if target_children := info.get('target_children'):
+        
+        if target_children := parent.get('target_children'):
             if not self.agent_id in target_children:
                 return  # Not in the target children.
         
-        if "terminate" == info['subject']:
+        if "terminate" == parent['subject']:
             self._terminate()
-        elif "register_parent" == info['subject']:
-            self.__register_parent(info.get('parent_id'), info)
+        elif "register_parent" == parent['subject']:
+            self.__register_parent(parent.get('parent_id'), parent)
             
-        self.on_parents_message(topic, info)
+        self.on_parents_message(topic, parent)
 
 
-    def on_parents_message(self, topic, info):
-        logger.verbose(f"topic: {topic}, info: {info}")
+    def on_parents_message(self, topic, parent):
+        logger.verbose(f"topic: {topic}, parent: {parent}")
     
     
     def _notify_child(self, child_id, subject, data=None):
@@ -497,16 +517,25 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
-        logger.verbose(self.M(f"topic: {topic}, __topic_handlers: {self.__topic_handlers}"))
-        
+        logger.verbose(self.M(f"topic: {topic}, data: {data[:200]}.."))
+        pcl = Parcel.from_payload(data)
+        # logger.verbose(self.M(f"managed_data: {str(pcl.managed_data)[:200]}.."))
+
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
-        if topic_handler:
-            logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
-            threading.Thread(target=topic_handler, args=(topic, data)).start()
-            # topic_handler(topic, data)
-        else:
-            threading.Thread(target=self.on_message, args=(topic, data)).start()
-            # self.on_message(topic, data)
+        logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
+        
+        def handle_message(topic_handler, topic, content):
+            data_resp = topic_handler(topic, content)
+            if pcl.topic_return:
+                self._publish(pcl.topic_return, data_resp)
+        threading.Thread(target=handle_message, args=(topic_handler, topic, pcl.content)).start()
+        # if topic_handler:
+        #     logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
+        #     threading.Thread(target=topic_handler, args=(topic, pcl.content)).start()
+        #     # topic_handler(topic, data)
+        # else:
+        #     threading.Thread(target=self.on_message, args=(topic, pcl.content)).start()
+        #     # self.on_message(topic, data)
 
 
     def on_connected(self):

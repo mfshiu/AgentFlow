@@ -36,9 +36,9 @@ class TestAgent(unittest.TestCase):
             logger.debug(self.M(f"topic: {topic}, len(data): {len(data)}"))
             
             if 'binary_payload' == topic:
-                TestAgent.binary_data = Parcel.from_bytes(data).managed_data
+                TestAgent.binary_data = data
             elif 'text_payload' == topic:
-                TestAgent.text_data = Parcel.from_text(data).managed_data
+                TestAgent.text_data = data
 
 
     def setUp(self):
@@ -49,7 +49,7 @@ class TestAgent(unittest.TestCase):
         def send_binary():
             def do_send():
                 time.sleep(random.uniform(0.5, 1.5))
-                self.binary_agent._publish('binary_payload', Parcel(bytes([72, 101, 108, 108, 111])).payload())
+                self.binary_agent._publish('binary_payload', bytes([72, 101, 108, 108, 111]))
             threading.Thread(target=do_send).start()
         
         cfg = config_test.copy()
@@ -61,7 +61,7 @@ class TestAgent(unittest.TestCase):
         def send_text():
             def do_send():
                 time.sleep(random.uniform(0.5, 1.5))
-                self.binary_agent._publish('text_payload', Parcel('早安, Anita.').payload())
+                self.binary_agent._publish('text_payload', '早安, Anita.')
             threading.Thread(target=do_send).start()
 
         cfg = config_test.copy()
@@ -72,14 +72,14 @@ class TestAgent(unittest.TestCase):
 
     def _do_test_binary(self):
         logger.info(f'TestAgent.binary_data: {TestAgent.binary_data}')
-        content = TestAgent.binary_data['content']
+        content = TestAgent.binary_data
         self.assertTrue(isinstance(content, bytes))
         self.assertEqual(content, bytes([72, 101, 108, 108, 111]))
 
 
     def _do_test_text(self):
         logger.info(f'TestAgent.text_data: {TestAgent.text_data}')
-        content = TestAgent.text_data['content']
+        content = TestAgent.text_data
         self.assertTrue(isinstance(content, str))
         self.assertEqual(content, '早安, Anita.')
 

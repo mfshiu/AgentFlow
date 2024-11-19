@@ -1,70 +1,107 @@
+from abc import ABC, abstractmethod
 import json
 import pickle
 
 
-VERSION = "2"
+VERSION = 3
 
 
-class Parcel():
-    def __init__(self, content=None, home_topic=None):
-        self.managed_data = dict()
-        self.content = None
-        self.home_topic:str = None
-        self.wrap = self.__wrap_json
+class Parcel(ABC):
+    def __init__(self, content=None, topic_return=None):
+        self.version = VERSION
+        self.content = content
+        self.topic_return:str = topic_return
 
-        self.__set_managed_data({
+
+    @staticmethod
+    def from_content(content) -> 'Parcel':
+        is_binary = content and (isinstance(content, bytes) or isinstance(content, bytearray))
+        if is_binary:
+            return BinaryParcel(content)
+        else:
+            return TextParcel(content)
+        
+        
+    @staticmethod
+    def from_payload(payload):
+        if BinaryParcel.is_payload(payload):
+            pcl = BinaryParcel.from_payload(payload)
+        elif TextParcel.is_payload(payload):
+            pcl = TextParcel.from_payload(payload)
+        else:
+            raise TypeError('Not valid Parcel payload.')
+
+        return pcl
+    
+    
+    @staticmethod
+    def is_payload(payload):
+        return BinaryParcel.is_payload(payload) or TextParcel.is_payload(payload)
+    
+    
+    def _get_managed_data(self):
+        return {
             'version': VERSION,
-            'content': content,
-            'home_topic': home_topic
-        })        
-        
-        
-    def __set_managed_data(self, managed_data):
-        self.managed_data = managed_data
-        self.content = managed_data.get('content')
-        self.home_topic = managed_data.get('home_topic')
-        self.wrap = self.__wrap_binary if self.content and Parcel.__is_binary_content(self.content) else self.__wrap_json
-        
-        
-    def __is_binary_content(content):
-        return isinstance(content, bytes) or isinstance(content, bytearray)
-        
-        
-    def __wrap_binary(self):
-        return pickle.dumps(self.managed_data)
-        
-        
-    def __wrap_json(self):
-        return json.dumps(self.managed_data)
+            'content': self.content,
+            'topic_return': self.topic_return
+        }
     
     
-    def from_bytes(payload):
-        parcel = Parcel()
-        parcel.load_bytes(payload)
-        return parcel
-    
-    
-    def from_text(payload):
-        parcel = Parcel()
-        parcel.load_text(payload)
-        return parcel
-    
-    
-    def load_bytes(self, payload):
-        self.__set_managed_data(pickle.loads(payload))
+    def _set_managed_data(self, managed_data):
+        self.version = managed_data['version']
+        self.content = managed_data['content']
+        self.topic_return = managed_data['topic_return']
 
 
-    def load_text(self, payload):
-        self.__set_managed_data(json.loads(payload))
+    @abstractmethod
+    def payload(self):
+        pass
+
+
+
+class BinaryParcel(Parcel):
+    HEAD = "application/pickle|"
+    
+    def __init__(self, content=None, topic_return=None):
+        super().__init__(content, topic_return)       
+    
+    
+    @staticmethod
+    def from_payload(payload):
+        pcl = BinaryParcel()
+        pcl._set_managed_data(pickle.loads(payload[len(BinaryParcel.HEAD):]))
+        return pcl
+    
+    
+    @staticmethod
+    def is_payload(payload):
+        return payload and payload.startswith(BinaryParcel.HEAD.encode())
 
 
     def payload(self):
-        return self.wrap()
+        return BinaryParcel.HEAD.encode() + pickle.dumps(self._get_managed_data())
+
+
+
+class TextParcel(Parcel):
+    HEAD = "text/json|"
+    
+    def __init__(self, content=None, topic_return=None):
+        super().__init__(content, topic_return)       
+        
+        
+    @staticmethod
+    def from_payload(payload):
+        pcl = TextParcel()
+        pcl._set_managed_data(json.loads(payload[len(TextParcel.HEAD):]))
+        return pcl
     
     
-    def get(self, key, default=None):
-        return self.managed_data.get(key, default)
-    
-    
-    def set(self, key, value):
-        self.managed_data[key] = value
+    @staticmethod
+    def is_payload(payload):
+        return payload and payload.startswith(TextParcel.HEAD.encode())
+
+
+    def payload(self):
+        return TextParcel.HEAD + json.dumps(self._get_managed_data())
+
