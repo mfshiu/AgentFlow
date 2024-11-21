@@ -36,7 +36,7 @@ class AgentB(Agent):
 
 
     def __init__(self):
-        super().__init__(name='aaa.bbb', agent_config=config_test)
+        super().__init__(name='bbb.aaa', agent_config=config_test)
         self.parents_count = 0
 
 

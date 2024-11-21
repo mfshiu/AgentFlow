@@ -64,14 +64,14 @@ class TestAgent(unittest.TestCase):
         self.aaa = Agent(name='aaa', agent_config=cfg)
         self.aaa.start()
         
-        self.aaa_bbb = Agent(name='aaa.bbb', agent_config=cfg)
+        self.aaa_bbb = Agent(name='bbb.aaa', agent_config=cfg)
         self.aaa_bbb.start()
-        self.aaa_ccc = Agent(name='aaa.ccc', agent_config=cfg)
+        self.aaa_ccc = Agent(name='ccc.aaa', agent_config=cfg)
         self.aaa_ccc.start()
 
-        self.aaa_bbb_111 = Agent(name='aaa.bbb.111', agent_config=cfg)
+        self.aaa_bbb_111 = Agent(name='111.bbb.aaa', agent_config=cfg)
         self.aaa_bbb_111.start()
-        self.aaa_bbb_222 = Agent(name='aaa.bbb.222', agent_config=cfg)
+        self.aaa_bbb_222 = Agent(name='222.bbb.aaa', agent_config=cfg)
         self.aaa_bbb_222.start()
 
 

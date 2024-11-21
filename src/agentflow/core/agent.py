@@ -32,7 +32,8 @@ class Agent(BrokerNotifier):
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
-        self.parent_name = name.rsplit('.', 1)[0] if '.' in name else None
+        # self.parent_name = name.rsplit('.', 1)[0] if '.' in name else None
+        self.parent_name = name.split('.', 1)[1] if '.' in name else None
         self.interval_seconds = 0
         self.__agent_worker: Worker = None
         
@@ -73,6 +74,12 @@ class Agent(BrokerNotifier):
             self.config[config.CONCURRENCY_TYPE] = 'process'
         logger.info(self.M(f"self.config: {self.config}"))
         self._get_worker().start()
+        
+        self._on_start()
+        
+        
+    def _on_start(self):
+        pass
         
         
     def start_process(self):
@@ -291,15 +298,10 @@ class Agent(BrokerNotifier):
             self._broker.publish(topic, pcl.payload())
         except Exception as ex:
             logger.exception(ex)
+
         
-        # if isinstance(data, dict):
-        #     try:
-        #         data = json.dumps(data)
-        #         self._broker.publish(topic, data)
-        #     except Exception as ex:
-        #         logger.exception(ex)
-        # else:
-        #     self._broker.publish(topic, data)
+    def __generate_return_topic(self, topic):
+        return f'{self.tag}-{int(time.time()*1000)}/{topic}'
 
 
     @final
@@ -314,12 +316,10 @@ class Agent(BrokerNotifier):
             elif topic_wait:
                 pcl.topic_return = topic_wait
             else:
-                raise ValueError("If the parameter 'topic_wait' is empty, then `data` must be a `Parcel` and have the `topic_return` attribute.")
-        elif topic_wait:
-            pcl = Parcel.from_content(data)
-            pcl.topic_return = topic_wait
+                pcl.topic_return = self.__generate_return_topic(topic)
         else:
-            raise ValueError("If the parameter 'topic_wait' is empty, then `data` must be a `Parcel` and have the `topic_return` attribute.")
+            pcl = Parcel.from_content(data)
+            pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
                 
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
@@ -395,7 +395,7 @@ class Agent(BrokerNotifier):
             self.__register_child(child_id, child)
             self._notify_child(child_id, 'register_parent')
             
-        self.on_children_message(topic, child)
+        return self.on_children_message(topic, child)
 
 
     def on_children_message(self, topic, info):
@@ -420,7 +420,7 @@ class Agent(BrokerNotifier):
         elif "register_parent" == parent['subject']:
             self.__register_parent(parent.get('parent_id'), parent)
             
-        self.on_parents_message(topic, parent)
+        return self.on_parents_message(topic, parent)
 
 
     def on_parents_message(self, topic, parent):

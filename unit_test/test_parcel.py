@@ -97,6 +97,8 @@ class TestAgent(unittest.TestCase):
 
     def tearDown(self):
         self.validation_agent.terminate()
+        self.text_agent.terminate()
+        self.binary_agent.terminate()
 
 
 
