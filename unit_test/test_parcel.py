@@ -32,7 +32,8 @@ class TestAgent(unittest.TestCase):
             self._subscribe('text_payload')
 
 
-        def on_message(self, topic:str, data):
+        def on_message(self, topic:str, pcl:Parcel):
+            data = pcl.content
             logger.debug(self.M(f"topic: {topic}, len(data): {len(data)}"))
             
             if 'binary_payload' == topic:

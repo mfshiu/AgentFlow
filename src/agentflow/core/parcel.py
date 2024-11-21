@@ -7,7 +7,7 @@ VERSION = 3
 
 
 class Parcel(ABC):
-    def __init__(self, content=None, topic_return=None):
+    def __init__(self, content=None, topic_return:str=None):
         self.version = VERSION
         self.content = content
         self.topic_return:str = topic_return
@@ -45,8 +45,8 @@ class Parcel(ABC):
             'content': self.content,
             'topic_return': self.topic_return
         }
-    
-    
+
+
     def _set_managed_data(self, managed_data):
         self.version = managed_data['version']
         self.content = managed_data['content']
@@ -56,6 +56,33 @@ class Parcel(ABC):
     @abstractmethod
     def payload(self):
         pass
+    
+    
+    # Subscription operations
+    
+    def __getitem__(self, key):
+        return self.get(key)
+
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+
+    def get(self, key, default=None):
+        if isinstance(self.content, dict):
+            return self.content.get(key, default)
+        else:
+            raise TypeError("self.content is not a dictionary. Get operation is not allowed.")
+
+
+    def set(self, key, value):
+        if not self.content:
+            self.content = dict()
+            
+        if isinstance(self.content, dict):
+            self.content[key] = value
+        else:
+            raise TypeError("self.content is not a dictionary. Set operation is not allowed.")
 
 
 

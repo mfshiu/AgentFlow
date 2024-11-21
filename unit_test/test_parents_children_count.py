@@ -2,25 +2,19 @@ import sys
 import os
 sys.path.append(os.path.abspath(".."))  # Adjust path if necessary
 
-import unittest
-from src.agentflow.core.agent import Agent
-
-import threading
 import time
 
+import unittest
 from agentflow.core.agent import Agent
-from agentflow.core import config
-from agentflow.core.config import EventHandler
+from agentflow.core.parcel import Parcel
 from unit_test.config_test import config_test
 
-from AgentFlow import log_helper
-logger = log_helper.get_logger()
+from logging import Logger
+logger:Logger = __import__('AgentFlow').get_logger()
 
 
 
 class AgentA(Agent):
-
-
     def __init__(self):
         super().__init__(name='aaa', agent_config=config_test)
         self.children_count = 0
@@ -33,8 +27,6 @@ class AgentA(Agent):
 
 
 class AgentB(Agent):
-
-
     def __init__(self):
         super().__init__(name='bbb.aaa', agent_config=config_test)
         self.parents_count = 0
@@ -47,15 +39,12 @@ class AgentB(Agent):
 
 
 class TestAgent(unittest.TestCase):
-
     children_count = 0
     parents_count = 0
     
     
     
     class ValidationAgent(Agent):
-
-
         def __init__(self):
             super().__init__(name='validation', agent_config=config_test)
             
@@ -65,7 +54,8 @@ class TestAgent(unittest.TestCase):
             self._subscribe('parents_count')
             
             
-        def on_message(self, topic: str, data):
+        def on_message(self, topic: str, pcl:Parcel):
+            data = pcl.content
             logger.debug(self.M(f"topic: {topic}, data: {data}"))
             
             if 'children_count' == topic:

@@ -305,7 +305,7 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def _publish_sync(self, topic, data, topic_wait=None, timeout=10):
+    def _publish_sync(self, topic, data, topic_wait=None, timeout=10)->Parcel:
         logger.verbose(self.M(f"topic: {topic}, data: {data}, topic_wait: {topic_wait}"))
         
         if isinstance(data, Parcel):
@@ -323,9 +323,9 @@ class Agent(BrokerNotifier):
                 
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
-        def handle_response(topic_resp, data_resp):
-            logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {data_resp}"))
-            data_event.data = data_resp
+        def handle_response(topic_resp, pcl_resp:Parcel):
+            logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {pcl_resp}"))
+            data_event.data = pcl_resp
             data_event.event.set()
 
         self._subscribe(pcl.topic_return, topic_handler=handle_response)
@@ -376,7 +376,8 @@ class Agent(BrokerNotifier):
         logger.verbose(f"parent_id: {parent_id}, parent_info: {parent_info}")
     
     
-    def _handle_children(self, topic, child:dict):
+    def _handle_children(self, topic, pcl:Parcel):
+        child = pcl.content
         logger.debug(f"topic: {topic}, child: {child}")
         # {
         #     'child_id': agent_id,
@@ -402,7 +403,8 @@ class Agent(BrokerNotifier):
         logger.verbose(f"topic: {topic}, info: {info}")
     
     
-    def _handle_parents(self, topic, parent):
+    def _handle_parents(self, topic, pcl:Parcel):
+        parent = pcl.content
         logger.debug(self.M(f"topic: {topic}, data type: {type(parent)}, data: {parent}"))
         # {
         #     'parent_id': agent_id,
@@ -524,18 +526,16 @@ class Agent(BrokerNotifier):
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
         logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
         
-        def handle_message(topic_handler, topic, content):
-            data_resp = topic_handler(topic, content)
-            if pcl.topic_return:
+        def handle_message(topic_handler, topic, p):
+            data_resp = topic_handler(topic, p)
+            if data_resp and p.topic_return:
                 self._publish(pcl.topic_return, data_resp)
-        threading.Thread(target=handle_message, args=(topic_handler, topic, pcl.content)).start()
-        # if topic_handler:
-        #     logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
-        #     threading.Thread(target=topic_handler, args=(topic, pcl.content)).start()
-        #     # topic_handler(topic, data)
-        # else:
-        #     threading.Thread(target=self.on_message, args=(topic, pcl.content)).start()
-        #     # self.on_message(topic, data)
+        threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()
+        # def handle_message(topic_handler, topic, content):
+        #     data_resp = topic_handler(topic, content)
+        #     if pcl.topic_return:
+        #         self._publish(pcl.topic_return, data_resp)
+        # threading.Thread(target=handle_message, args=(topic_handler, topic, pcl.content)).start()
 
 
     def on_connected(self):
