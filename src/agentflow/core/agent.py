@@ -23,8 +23,7 @@ logger:Logger = __import__('agentflow').get_logger()
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
-        print(agent_config)
-        logger.debug(f'name: {name}, agent_config: {agent_config}')
+        logger.verbose(f'name: {name}, agent_config: {agent_config}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -527,9 +526,21 @@ class Agent(BrokerNotifier):
         logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
         
         def handle_message(topic_handler, topic, p):
-            data_resp = topic_handler(topic, p)
-            if data_resp and p.topic_return:
-                self._publish(pcl.topic_return, data_resp)
+            if p.topic_return:
+                try:
+                    data_resp = topic_handler(topic, p)
+                except Exception as ex:
+                    logger.exception(ex)
+                    p.error = str(ex)
+                    data_resp = None
+                finally:
+                    self._publish(pcl.topic_return, data_resp)
+            else:
+                try:
+                    topic_handler(topic, p)
+                except Exception as ex:
+                    logger.exception(ex)
+                
         threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()
         # def handle_message(topic_handler, topic, content):
         #     data_resp = topic_handler(topic, content)

@@ -11,6 +11,7 @@ class Parcel(ABC):
         self.version = VERSION
         self.content = content
         self.topic_return:str = topic_return
+        self.error = None
 
 
     @staticmethod
