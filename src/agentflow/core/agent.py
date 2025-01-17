@@ -234,7 +234,7 @@ class Agent(BrokerNotifier):
             
             
     def _terminate(self):
-        logger.info(self.M('Terminating..'))
+        logger.warning(self.M('Terminating..'))
         
         self._notify_children('terminate')
         def stop():

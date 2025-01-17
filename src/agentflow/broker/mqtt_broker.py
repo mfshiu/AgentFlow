@@ -53,7 +53,7 @@ class MqttBroker(MessageBroker):
 
 
     def stop(self):
-        logger.info(f"MQTT broker is stopping...")
+        logger.warning(f"MQTT broker is stopping...")
         
         self._client.disconnect()
         self._client.loop_stop()
