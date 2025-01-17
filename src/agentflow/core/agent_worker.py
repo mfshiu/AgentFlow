@@ -1,4 +1,3 @@
-from typing import Callable
 from logging import Logger
 import multiprocessing
 import queue
@@ -14,6 +13,8 @@ logger:Logger = __import__('agentflow').get_logger()
 # Define the Strategy interface
 class Worker:
     def __init__(self, initiator_agent):
+        multiprocessing.set_start_method('spawn')
+        
         self.initiator_agent = initiator_agent
         
         
