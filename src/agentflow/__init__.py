@@ -2,10 +2,6 @@ import logging
 import os
 
 
-LOGGER_NAME = os.getenv("LOGGER_NAME", "agentflow")
-__logger:logging.Logger = logging.getLogger(LOGGER_NAME)
-
-
 LOGGING_LEVEL_VERBOSE = int(logging.DEBUG / 2)
 logging.addLevelName(LOGGING_LEVEL_VERBOSE, "VERBOSE")
 
@@ -15,6 +11,9 @@ def verbose(self, message, *args, **kwargs):
 
 logging.Logger.verbose = verbose
 
+
+LOGGER_NAME = os.getenv("LOGGER_NAME", "agentflow")
+__logger:logging.Logger = logging.getLogger(LOGGER_NAME)
 
 def get_logger() -> logging.Logger:
     return __logger
