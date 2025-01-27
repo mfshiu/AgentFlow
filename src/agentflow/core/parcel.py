@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 import json
 import pickle
 
+from agentflow import ensure_size
+
 
 VERSION = 3
 
@@ -12,6 +14,29 @@ class Parcel(ABC):
         self.content = content
         self.topic_return:str = topic_return
         self.error = None
+
+
+    def __str__(self):
+        return json.dumps({
+            "version": self.version,
+            "content": ensure_size(self._convert_content(self.content)),
+            "topic_return": self.topic_return,
+            "error": self.error
+        }, indent=4, ensure_ascii=False)
+
+
+    def _convert_content(self, content):
+        if isinstance(content, bytes):
+            try:
+                content = ensure_size(self.content.decode('utf-8', 'replace'))
+            except Exception as e:
+                content = f"len(<binary data>): {len(content)}, error: {e}"  # Fallback message for undecodable bytes
+        elif isinstance(content, dict):
+            content = {key: self._convert_content(value) for key, value in content.items()}
+        elif isinstance(content, list):
+            content = [self._convert_content(item) for item in content]
+
+        return content
 
 
     @staticmethod

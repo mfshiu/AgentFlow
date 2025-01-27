@@ -290,7 +290,7 @@ class Agent(BrokerNotifier):
 
     @final
     def _publish(self, topic, data=None):
-        logger.verbose(self.M(f"topic: {topic}, data: {data}"))
+        # logger.verbose(self.M(f"topic: {topic}, data: {data}"))
         
         pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)         
         try:
