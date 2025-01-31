@@ -9,12 +9,12 @@ import uuid
 
 from agentflow.core.parcel import Parcel
 
-from ..broker import BrokerType
-from ..broker.notifier import BrokerNotifier
-from ..broker.broker_maker import BrokerMaker
-from . import config
-from .config import EventHandler
-from .agent_worker import Worker, ProcessWorker, ThreadWorker
+from agentflow.broker import BrokerType
+from agentflow.broker.notifier import BrokerNotifier
+from agentflow.broker.broker_maker import BrokerMaker
+from agentflow.core import config
+from agentflow.core.config import EventHandler
+from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
 
 
 logger:Logger = __import__('agentflow').get_logger()
@@ -125,7 +125,6 @@ class Agent(BrokerNotifier):
     
     
     def on_activate(self):
-        # logger.verbose(self.M("Hello!"))
         pass
 
 
@@ -198,6 +197,7 @@ class Agent(BrokerNotifier):
         self.terminate_event = config['terminate_event']
         
         if self.__activating():
+            logger.verbose(self.M('__activating'))
             sig = inspect.signature(self.on_activate)
             if len(sig.parameters) == 0:
                 logger.verbose(self.M("Invoke on_activate 1"))

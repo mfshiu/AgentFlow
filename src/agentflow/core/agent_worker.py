@@ -13,8 +13,8 @@ logger:Logger = __import__('agentflow').get_logger()
 # Define the Strategy interface
 class Worker:
     def __init__(self, initiator_agent):
-        multiprocessing.set_start_method('spawn')
-        
+        if not multiprocessing.get_start_method(allow_none=True):
+            multiprocessing.set_start_method('spawn')        
         self.initiator_agent = initiator_agent
         
         
