@@ -168,6 +168,7 @@ class Agent(BrokerNotifier):
         logger.verbose(self.M("begin"))
         self.__data = {}
         self.__data_lock = threading.Lock()
+        self.__connected_event = threading.Event()
 
         self.on_begining()
 
@@ -187,6 +188,7 @@ class Agent(BrokerNotifier):
             logger.error(self.M("Broker startup failed."))
             is_success = False
                 
+        self.__connected_event.wait()
         logger.verbose(self.M("end"))
         return is_success
 
@@ -195,6 +197,7 @@ class Agent(BrokerNotifier):
         logger.verbose(self.M('Begin'))
         self.config = config
         self.terminate_event = config['terminate_event']
+
         
         if self.__activating():
             logger.verbose(self.M('__activating'))
@@ -304,7 +307,7 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def _publish_sync(self, topic, data=None, topic_wait=None, timeout=10)->Parcel:
+    def _publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
         logger.verbose(self.M(f"topic: {topic}, data: {data}, topic_wait: {topic_wait}"))
         
         if isinstance(data, Parcel):
@@ -509,7 +512,11 @@ class Agent(BrokerNotifier):
             self._subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
 
-        threading.Thread(target=self.on_connected).start()
+        def handle_connected():
+            time.sleep(1)
+            self.__connected_event.set()
+            self.on_connected()
+        threading.Thread(target=handle_connected).start()
         # try:
         #     self.on_connected()
         # except Exception as ex:
