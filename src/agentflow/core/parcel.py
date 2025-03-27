@@ -69,7 +69,8 @@ class Parcel(ABC):
         return {
             'version': VERSION,
             'content': self.content,
-            'topic_return': self.topic_return
+            'topic_return': self.topic_return,
+            'error': self.error
         }
 
 
@@ -77,6 +78,7 @@ class Parcel(ABC):
         self.version = managed_data['version']
         self.content = managed_data['content']
         self.topic_return = managed_data['topic_return']
+        self.error = managed_data['error']
 
 
     @abstractmethod

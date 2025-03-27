@@ -292,10 +292,11 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def _publish(self, topic, data=None):
+    def publish(self, topic, data=None):
         # logger.verbose(self.M(f"topic: {topic}, data: {data}"))
         
-        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)         
+        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)      
+        logger.verbose(self.M(f"topic: {topic}, pcl: {str(pcl)[:400]}.."))   
         try:
             self._broker.publish(topic, pcl.payload())
         except Exception as ex:
@@ -307,7 +308,7 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def _publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
+    def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
         logger.verbose(self.M(f"topic: {topic}, data: {data}, topic_wait: {topic_wait}"))
         
         if isinstance(data, Parcel):
@@ -326,23 +327,23 @@ class Agent(BrokerNotifier):
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
-            logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {pcl_resp}"))
+            # logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {str(pcl_resp)[:400]}.."))
             data_event.data = pcl_resp
             data_event.event.set()
 
-        self._subscribe(pcl.topic_return, topic_handler=handle_response)
-        self._publish(topic, pcl)
+        self.subscribe(pcl.topic_return, topic_handler=handle_response)
+        self.publish(topic, pcl)
 
         logger.verbose(self.M(f"Waitting for event: {data_event}"))
         if data_event.event.wait(timeout):
-            logger.verbose(self.M(f"Waitted the event: {data_event}, event.data: {data_event.data}"))
+            logger.verbose(self.M(f"Waitted the event: {data_event}, event.data: {str(data_event.data)[:400]}.."))
             return data_event.data
         else:
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
 
 
     @final
-    def _subscribe(self, topic, data_type:str="str", topic_handler=None):
+    def subscribe(self, topic, data_type:str="str", topic_handler=None):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
         
         if not isinstance(data_type, str):
@@ -435,7 +436,7 @@ class Agent(BrokerNotifier):
         logger.debug(f"child_id: {child_id}, subject: {subject}, data: {data}")
 
         if self._children and child_id in self._children:
-            self._publish(f'{child_id}.to_child.{self.name}', {
+            self.publish(f'{child_id}.to_child.{self.name}', {
                 'parent_id': self.agent_id,
                 'subject': subject,
                 'data': data
@@ -466,14 +467,14 @@ class Agent(BrokerNotifier):
             logger.debug(self.M(f"target_child_name: {target_child_name}"))
             topic = f'to_child.{target_child_name}'
 
-        self._publish(topic, data_send)
+        self.publish(topic, data_send)
     
     
     def _notify_parent(self, parent_id, subject, data=None):
         logger.debug(self.M(f"parent_id: {parent_id}, subject: {subject}, data: {data}"))
 
         if self._parents and parent_id in self._parents:
-            self._publish(f'{parent_id}.to_parent.{self.parent_name}', {
+            self.publish(f'{parent_id}.to_parent.{self.parent_name}', {
                 'child_id': self.agent_id,
                 'subject': subject,
                 'data': data
@@ -486,7 +487,7 @@ class Agent(BrokerNotifier):
         logger.debug(f"subject: {subject}, data: {data}")
         
         if self.parent_name:
-            self._publish(f'to_parent.{self.parent_name}', data={
+            self.publish(f'to_parent.{self.parent_name}', data={
                 'child_id': self.agent_id,
                 'child_name': self.name,
                 'subject': subject,
@@ -502,14 +503,14 @@ class Agent(BrokerNotifier):
             attr_name = str(event).lower()[len('EventHandler.'):]
             setattr(self, attr_name, self.get_config(event, getattr(self, attr_name, None)))
 
-        self._subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children)  # All the parents were notified by the children.
-        self._subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children)  # I was the only parent notified by a child.  
+        self.subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children)  # All the parents were notified by the children.
+        self.subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children)  # I was the only parent notified by a child.  
         
         # logger.verbose(f"self.parent_name: {self.parent_name}")
         if self.parent_name:
-            self._subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents) # All the children were notified by the parents.
-            self._subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
-            self._subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
+            self.subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents) # All the children were notified by the parents.
+            self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
+            self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
 
         def handle_connected():
@@ -532,16 +533,18 @@ class Agent(BrokerNotifier):
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
         logger.verbose(self.M(f"Invoke handler: {topic_handler}"))
         
-        def handle_message(topic_handler, topic, p):
+        def handle_message(topic_handler, topic, p:Parcel):
             if p.topic_return:
                 try:
                     data_resp = topic_handler(topic, p)
                 except Exception as ex:
                     logger.exception(ex)
                     p.error = str(ex)
-                    data_resp = None
+                    p.content = None
+                    data_resp = p
+                    logger.debug(data_resp)
                 finally:
-                    self._publish(pcl.topic_return, data_resp)
+                    self.publish(pcl.topic_return, data_resp)
             else:
                 try:
                     topic_handler(topic, p)
