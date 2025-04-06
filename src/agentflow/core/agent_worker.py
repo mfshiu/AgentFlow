@@ -16,6 +16,7 @@ class Worker:
         if not multiprocessing.get_start_method(allow_none=True):
             multiprocessing.set_start_method('spawn')        
         self.initiator_agent = initiator_agent
+        self.work_process = None
         
         
     def create_event(self):
@@ -23,8 +24,10 @@ class Worker:
     
     
     def is_working(self):
-        if hasattr(self, 'terminate_event'):
-            return not self.terminate_event.is_set()
+        if self.work_process:
+            return self.work_process.is_alive()
+        # elif hasattr(self, 'terminate_event'):
+        #     return not self.terminate_event.is_set()
         else:
             return False
 
@@ -55,13 +58,15 @@ class ProcessWorker(Worker):
     def start(self):
         logger.debug(self.initiator_agent.M(f"self.initiator_agent: {self.initiator_agent}"))
         self.work_queue = multiprocessing.Queue()
-        self.terminate_event = multiprocessing.Event()
+        # self.terminate_event = multiprocessing.Event()
         
         cfg = self.initiator_agent.config
         cfg['work_queue'] = self.work_queue
-        cfg['terminate_event'] = self.terminate_event
+        # cfg['terminate_event'] = self.terminate_event
         self.process = multiprocessing.Process(target=self.initiator_agent._activate, args=(cfg,))
-        self.process.start()
+        self.work_process = self.process.start()
+        
+        return self.process
 
 
     def send_data(self, data):
@@ -89,13 +94,15 @@ class ThreadWorker(Worker):
     def start(self):
         logger.debug("Thread worker")
         self.work_queue = queue.Queue()
-        self.terminate_event = threading.Event()
+        # self.terminate_event = threading.Event()
         
         cfg = self.initiator_agent.config
         cfg['work_queue'] = self.work_queue
-        cfg['terminate_event'] = self.terminate_event
+        # cfg['terminate_event'] = self.terminate_event
         self.thread = threading.Thread(target=self.initiator_agent._activate, args=(cfg,))
-        self.thread.start()
+        self.work_process = self.thread.start()
+        
+        return self.thread
 
 
     def send_data(self, data):

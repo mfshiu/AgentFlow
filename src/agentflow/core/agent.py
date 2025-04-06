@@ -41,13 +41,11 @@ class Agent(BrokerNotifier):
         
         self._message_broker = None
         self.__topic_handlers: dict[str, function] = {}
-
-
+        
 
 # ==================
 #  Agent Initializing
 # ==================
-
         
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
@@ -72,7 +70,7 @@ class Agent(BrokerNotifier):
         if not config.CONCURRENCY_TYPE in self.config:
             self.config[config.CONCURRENCY_TYPE] = 'process'
         logger.info(self.M(f"self.config: {self.config}"))
-        self._get_worker().start()
+        self.work_process = self._get_worker().start()
         
         self._on_start()
         
@@ -165,40 +163,55 @@ class Agent(BrokerNotifier):
 
 
     def __activating(self):
-        logger.verbose(self.M("begin"))
         self.__data = {}
         self.__data_lock = threading.Lock()
         self.__connected_event = threading.Event()
 
         self.on_begining()
 
-        # Create broker
+        # Create broker with retry
         broker_config = self.get_config("broker", {'broker_type': BrokerType.Empty})
         logger.debug(self.M(f"broker_config: {broker_config}"))
-        self._broker = BrokerMaker().create_broker(BrokerType(broker_config['broker_type'].lower()), self)
-        is_success = True
-        try:
-            logger.debug(self.M("Ready to start broker.."))
-            self._broker.start(options=broker_config)
-        except ConnectionRefusedError:
-            logger.error(self.M("Broker startup failed."))
-            is_success = False
-        except Exception as ex:
-            logger.exception(ex)
-            logger.error(self.M("Broker startup failed."))
-            is_success = False
-                
-        self.__connected_event.wait()
-        logger.verbose(self.M("end"))
+        
+        retry_count = 0
+        max_retries = 10  # 可根據需求調整或設為 None 表示無限重試
+        retry_interval = 5  # 每次重試間隔秒數
+
+        is_success = False
+        while not is_success and (max_retries is None or retry_count < max_retries):
+            try:
+                logger.debug(self.M("Creating broker..."))
+                self._broker = BrokerMaker().create_broker(
+                    BrokerType(broker_config['broker_type'].lower()), self)
+                logger.debug(self.M("Ready to start broker.."))
+                self._broker.start(options=broker_config)
+                is_success = True
+            except ConnectionRefusedError as e:
+                logger.error(self.M(f"Broker startup failed (ConnectionRefusedError). Retrying...\n{e}"))
+            except Exception as e:
+                logger.error(self.M(f"Broker startup failed. Retrying...\n{e}"))
+
+            if not is_success:
+                logger.debug(self.M("Waiting for retry..."))
+                retry_count += 1
+                for _ in range(retry_interval):
+                    if self.__terminate_event.is_set():
+                        return False
+                    time.sleep(1)
+
+        if is_success:
+            self.__connected_event.wait()
+            logger.info(self.M("Broker started successfully."))
+        else:
+            logger.error(self.M(f"Broker startup failed after {max_retries} retries."))
+
         return is_success
 
 
     def _activate(self, config):
-        logger.verbose(self.M('Begin'))
         self.config = config
-        self.terminate_event = config['terminate_event']
+        self.__terminate_event = threading.Event()
 
-        
         if self.__activating():
             logger.verbose(self.M('__activating'))
             sig = inspect.signature(self.on_activate)
@@ -215,7 +228,7 @@ class Agent(BrokerNotifier):
             # Waiting for termination.
             logger.info(self.M("Running.."))
             work_queue = config['work_queue']
-            while not self.terminate_event.is_set():
+            while not self.__terminate_event.is_set():
                 try:
                     data = work_queue.get(timeout=1)
                     self._on_worker_data(data)
@@ -224,10 +237,9 @@ class Agent(BrokerNotifier):
                 except KeyboardInterrupt:
                     self._terminate()
         else:
-            self.terminate_event.set()
+            self.__terminate_event.set()
 
         self.__deactivating()
-        logger.verbose(self.M('End'))
         
         
     def _on_worker_data(self, data):
@@ -242,7 +254,7 @@ class Agent(BrokerNotifier):
         self._notify_children('terminate')
         def stop():
             time.sleep(1)
-            self.terminate_event.set()
+            self.__terminate_event.set()
         threading.Thread(target=stop).start()          
 
 
