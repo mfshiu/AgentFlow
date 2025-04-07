@@ -321,7 +321,7 @@ class Agent(BrokerNotifier):
 
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
-        logger.verbose(self.M(f"topic: {topic}, data: {data}, topic_wait: {topic_wait}"))
+        logger.verbose(self.M(f"topic: {topic}, data: {str(data)[:200]}.., topic_wait: {topic_wait}"))
         
         if isinstance(data, Parcel):
             pcl = data
