@@ -17,6 +17,7 @@ class Worker:
             multiprocessing.set_start_method('spawn')        
         self.initiator_agent = initiator_agent
         self.work_process = None
+        self.work_thread = None
         
         
     def create_event(self):
@@ -26,8 +27,8 @@ class Worker:
     def is_working(self):
         if self.work_process:
             return self.work_process.is_alive()
-        # elif hasattr(self, 'terminate_event'):
-        #     return not self.terminate_event.is_set()
+        elif self.work_thread:
+            return self.work_thread.is_alive()
         else:
             return False
 
@@ -99,10 +100,10 @@ class ThreadWorker(Worker):
         cfg = self.initiator_agent.config
         cfg['work_queue'] = self.work_queue
         # cfg['terminate_event'] = self.terminate_event
-        self.thread = threading.Thread(target=self.initiator_agent._activate, args=(cfg,))
-        self.work_process = self.thread.start()
+        self.work_thread = threading.Thread(target=self.initiator_agent._activate, args=(cfg,))
+        self.work_thread.start()
         
-        return self.thread
+        return self.work_thread
 
 
     def send_data(self, data):
@@ -113,5 +114,5 @@ class ThreadWorker(Worker):
     def stop(self):
         logger.debug(self.initiator_agent.M("Stopping.."))
         self.send_data('terminate')
-        self.thread.join()  # Wait for the process to finish
+        self.work_thread.join()  # Wait for the process to finish
         logger.debug(self.initiator_agent.M("Stopped."))
