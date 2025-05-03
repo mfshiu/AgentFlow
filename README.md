@@ -87,13 +87,6 @@ AgentFlow/
 └── README.md
 ```
 
-## 📖 Reference
-
-If you use this project in your research, please cite:
-
-> Chen, C. H., & Shiu, M. F. (2025). AgentFlow: Resilient Adaptive Cloud-Edge Framework for Multi-Agent Coordination. *IEEE Internet Computing (Special Issue on Programming Flexible Distributed Systems for the Internet Era)*.  
-> [PDF](./AgentFlow-v20.pdf)
-
 ## 📬 Contact
 
 For questions or collaboration inquiries, contact:
