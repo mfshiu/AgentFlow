@@ -79,11 +79,11 @@ Tested using a swarm of 50–500 autonomous mobile robots (AMRs):
 
 ```bash
 AgentFlow/
-├── agents/                # Holonic agent definitions
-├── logistics/             # Request/response/election logistics
-├── comm/                  # MQTT/DDS brokers
-├── examples/              # Sample AMR swarm scenarios
-├── configs/               # YAML-based orchestration
+├── src/agentflow/
+│          ├── broker/    # MQTT/DDS brokers
+│          ├── core/    # Holonic agent definitions
+│          └── logistics/    # Request/response/election logistics
+├── unittest/    # AgentFlow unittests
 └── README.md
 ```
 
