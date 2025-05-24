@@ -1,5 +1,4 @@
 import inspect
-import json
 from logging import Logger
 import queue
 import threading
@@ -23,7 +22,7 @@ logger:Logger = __import__('agentflow').get_logger()
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
-        logger.verbose(f'name: {name}, agent_config: {agent_config}')
+        logger.debug(f'name: {name}, agent_config: {agent_config}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -170,11 +169,13 @@ class Agent(BrokerNotifier):
         self.on_begining()
 
         # Create broker with retry
-        broker_config = self.get_config("broker", {'broker_type': BrokerType.Empty})
-        logger.debug(self.M(f"broker_config: {broker_config}"))
+        broker_config_all = self.get_config("broker", {'broker_type': BrokerType.Empty})
+        logger.debug(self.M(f"broker_config_all: {broker_config_all}"))
+        broker_name = broker_config_all['broker_name']
+        broker_config = broker_config_all[broker_name]
         
         retry_count = 0
-        max_retries = 10  # 可根據需求調整或設為 None 表示無限重試
+        max_retries = 1  # 可根據需求調整或設為 None 表示無限重試
         retry_interval = 5  # 每次重試間隔秒數
 
         is_success = False
@@ -322,7 +323,7 @@ class Agent(BrokerNotifier):
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
         logger.verbose(self.M(f"topic: {topic}, data: {str(data)[:200]}.., topic_wait: {topic_wait}"))
-        
+
         if isinstance(data, Parcel):
             pcl = data
             if pcl.topic_return:
@@ -335,7 +336,7 @@ class Agent(BrokerNotifier):
         else:
             pcl = Parcel.from_content(data)
             pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
-                
+
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
