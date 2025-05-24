@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="agentflow",  # Replace with your desired package name
-    version="0.1",
+    name="mas-agentflow",  
+    version="2025.5.24",
     packages=find_packages(where="src"),  # Tell setuptools to look for packages in 'src'
     package_dir={"": "src"},  # Set 'src' as the root directory for the package
     include_package_data=True,  # If you have any data files (e.g., non-Python files)
@@ -17,5 +17,5 @@ setup(
         #     'agentflow-cli=agentflow.cli:main',
         # ],
     },
-    python_requires='>=3.9',  # Specify the Python version you require
+    python_requires='>=3.11',  # Specify the Python version you require
 )
