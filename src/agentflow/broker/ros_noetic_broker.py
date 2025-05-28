@@ -6,7 +6,8 @@ from .message_broker import MessageBroker
 from .notifier import BrokerNotifier
 
 
-logger = __import__('agentflow').get_logger()
+import logging, os
+logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 class RosNoeticBroker(MessageBroker):

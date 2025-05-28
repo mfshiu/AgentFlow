@@ -1,7 +1,8 @@
 from paho.mqtt.client import Client
 
-logger = __import__('agentflow').get_logger()
-from .. import LOGGER_NAME
+import logging, os
+logger = logging.getLogger(os.getenv('LOGGER_NAME'))
+
 from .message_broker import MessageBroker
 from .notifier import BrokerNotifier
 

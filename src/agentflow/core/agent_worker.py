@@ -6,7 +6,8 @@ import threading
 # import agentflow.core.agent as aa
 
 
-logger:Logger = __import__('agentflow').get_logger()
+import logging, os
+logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 

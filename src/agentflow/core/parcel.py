@@ -2,41 +2,67 @@ from abc import ABC, abstractmethod
 import json
 import pickle
 
-from agentflow import ensure_size
-
-
 VERSION = 3
 
 
+def ensure_size(text: str, max_length: int = 300) -> str:
+    """
+    Ensure a text size is less than or equal to the specified max length.
+    If the text exceeds the max length, return a truncated version ending with '..'.
+
+    Args:
+        text (str): The input string.
+        max_length (int): The maximum allowed length of the string. Default is 300.
+
+    Returns:
+        str: The original text if within the limit, otherwise a truncated version.
+    """
+    if text:
+        if len(text) <= max_length:
+            return text
+        else:
+            return text[:max_length - 2] + '..'
+    else:
+        return text
+
+
+
 class Parcel(ABC):
-    def __init__(self, content=None, topic_return:str=None):
+    def __init__(self, content=None, topic_return=None):
         self.version = VERSION
         self.content = content
-        self.topic_return:str = topic_return
+        self.topic_return = topic_return
         self.error = None
 
 
     def __str__(self):
+        def _convert_content(content)-> str:
+            """ Convert the content of the parcel to a string representation.
+            This method handles different types of content, including bytes, dicts, and lists.
+            Args:
+                content: The content to convert, which can be of various types.
+            Returns:
+                str: A string representation of the content, ensuring it is readable.
+            """
+            if isinstance(content, bytes):
+                try:
+                    str_content = ensure_size(content.decode('utf-8', 'replace'))
+                except Exception as e:
+                    str_content = f"len(<binary data>): {len(content)}, error: {e}"  # Fallback message for undecodable bytes
+            elif isinstance(content, dict):
+                str_content = {key: _convert_content(value) for key, value in content.items()}
+            elif isinstance(content, list):
+                str_content = [_convert_content(item) for item in content]
+
+            return str(str_content)
+        
+        
         return json.dumps({
             "version": self.version,
-            "content": ensure_size(self._convert_content(self.content)),
+            "content": ensure_size(_convert_content(self.content)),
             "topic_return": self.topic_return,
             "error": self.error
         }, indent=4, ensure_ascii=False)
-
-
-    def _convert_content(self, content):
-        if isinstance(content, bytes):
-            try:
-                content = ensure_size(self.content.decode('utf-8', 'replace'))
-            except Exception as e:
-                content = f"len(<binary data>): {len(content)}, error: {e}"  # Fallback message for undecodable bytes
-        elif isinstance(content, dict):
-            content = {key: self._convert_content(value) for key, value in content.items()}
-        elif isinstance(content, list):
-            content = [self._convert_content(item) for item in content]
-
-        return content
 
 
     @staticmethod
