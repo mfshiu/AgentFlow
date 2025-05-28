@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="mas-agentflow",  
-    version="2025.5.24",
+    version="2025.5.29",
     packages=find_packages(where="src"),  # Tell setuptools to look for packages in 'src'
     package_dir={"": "src"},  # Set 'src' as the root directory for the package
     include_package_data=True,  # If you have any data files (e.g., non-Python files)
