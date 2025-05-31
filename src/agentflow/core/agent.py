@@ -541,7 +541,7 @@ class Agent(BrokerNotifier):
         def handle_message(topic_handler, topic, p:Parcel):
             if p.topic_return:
                 try:
-                    logger.debug(f"topic: {topic}, p: {p}")
+                    logger.debug(f"topic: {topic}, topic_return: {p.topic_return}")
                     data_resp = topic_handler(topic, p)
                 except Exception as ex:
                     logger.exception(ex)
