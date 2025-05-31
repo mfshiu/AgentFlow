@@ -1,4 +1,5 @@
 from paho.mqtt.client import Client
+from paho.mqtt.enums import CallbackAPIVersion
 
 import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -9,7 +10,7 @@ from .notifier import BrokerNotifier
 
 class MqttBroker(MessageBroker):
     def __init__(self, notifier:BrokerNotifier):
-        self._client = Client()
+        self._client = Client(callback_api_version=CallbackAPIVersion.VERSION2)
         self.host = ""
         self.port = 0
         self.keepalive = 0
@@ -17,9 +18,9 @@ class MqttBroker(MessageBroker):
         super().__init__(notifier=notifier)
 
 
-    def _on_connect(self, client:Client, userdata, flags, rc):
+    # def _on_connect(self, client:Client, userdata, flags, rc):
+    def _on_connect(self, client: Client, userdata, flags, reasonCode, properties):
         logger.info(f"MQTT broker connected. url: {self.host}, port: {self.port}, keepalive: {self.keepalive}")
-        # logger.debug(f"Client: {client}\nuserdata:{userdata}\nflags: {flags}\nrc: {rc}")
         self._notifier._on_connect()
 
 
