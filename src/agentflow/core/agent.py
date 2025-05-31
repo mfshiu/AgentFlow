@@ -35,7 +35,7 @@ class Agent(BrokerNotifier):
         self.parent_name = name.split('.', 1)[1] if '.' in name else None
         self.interval_seconds = 0
         self._agent_worker: Optional["Worker"] = None
-        
+
         self._children: dict = {}
         self._parents: dict = {}
         
@@ -533,6 +533,7 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
+        # logger.debug(self.M(f"topic: {topic}, data: {data}"))        
         pcl = Parcel.from_payload(data)
 
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
@@ -540,6 +541,7 @@ class Agent(BrokerNotifier):
         def handle_message(topic_handler, topic, p:Parcel):
             if p.topic_return:
                 try:
+                    logger.debug(f"topic: {topic}, p: {p}")
                     data_resp = topic_handler(topic, p)
                 except Exception as ex:
                     logger.exception(ex)
@@ -554,7 +556,7 @@ class Agent(BrokerNotifier):
                     topic_handler(topic, p)
                 except Exception as ex:
                     logger.exception(ex)
-                
+
         threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()
 
 
