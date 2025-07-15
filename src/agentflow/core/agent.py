@@ -198,19 +198,22 @@ class Agent(BrokerNotifier):
         self.config = config
         self.terminate_event = config['terminate_event']
 
-        
         if self.__activating():
             logger.verbose(self.M('__activating'))
             sig = inspect.signature(self.on_activate)
-            if len(sig.parameters) == 0:
-                logger.verbose(self.M("Invoke on_activate 1"))
-                self.on_activate()
-            elif isinstance(sig.parameters.get('self'), Agent):
-                logger.verbose(self.M("Invoke on_activate 2"))
-                self.on_activate(self)
-            else:
-                logger.verbose(self.M("Invoke on_activate 3"))
-                self.on_activate(self.config)
+            try:
+                if len(sig.parameters) == 0:
+                    logger.verbose(self.M("Invoke on_activate 1"))
+                    self.on_activate()
+                elif isinstance(sig.parameters.get('self'), Agent):
+                    logger.verbose(self.M("Invoke on_activate 2"))
+                    self.on_activate(self)
+                else:
+                    logger.verbose(self.M("Invoke on_activate 3"))
+                    self.on_activate(self.config)
+            except Exception as e:
+                logger.error(self.M(f"on_activate failed: {e}"))
+                self.terminate_event.set()
 
             # Waiting for termination.
             logger.info(self.M("Running.."))
