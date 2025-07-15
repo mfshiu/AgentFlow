@@ -1,5 +1,4 @@
-from paho.mqtt.client import Client
-from paho.mqtt.enums import CallbackAPIVersion
+from rticonnextdds_connector import Connector
 
 import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -8,19 +7,18 @@ from .message_broker import MessageBroker
 from .notifier import BrokerNotifier
 
 
-class MqttBroker(MessageBroker):
+class DdsBroker(MessageBroker):
     def __init__(self, notifier:BrokerNotifier):
-        self._client = Client(callback_api_version=CallbackAPIVersion.VERSION2)
-        self.host = ""
-        self.port = 0
-        self.keepalive = 0
+        self._connector = None  # Connector instance of RTI Connext DDS
+        self.participant_url:str = ''  # URL of the DDS participant configuration
+        self.domain_participant:str = ''  # Domain participant name
 
         super().__init__(notifier=notifier)
 
 
     # def _on_connect(self, client:Client, userdata, flags, rc):
-    def _on_connect(self, client: Client, userdata, flags, reasonCode, properties):
-        logger.info(f"MQTT broker connected. url: {self.host}, port: {self.port}, keepalive: {self.keepalive}")
+    def _publication_matched(self):
+        logger.info(f"DDS broker connected. participant_url: {self.participant_url}, domain_participant: {self.domain_participant}")
         self._notifier._on_connect()
 
 
@@ -38,6 +36,7 @@ class MqttBroker(MessageBroker):
     
     
     def start(self, options:dict):
+        self._connector = Connector(config_name="MyParticipantLibrary::MyParticipant", url="MyParticipant.xml")
         logger.info(f"MQTT broker is starting...")
         
         self._client.on_connect = self._on_connect

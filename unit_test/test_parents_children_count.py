@@ -9,8 +9,8 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel
 from unit_test.config_test import config_test
 
-from logging import Logger
-logger:Logger = __import__('AgentFlow').get_logger()
+import logging, os
+logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 

@@ -1,38 +1,95 @@
-# Physiologically Inspired Framework for Complex System Integration
+# AgentFlow
 
+**Resilient Adaptive Cloud-Edge Framework for Multi-Agent Coordination**
 
-## Introduction
-In this study, inspired by the physiological operation of the human body, an efficient and resilient software framework was developed to aid in the integration of mature AI technologies, allowing them to coordinate with one another to accomplish more advanced goals. A navigation system for the visually impaired was then developed to validate the framework, with promising experimental results. This framework can be applied to other types of AI systems.
+AgentFlow is a Multi-Agent System (MAS)-based framework for scalable, fault-tolerant coordination across heterogeneous cloud-edge infrastructures. Designed for real-time and mission-critical applications, AgentFlow enables decentralized, dynamic service orchestration using programmable logistics objects and abstract agent interfaces.
 
+## 🔍 Key Features
 
-## Instruction
-1. Install the required packages.
-````
-pip install -r requirements.txt
-````
-2. Create config.py, rewite the MQTT settings. 
-````
-cp config.sample.py config.py
-````
-3. Start the framework.
-````
-python start.py
-````
+- **Decentralized Decision Making**  
+  Supports agent-driven coordination without central servers using lightweight consensus.
 
+- **Programmable Logistics Objects**  
+  Request/Response Logistics allow precise, selective communication, minimizing unnecessary network traffic.
 
-## Class Diagram
-The class diagram of the integration of agents and coordination. HolonicAgent represents the core, and HeadAgents and BodyAgents represent the collection of head agents and subagents, respectively. MQTT is the fundamental communication protocol for agents in the global circulation system, and MqttClient is a private member of HolonicAgent, which allows the agent to have built-in MQTT connection and reception capabilities.
+- **Dynamic Service Election**  
+  Agents elect optimal services at runtime based on real-time load and responsiveness.
 
-All agents inherit from HolonicAgent to form a hierarchical structure, and they use the DDS to achieve neural message transmission depending on their specific behavior. Each super-agent is a DDS domain that publishes or subscribes to related topics with the required QoS, such as the DEADLINE policy to confirm the date of the data or the TRANSPORT_PRIORITY policy to define the transmission priority order, in order to achieve the purpose of a specific agent.
-<figure>
-    <img src="https://i.imgur.com/9vIa7JH.png" height=500>
-    <figcaption>Class diagram of integration</figcaption>
-</figure>
+- **Many-to-Many Coordination Model**  
+  Enables scalable task distribution and autonomous recovery in complex cloud-edge environments.
 
+- **Resilience and Fault Tolerance**  
+  Supports agent-level fault containment and task reassignment under node failures.
 
-## Sequence Diagram
-According to the sequence diagram depicted in below, the DDS and MQTT serve to transmit messages for the agents. Action 1 entails generating an independent process immediately after the root agent is initialized. Action 2 entails subscribing to or publishing relevant topics within the QoS constraints. Action 3 entails recursively calling all the subagents to initiate the action. The agent main action is performed in a separate process of Action 2 until it is notified of its termination. Finally, Action 4 entails generating a global broadcast with MQTT, with a system termination notification serving as an example in this study.
-<figure>
-    <img src="https://i.imgur.com/6lA3w1X.png" height=500>
-    <figcaption>Sequence Diagram of Integration</figcaption>
-</figure>
+- **Modular Architecture**  
+  Holonic agent structure with loosely coupled communication layers (e.g., MQTT, DDS).
+
+## 🧱 Architecture Overview
+
+```
++----------------------------+
+|     Orchestration Layer    | <-- Load balancing, no central control
++----------------------------+
+|         Agent Layer        | <-- Holonic agents: Perception, Decision, Action
++----------------------------+
+|     Communication Layer    | <-- MQTT / DDS pub-sub abstraction
++----------------------------+
+```
+
+## 🧠 How It Works
+
+AgentFlow employs an event-driven publish-subscribe pattern with three logistics mechanisms:
+
+- **Selective Request-Response**: Each client gets a unique topic to prevent message broadcasting.
+- **Dynamic Election**: Tasks are dynamically assigned to the least-loaded agent.
+- **Composite Coordination**: Coordinators manage agent clusters for many-to-many interactions.
+
+### Example Algorithms
+
+**Service Agent Selection:**
+```math
+s^* = \arg\min_{s \in S} \text{Load}(s)
+```
+
+**Communication Mapping:**
+```math
+f: c_i \rightarrow t_i
+```
+
+## 📊 Experimental Results
+
+Tested using a swarm of 50–500 autonomous mobile robots (AMRs):
+
+| Metric                    | Result            |
+|---------------------------|-------------------|
+| Task Success Rate         | 98.5%             |
+| Task Assignment Latency   | 30–63 ms          |
+| Election Convergence Time | ~18 ms            |
+| MTTR under failure        | < 30 sec          |
+| Orphaned Tasks (30% fail) | 14 (of 1000+)     |
+
+## 🚀 Applications
+
+- Smart warehouses and AMR fleets
+- Industrial IoT and edge robotics
+- Intelligent grid and healthcare logistics
+- Programmable, real-time distributed systems
+
+## 📦 Repository Structure
+
+```bash
+AgentFlow/
+├── src/agentflow/
+│          ├── broker/    # MQTT/DDS brokers
+│          ├── core/    # Holonic agent definitions
+│          └── logistics/    # Request/response/election logistics
+├── unittest/    # AgentFlow unittests
+└── README.md
+```
+
+## 📬 Contact
+
+For questions or collaboration inquiries, contact:
+
+- Ming Fang Shiu – [108582003@cc.ncu.edu.tw](mailto:108582003@cc.ncu.edu.tw)
+- Prof. Ching Han Chen – [pierre@csie.ncu.edu.tw](mailto:pierre@csie.ncu.edu.tw)

@@ -8,8 +8,8 @@ from .ros_broker import RosBroker
 from .notifier import BrokerNotifier
 
 
-from logging import Logger
-logger:Logger = __import__('agentflow').get_logger()
+import logging, os
+logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 
