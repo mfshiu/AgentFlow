@@ -132,6 +132,7 @@ _bak/
 _log/
 _input/
 _output/
+_test/
 _upload/
 tests/lab/lab_config.py
 tests/guide/config.py

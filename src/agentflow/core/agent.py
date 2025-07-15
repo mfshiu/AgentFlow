@@ -1,13 +1,14 @@
+import asyncio
 import inspect
 import logging
 import queue
 import threading
 import time 
+from tkinter import N
 from typing import final, Optional
 import uuid
 
 from agentflow.core.parcel import Parcel
-
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -41,6 +42,8 @@ class Agent(BrokerNotifier):
         
         self._message_broker = None
         self.__topic_handlers: dict[str, function] = {}
+        
+        self._broker = None
         
 
 # ==================
@@ -126,6 +129,10 @@ class Agent(BrokerNotifier):
 
     def is_active(self):
         return self._agent_worker is not None and self._agent_worker.is_working()
+
+
+    def on_activating(self):
+        pass
     
     
     def on_activate(self, config=None):
@@ -137,14 +144,6 @@ class Agent(BrokerNotifier):
 
 
     def on_terminated(self):
-        pass
-
-
-    def on_begining(self):
-        pass
-
-
-    def on_began(self):
         pass
 
 
@@ -173,7 +172,7 @@ class Agent(BrokerNotifier):
         self.__data_lock = threading.Lock()
         self.__connected_event = threading.Event()
 
-        self.on_begining()
+        self.on_activating()
 
         # Create broker with retry
         broker_config_all = self.get_config("broker", {'broker_type': BrokerType.Empty})
@@ -268,7 +267,8 @@ class Agent(BrokerNotifier):
     def __deactivating(self):        
         self.on_terminating()
             
-        self._broker.stop()
+        if self._broker:
+            self._broker.stop()
         
         self.on_terminated()
         
@@ -301,6 +301,33 @@ class Agent(BrokerNotifier):
 # =====================
 #  Publish / Subscribe
 # =====================
+    # class DataEvent:
+    #     def __init__(self):
+    #         try:
+    #             self.loop = asyncio.get_running_loop()
+    #             self.future: asyncio.Future = self.loop.create_future()
+    #             self.async_mode = True
+    #         except RuntimeError:
+    #             self.event = threading.Event()
+    #             self.data = None
+    #             self.async_mode = False
+
+    #     def set_data(self, data):
+    #         if self.async_mode:
+    #             if not self.future.done():
+    #                 self.future.set_result(data)
+    #         else:
+    #             self.data = data
+    #             self.event.set()
+
+    #     def wait(self, timeout: float = 30):
+    #         if self.async_mode:
+    #             return asyncio.wait_for(self.future, timeout)
+    #         else:
+    #             if self.event.wait(timeout):
+    #                 return self.data
+    #             else:
+    #                 raise TimeoutError("No response received within timeout period.")
     class DataEvent:
         def __init__(self, event=None):
             import threading
@@ -313,7 +340,10 @@ class Agent(BrokerNotifier):
     def publish(self, topic, data=None):
         pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)      
         try:
-            self._broker.publish(topic, pcl.payload())
+            if self._broker:
+                self._broker.publish(topic, pcl.payload())
+            else:
+                logger.error("Cannot publish: _broker is None.")
         except Exception as ex:
             logger.exception(ex)
 
@@ -322,6 +352,38 @@ class Agent(BrokerNotifier):
         return f'{self.tag}-{int(time.time()*1000)}/{topic}'
 
 
+    # def publish_sync(self, topic, data=None, topic_wait=None, timeout=30) -> 'Parcel':
+    #     if isinstance(data, Parcel):
+    #         pcl = data
+    #         if pcl.topic_return:
+    #             if topic_wait:
+    #                 logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{pcl.topic_return}'.")
+    #         elif topic_wait:
+    #             pcl.topic_return = topic_wait
+    #         else:
+    #             pcl.topic_return = self.__generate_return_topic(topic)
+    #     else:
+    #         pcl = Parcel.from_content(data)
+    #         pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
+
+    #     data_event = Agent.DataEvent()
+
+    #     def handle_response(topic_resp, pcl_resp: Parcel):
+    #         data_event.set_data(pcl_resp)
+
+    #     self.subscribe(pcl.topic_return, topic_handler=handle_response)
+    #     self.publish(topic, pcl)
+
+    #     result = data_event.wait(timeout)
+
+    #     if asyncio.iscoroutine(result):
+    #         # 非同步模式，需執行 coroutine 並取得結果
+    #         loop = asyncio.get_event_loop()
+    #         result = loop.run_until_complete(result)
+
+    #     if not isinstance(result, Parcel):
+    #         raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
+    #     return result    
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
         if isinstance(data, Parcel):
@@ -365,7 +427,7 @@ class Agent(BrokerNotifier):
                 logger.warning(self.M(f"Exist the handler for topic: {topic}"))
             self.__topic_handlers[topic] = topic_handler
 
-        return self._broker.subscribe(topic, data_type)
+        return self._broker.subscribe(topic, data_type) if self._broker else None
     
     
     def __register_child(self, child_id:str, child_info:dict):
