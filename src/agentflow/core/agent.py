@@ -1,7 +1,8 @@
-import asyncio
 import inspect
 import logging
 import queue
+import random
+import string
 import threading
 import time 
 from tkinter import N
@@ -44,6 +45,7 @@ class Agent(BrokerNotifier):
         self.__topic_handlers: dict[str, function] = {}
         
         self._broker = None
+        self._connected_once = False
         
 
 # ==================
@@ -183,40 +185,31 @@ class Agent(BrokerNotifier):
         broker_name = broker_config_all['broker_name']
         broker_config = broker_config_all[broker_name]
         
-        retry_count = 0
-        max_retries = 1  # 可根據需求調整或設為 None 表示無限重試
-        retry_interval = 5  # 每次重試間隔秒數
-
-        is_success = False
-        while not is_success and (max_retries is None or retry_count < max_retries):
+        retry = 0
+        max_retries = 3
+        interval = 5
+        while retry < max_retries and not self.__terminate_event.is_set():
             try:
-                logger.debug(self.M("Creating broker..."))
                 self._broker = BrokerMaker().create_broker(
-                    BrokerType(broker_config['broker_type'].lower()), self)
-                logger.debug(self.M("Ready to start broker.."))
+                    BrokerType(broker_config['broker_type'].lower()), self
+                )
+                # 等待連線成功或失敗（Max 10秒）
                 self._broker.start(options=broker_config)
-                is_success = True
-            except ConnectionRefusedError as e:
-                logger.error(self.M(f"Broker startup failed (ConnectionRefusedError). Retrying...\n{e}"))
-            except Exception as e:
-                logger.error(self.M(f"Broker startup failed. Retrying...\n{e}"))
-
-            if not is_success:
-                logger.debug(self.M("Waiting for retry..."))
-                retry_count += 1
-                for _ in range(retry_interval):
-                    if self.__terminate_event.is_set():
-                        return False
+                logger.info(self.M("Broker started successfully."))
+                return True
+            except (TimeoutError, ConnectionError) as e:
+                retry += 1
+                logger.error(self.M(f"Broker start failed ({retry}/{max_retries}): {e}"))
+                if retry >= max_retries: break
+                for _ in range(interval):
+                    if self.__terminate_event.is_set(): return False
                     time.sleep(1)
+            except Exception as e:
+                logger.exception(self.M(f"Unexpected error starting broker: {e}"))
+                return False
 
-        if is_success:
-            self.__connected_event.wait()
-            logger.info(self.M("Broker started successfully."))
-        else:
-            logger.error(self.M(f"Broker startup failed after {max_retries} retries."))
-
-        return is_success
-
+        logger.error(self.M("Broker startup failed after retries."))
+        return False
 
     def _activate(self, config):
         self.config = config
@@ -231,8 +224,7 @@ class Agent(BrokerNotifier):
             else:
                 self.on_activate(self.config)
 
-            # Waiting for termination.
-            logger.info(self.M("Running.."))
+            logger.info(self.M("Waiting for termination..."))
             work_queue = config['work_queue']
             while not self.__terminate_event.is_set():
                 try:
@@ -301,33 +293,6 @@ class Agent(BrokerNotifier):
 # =====================
 #  Publish / Subscribe
 # =====================
-    # class DataEvent:
-    #     def __init__(self):
-    #         try:
-    #             self.loop = asyncio.get_running_loop()
-    #             self.future: asyncio.Future = self.loop.create_future()
-    #             self.async_mode = True
-    #         except RuntimeError:
-    #             self.event = threading.Event()
-    #             self.data = None
-    #             self.async_mode = False
-
-    #     def set_data(self, data):
-    #         if self.async_mode:
-    #             if not self.future.done():
-    #                 self.future.set_result(data)
-    #         else:
-    #             self.data = data
-    #             self.event.set()
-
-    #     def wait(self, timeout: float = 30):
-    #         if self.async_mode:
-    #             return asyncio.wait_for(self.future, timeout)
-    #         else:
-    #             if self.event.wait(timeout):
-    #                 return self.data
-    #             else:
-    #                 raise TimeoutError("No response received within timeout period.")
     class DataEvent:
         def __init__(self, event=None):
             import threading
@@ -349,41 +314,10 @@ class Agent(BrokerNotifier):
 
         
     def __generate_return_topic(self, topic):
-        return f'{self.tag}-{int(time.time()*1000)}/{topic}'
+        alphabet = string.digits + string.ascii_lowercase
+        rand = ''.join(random.choice(alphabet) for _ in range(10))
+        return f"{self.tag}-{rand}/{topic}"
 
-
-    # def publish_sync(self, topic, data=None, topic_wait=None, timeout=30) -> 'Parcel':
-    #     if isinstance(data, Parcel):
-    #         pcl = data
-    #         if pcl.topic_return:
-    #             if topic_wait:
-    #                 logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{pcl.topic_return}'.")
-    #         elif topic_wait:
-    #             pcl.topic_return = topic_wait
-    #         else:
-    #             pcl.topic_return = self.__generate_return_topic(topic)
-    #     else:
-    #         pcl = Parcel.from_content(data)
-    #         pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
-
-    #     data_event = Agent.DataEvent()
-
-    #     def handle_response(topic_resp, pcl_resp: Parcel):
-    #         data_event.set_data(pcl_resp)
-
-    #     self.subscribe(pcl.topic_return, topic_handler=handle_response)
-    #     self.publish(topic, pcl)
-
-    #     result = data_event.wait(timeout)
-
-    #     if asyncio.iscoroutine(result):
-    #         # 非同步模式，需執行 coroutine 並取得結果
-    #         loop = asyncio.get_event_loop()
-    #         result = loop.run_until_complete(result)
-
-    #     if not isinstance(result, Parcel):
-    #         raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
-    #     return result    
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
         if isinstance(data, Parcel):
@@ -572,6 +506,12 @@ class Agent(BrokerNotifier):
         
         
     def _on_connect(self):
+        if self._connected_once:
+            logger.warning(self.M("Already connected to the broker."))
+            return
+        self._connected_once = True
+        logger.info(self.M("Connected to the broker."))
+
         for event in EventHandler:
             attr_name = str(event).lower()[len('EventHandler.'):]
             setattr(self, attr_name, self.get_config(str(event), getattr(self, attr_name, None)))
