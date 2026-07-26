@@ -21,6 +21,12 @@ class FakeWorker:
     worker. Returning None causes Agent.DataEvent (agent.py:297) to fall
     back to threading.Event(), which needs no multiprocessing setup.
 
+    Agent.terminate calls self._agent_worker.stop(); FakeWorker.stop is
+    a no-op because there is no real worker to signal.
+
+    Agent.is_active calls self._agent_worker.is_working(); FakeWorker
+    always reports False because it is never 'started'.
+
     This class deliberately does NOT inherit from Worker so that
     multiprocessing.set_start_method('spawn') (agent_worker.py:13-14) is
     not triggered as a global side effect across the test suite.
@@ -28,6 +34,13 @@ class FakeWorker:
 
     def create_event(self):
         return None
+
+    def stop(self):
+        # No-op: no worker thread/process to signal.
+        return None
+
+    def is_working(self) -> bool:
+        return False
 
 
 class FakeBroker:
