@@ -97,16 +97,52 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-05 — Suspected reply loop on error paths and on default handlers
 
+- **Status**: **RESOLVED** (2026-07-26) — see [RFC-003](../rfc/RFC-003-auto-reply-contract.md)
 - **Severity**: High
 - **Category**: Correctness / Message Reliability
-- **File / Function / Line**: `src/agentflow/core/agent.py:543–555` in `_on_message.handle_message`; `parcel.py:95–107` (`topic_return` survives round-trip via `_get_managed_data` / `_set_managed_data`)
-- **Evidence**:
-  - The dispatch always calls `self.publish(pcl.topic_return, data_resp)` when `p.topic_return` is truthy.
-  - On exception, `data_resp = p` — and `p.topic_return` is still set → the reply parcel itself has `topic_return`, potentially triggering another cycle at the requester side where `handle_response` returns `None` and re-enters the same branch.
-- **Trigger**: Any `publish_sync` where the responder handler raises, or where the requester's `handle_response` closure allows re-entry.
-- **Impact**: Infinite reply loop, broker flood.
-- **Confidence**: Medium — depends on whether the broker echoes self-published messages (MQTT usually does).
-- **Recommended verification test**: Run a scripted `publish_sync` where the responder raises; observe broker traffic on the return topic.
+- **File / Function / Line** (historical): `src/agentflow/core/agent.py:543–555` in `_on_message.handle_message`; `parcel.py:95–107` (`topic_return` survives round-trip via `_get_managed_data` / `_set_managed_data`)
+- **Evidence** (historical):
+  - The dispatch always called `self.publish(pcl.topic_return, data_resp)` when `p.topic_return` was truthy — including on the fall-through-to-on_message path.
+  - On exception, `data_resp = p` — and `p.topic_return` was still set → the reply parcel itself carried `topic_return`, seeding a cycle whenever the broker delivered the reply back to the same agent (paho self-echo) or to a peer whose handler also produced a Parcel-with-topic_return.
+- **Trigger** (historical): Handler exception + broker self-echo; handler returns Parcel-with-topic_return + broker self-echo; two-agent mutual reply where both handlers return Parcel-with-topic_return.
+- **Impact** (historical): Infinite reply loop, broker flood.
+- **Confidence at discovery**: Medium.
+- **Recommended verification test** (was): Run a scripted `publish_sync` where the responder raises; observe broker traffic on the return topic.
+
+### Runtime confirmation (before fix)
+
+R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests/unit/core/test_agent_reply_behavior.py`. Three concrete loop patterns were reproduced against a bounded FakeBroker with self-echo:
+
+1. **Handler exception loop** — `test_scenario_9_handler_exception_creates_reply_loop_bounded_by_broker` hit the 20-publish bound.
+2. **Handler-returns-loopy-Parcel loop** — `test_scenario_4_5_handler_returns_topic_return_parcel_creates_loop` hit the 20-publish bound.
+3. **Two-agent mutual reply loop** — `test_scenario_6_two_agent_reply_loop_via_hub_broker` hit the 30-publish bound via a shared hub broker.
+
+### Resolution
+
+- **Resolved on**: 2026-07-26
+- **RFC**: [RFC-003 — auto-reply contract](../rfc/RFC-003-auto-reply-contract.md) (Implemented)
+- **Scope of change**: `src/agentflow/core/agent.py` — `Agent._on_message` (`@final`, public signature unchanged). Three rules now hold together:
+  - **R-fallback-silent**: `is_specific_handler = topic in self.__topic_handlers` is computed at dispatch. Auto-reply is emitted **iff** `pcl.topic_return` is truthy AND `is_specific_handler` is `True`. Fall-through to `on_message` still runs the handler but never publishes an implicit reply.
+  - **R-strip-topic_return**: before publishing an auto-reply, if `data_resp` is a `Parcel` whose `topic_return` is truthy, the framework reconstructs a fresh parcel via `type(data_resp)(data_resp.content)`, copies `.error`, and uses it as the reply. The handler's returned object is not mutated.
+  - **R-exception-fresh**: on handler exception, the reply is a new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming parcel `p` is not mutated; handlers that store a reference to `p` observe its original state.
+- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
+- **Observable behavioural changes** (three; all narrow, all in the loop-prevention direction):
+  1. A topic that is subscribed but has no specific handler no longer produces an implicit auto-reply when a message with `topic_return` arrives; the message dispatches to `on_message` default (no-op) and no publish is emitted.
+  2. Auto-reply parcels never carry `topic_return` on the wire. A handler that returns a `Parcel` with `topic_return` set observes the reply carrying `topic_return=None` after reconstruction, while the handler's own returned object is left intact.
+  3. Handler exceptions no longer mutate the incoming parcel; handlers that stored a reference to their input parcel see its original `content`, `error`, and `topic_return`.
+- **Runtime verification** (as of 2026-07-26):
+  - Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+  - Result: **135 passed, 0 failed, 0 xfailed, 0 xpassed** in 2.73 s.
+  - The three previously loop-forcing scenarios (`test_scenario_9_...`, `test_scenario_4_5_...`, `test_scenario_6_...`) were rewritten to assert termination and each observes ≤ 3 publishes instead of hitting the 20/30 bound.
+  - Normal request-response paths verified: `test_scenario_1` (no topic_return), `test_scenario_2` (None), `test_scenario_3` (scalar), `test_scenario_4` (Parcel), `test_publish_sync_happy_path_still_works_under_RFC_003`.
+  - Rule verification: `test_default_on_message_does_not_auto_reply_when_no_specific_handler` (R-fallback-silent), 5 tests under R-strip-topic_return, 3 tests under R-exception-fresh.
+- **No regression**: RFC-001's 27 R-02 cleanup tests and RFC-002's 46 R-13 fast-fail tests both continue to pass unchanged. `test_publish_sync_late_reply_after_cleanup_is_silently_dropped` explicitly validates the RFC-003 × RFC-001 interaction.
+- **Known issues NOT resolved by this fix** (tracked separately):
+  - **R-01** — `BinaryParcel.pickle.loads` on wire bytes.
+  - **R-03** — MQTT reconnect + re-subscribe.
+  - **R-04** — `Agent._on_message` still spawns one short-lived thread per received message.
+  - **Concurrent same-`topic_wait` race** — `Agent.subscribe` silent overwrite on duplicate registrations.
+  - **Broker-side `MessageInfo`** — `MqttBroker.publish` still discards paho `MessageInfo` (rc/mid); deferred to a future RFC on broker observability.
 
 ---
 
@@ -453,7 +489,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | Open | `Worker.stop()` join without timeout |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
-| R-05 | High | Medium | Open | Suspected reply loop |
+| R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | Medium | Open | Process-mode pickling |
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |

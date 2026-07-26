@@ -127,7 +127,7 @@ Observed:
 - One new `threading.Thread` per received message, no daemon flag, no pool, no upper bound → Risk R-04.
 - `Parcel.from_payload` raises `TypeError` on unknown HEAD (`parcel.py:89`); the raise happens on the broker's paho loop thread, then it is caught by `MqttBroker._on_message`.
 - **BinaryParcel triggers `pickle.loads` on wire bytes** (`parcel.py:146`) → Risk R-01.
-- If the handler returns `None` (typical for `on_message` overrides) and `p.topic_return` is set, `data_resp = None` is published to `topic_return`. That means any parcel that arrives with a `topic_return` set will cause a reply — even if the receiver has no intention of replying. See Risk R-05.
+- Auto-reply eligibility (**post-RFC-003, 2026-07-26**): an auto-reply is emitted only when both (a) the incoming `pcl.topic_return` is truthy AND (b) the dispatched handler was a **specifically registered** entry in `__topic_handlers` (not the fall-through to `on_message`). See [RFC-003](../rfc/RFC-003-auto-reply-contract.md) and R-05 in the risk register. The pre-RFC-003 behaviour where a fall-through `on_message` also generated an implicit reply is no longer the case.
 
 ---
 
@@ -242,23 +242,23 @@ For every `publish_sync` call, regardless of exit path (success, `TimeoutError`,
 
 The one exception is the **identity-guard bypass**: if a foreign handler races onto the same topic between `subscribe` and `finally`, the guard skips both the pop and the unsubscribe. In that case the foreign handler is preserved and the (already lost) subscription is not torn down. Verified by `test_identity_guard_preserves_foreign_handler_on_same_topic`.
 
-### Suspected reply loop (Confidence: Medium — not verified)
+### Reply loop — RESOLVED 2026-07-26 (RFC-003)
 
-`handle_response` (`agent.py:338–341`) returns `None`. The parcel received on `return_topic` still carries `pcl.topic_return` = the same `return_topic` (round-tripped through `_get_managed_data` / `_set_managed_data`, `parcel.py:95–107`). In `_on_message` (`agent.py:543–555`), whenever `p.topic_return` is truthy, the framework publishes `data_resp` back to `p.topic_return`. So:
+> **Update (2026-07-26)**: the suspected reply loop was **confirmed by runtime evidence** and then **Resolved by [RFC-003](../rfc/RFC-003-auto-reply-contract.md)** — see [`docs/audit/05-risk-register.md` R-05](05-risk-register.md#r-05--suspected-reply-loop-on-error-paths-and-on-default-handlers).
 
-```
-Requester subscribes return_topic
-Responder publishes to return_topic (topic_return echoed in parcel)
-Requester._on_message receives → handle_response returns None → data_resp = None
-Requester publishes None to return_topic (because topic_return is still set on the parcel it just received)
-Requester._on_message receives its own publish → handle_response returns None → publishes again
-… loop
-```
+Three loop patterns were runtime-confirmed under a bounded self-echo broker in `tests/unit/core/test_agent_reply_behavior.py`:
 
-**Whether this loop actually triggers depends on**:
-- Whether the responder actually copies `topic_return` into the response parcel it emits. In current code the request-side sets `pcl.topic_return` before publish; the responder is expected to *reply on that topic*, not to re-emit a parcel with that topic set. But the current dispatch code (`agent.py:555`) does `self.publish(pcl.topic_return, data_resp)` where `data_resp` may be `pcl` itself (line 552 sets `data_resp = p` on exception), which still has `topic_return` set. So on error paths at least, the round-trip loop is highly plausible.
+1. **Handler exception + self-echo**: on exception, `agent.py` used to set `data_resp = p` with `p.topic_return` preserved. The echoed error re-arrived and re-raised → loop (previously bounded at 20 dispatches; now terminates in ≤ 3).
+2. **Handler returns Parcel-with-topic_return + self-echo**: the reply parcel preserved `topic_return` on the wire → re-arrival triggered another auto-reply → loop (previously bounded at 20; now ≤ 3).
+3. **Two-agent mutual reply**: each side's handler produced a Parcel-with-topic_return targeted at the other's topic → ping-pong (previously bounded at 30 via a hub broker; now ≤ 3).
 
-Filed as Risk R-05 with Confidence Medium and a specific reproduction plan.
+Post-RFC-003 dispatch (`agent.py:_on_message`, `@final`, public signature unchanged) enforces three rules that break every one of these patterns:
+
+- **R-fallback-silent**: auto-reply is emitted only when `topic in self.__topic_handlers` (i.e. a specifically registered handler) AND `pcl.topic_return` is truthy. A subscribed-but-unhandled topic no longer generates implicit replies.
+- **R-strip-topic_return**: if `data_resp` is a `Parcel` whose `topic_return` is truthy, the framework reconstructs a fresh parcel of the same subclass (`type(data_resp)(data_resp.content)`), copies `.error`, and uses it as the reply. The handler's original returned object is not mutated.
+- **R-exception-fresh**: on handler exception the reply is a brand-new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming `p` is not mutated; handlers holding a reference to `p` observe its original `content`, `error`, and `topic_return`.
+
+`publish_sync` is unaffected: `handle_response` returns `None`, so `Parcel.from_content(None)` produces a reply with `topic_return=None` and R-strip-topic_return is a no-op for the request-response path. `publish_sync`'s specific handler on `return_topic` also prevents R-fallback-silent from ever applying during its lifetime. Verified by `test_publish_sync_happy_path_still_works_under_RFC_003` and `test_publish_sync_late_reply_after_cleanup_is_silently_dropped`.
 
 ---
 
@@ -285,6 +285,6 @@ Verified by `tests/unit/core/test_agent_publish_errors.py` (46 tests) and the fo
 
 ## 2.9 Unknowns
 
-- **U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05 — needs a scripted reproduction with a real MQTT broker.
+- ~~**U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05~~ — **Resolved**: reproduced against a bounded self-echo FakeBroker in `tests/unit/core/test_agent_reply_behavior.py`, then fixed by RFC-003 (§2.7 update above).
 - **U-2.2**: Behaviour of MQTT topics containing `.` under paho v2 — assumed to be a normal character (only `+ # / $` are special), but not empirically tested against a broker.
 - **U-2.3**: Whether `handle_response` ever sees its own publish echoed back — depends on broker semantics (MQTT typically does deliver self-published messages).

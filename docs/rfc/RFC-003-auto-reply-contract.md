@@ -1,10 +1,16 @@
 # RFC-003 — auto-reply contract
 
-- **Status**: Draft
+- **Status**: **Implemented (2026-07-26)**
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-05; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md) and [RFC-002](RFC-002-publish-error-propagation.md)
 - **Scope**: `Agent._on_message` auto-reply semantics: specific-handler vs fall-through-on_message dispatch, return-type rules, whether reply parcels preserve `topic_return`, and how to prevent self-loop / multi-agent loop
 - **Explicitly out of scope**: hop count, message metadata, Parcel schema version, rate limiting, broker-level duplicate suppression, MQTT reconnect (R-03), ProcessWorker (R-06/R-08), thread pool (R-04)
+- **Implementation summary** (2026-07-26):
+  - Adopted the recommended Option D (three rules together) in `src/agentflow/core/agent.py`, `Agent._on_message` only. Public signature unchanged; no changes to `Parcel`, `MessageBroker`, `MqttBroker`, `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise`, wire format, or `pyproject.toml`.
+  - Test surface: `tests/unit/core/test_agent_reply_behavior.py` — 5 loop-forcing tests rewritten to assert termination (≤ 3 publishes each), 2 strict xfails removed (now pass), 6 R-strip / R-exception-fresh tests added, `publish_sync` late-reply drop test added, `publish_sync` happy-path regression check added.
+  - Full unit regression: `PYTHONPATH=src python -m pytest tests/unit` → **135 passed, 0 failed, 0 xfailed, 0 xpassed** in 2.73 s.
+  - No regression to R-02 (RFC-001) or R-13 (RFC-002); their combined 73 tests pass unchanged.
+  - See [R-05 resolution block](../audit/05-risk-register.md#r-05--suspected-reply-loop-on-error-paths-and-on-default-handlers).
 
 ---
 

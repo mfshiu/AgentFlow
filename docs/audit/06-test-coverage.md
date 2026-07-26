@@ -7,7 +7,7 @@
 
 ## 6.0 Status update (2026-07-26)
 
-The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved R-02 via [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md) and R-13 via [RFC-002](../rfc/RFC-002-publish-error-propagation.md).
+The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved R-02 via [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md), R-13 via [RFC-002](../rfc/RFC-002-publish-error-propagation.md), and R-05 via [RFC-003](../rfc/RFC-003-auto-reply-contract.md).
 
 Current authoritative pytest command:
 
@@ -15,10 +15,10 @@ Current authoritative pytest command:
 PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
 ```
 
-Result as of 2026-07-26 (after RFC-002 implementation):
+Result as of 2026-07-26 (after RFC-003 implementation):
 
 ```
-114 passed, 0 failed, 0 xfailed, 0 xpassed  in 1.82s
+135 passed, 0 failed, 0 xfailed, 0 xpassed  in 2.73s
 ```
 
 Suite composition:
@@ -27,6 +27,7 @@ Suite composition:
 |---|---:|---:|
 | `tests/unit/core/test_agent_publish_sync.py` | R-02 characterization + fix invariants | 27 |
 | `tests/unit/core/test_agent_publish_errors.py` | R-13 characterization + `_publish_or_raise` API | 46 |
+| `tests/unit/core/test_agent_reply_behavior.py` | R-05 characterization + auto-reply contract (RFC-003) | 21 |
 | `tests/unit/test_mqtt_broker_start.py` | MqttBroker start + wait paths | 13 |
 | `tests/unit/test_mqtt_broker_auth.py` | username / password walrus edges | 6 |
 | `tests/unit/test_mqtt_broker_lifecycle.py` | stop / publish / subscribe / **unsubscribe** delegation | 11 |
@@ -37,7 +38,8 @@ Coverage changes since baseline:
 
 - **R-02** — was uncovered; now covered by `tests/unit/core/test_agent_publish_sync.py` (success cleanup, timeout cleanup, publish-exception cleanup, late-response fallback, duplicate-response fallback, identity guard, concurrent cleanup). See §6.4 for the updated matrix.
 - **R-13** — was uncovered; now covered by `tests/unit/core/test_agent_publish_errors.py` (Agent.publish fire-and-forget contract preserved; `publish_sync` propagates the broker's original exception object with fast-fail timing; `_publish_or_raise` internal method verified for success, all four exception types, missing broker; R-02 cleanup verified on the new fast-fail path).
-- **R-04** — still uncovered; explicitly out of RFC-001 and RFC-002 scope.
+- **R-05** — was uncovered; now covered by `tests/unit/core/test_agent_reply_behavior.py` (three loop patterns previously observed under a bounded self-echo broker now terminate in ≤ 3 publishes; R-fallback-silent verified; R-strip-topic_return verified across TextParcel / BinaryParcel / content / error field preservation; R-exception-fresh verified with non-mutation of incoming parcel; RFC-003 × RFC-001 interaction verified).
+- **R-04** — still uncovered; explicitly out of RFC-001, RFC-002, and RFC-003 scope.
 
 Legacy trees (`unit_test/`, `exe_test/`) remain excluded from pytest collection via `pyproject.toml` `norecursedirs`. No change to §6.1–6.7 inventory.
 
@@ -146,7 +148,7 @@ Cross-referenced with `05-risk-register.md`.
 | R-02 `publish_sync` leaks | **Resolved 2026-07-26 (RFC-001); covered by `tests/unit/core/test_agent_publish_sync.py`** |
 | R-03 broker reconnect / re-subscribe | ✓ |
 | R-04 unbounded per-message threads | ✓ |
-| R-05 suspected reply loop | ✓ |
+| R-05 suspected reply loop | **Resolved 2026-07-26 (RFC-003); covered by `tests/unit/core/test_agent_reply_behavior.py`.** Three loop patterns (handler exception, handler-returns-loopy-Parcel, two-agent mutual reply) are verified to terminate in ≤ 3 publishes each under a bounded self-echo broker. |
 | R-06 process-mode pickling | ✓ (all tests use `start_thread`) |
 | R-07 handler BaseException | ✓ |
 | R-08 parent-side publish silent failure | ✓ |
