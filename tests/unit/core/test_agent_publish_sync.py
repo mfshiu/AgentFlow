@@ -1,17 +1,9 @@
-"""Characterization tests for Agent.publish_sync (agent.py:321-349).
+"""Characterization tests for Agent.publish_sync (agent.py:321-353).
 
-These tests document the CURRENT behaviour of publish_sync, including
-its known leaks (Risk R-02 in docs/audit/05-risk-register.md). Any
-assertion in this file that pins a leak is paired with an @xfail
-counterpart that describes the aspirational cleaned-up behaviour. When
-a future change fixes the leak, the strict xfail will convert to an
-XPASS and force the pinning assertion (and this file) to be revisited.
-
-Constraints:
-  - No real MQTT / socket / subprocess / ProcessWorker.
-  - Every test's total wall time should stay well under 2 seconds.
-  - `Agent._on_message` spawns a short-lived per-message thread
-    (agent.py:562); that is prod-code behaviour, not a test artefact.
+Post R-02 fix: publish_sync wraps its wait/publish in try/finally and
+unsubscribes on every exit path (success, timeout, publish exception).
+Handler dispatch tolerates duplicates via an is_set() guard and the
+finally cleanup uses an identity guard to protect foreign handlers.
 """
 
 import re
@@ -68,7 +60,7 @@ def test_publish_sync_returns_response_content_verbatim(agent_with_fake_broker):
 
 
 # --------------------------------------------------------------------------
-# 3: no response → TimeoutError
+# 3: no response -> TimeoutError
 # --------------------------------------------------------------------------
 
 def test_publish_sync_raises_TimeoutError_when_no_response(agent_with_fake_broker):
@@ -84,8 +76,6 @@ def test_publish_sync_timeout_wait_duration_is_bounded(agent_with_fake_broker):
     with pytest.raises(TimeoutError):
         agent.publish_sync('req', 'q', topic_wait='ret/3b', timeout=0.05)
     elapsed = time.monotonic() - start
-    # Lower bound: cannot short-circuit before requested timeout.
-    # Upper bound: generous headroom for CI jitter.
     assert 0.03 < elapsed < 1.0, f'timeout elapsed={elapsed:.3f}s'
 
 
@@ -94,10 +84,9 @@ def test_publish_sync_timeout_wait_duration_is_bounded(agent_with_fake_broker):
 # --------------------------------------------------------------------------
 
 def test_publish_sync_still_times_out_when_publish_raises(agent_with_fake_broker):
-    """Characterization: Agent.publish (agent.py:312-313) catches every
-    Exception and only logs. publish_sync therefore never sees the
-    broker failure and eventually raises TimeoutError, NOT the original
-    exception. This is Risk R-13."""
+    """Agent.publish catches every Exception (agent.py:312-313) so
+    publish_sync sees no response and raises TimeoutError, NOT the
+    original exception. This is Risk R-13, unchanged by R-02 fix."""
     agent, broker = agent_with_fake_broker
     broker.publish_exception = RuntimeError('broker down')
     with pytest.raises(TimeoutError):
@@ -115,82 +104,90 @@ def test_publish_sync_records_publish_attempt_even_when_publish_raises(
     assert 'req' in published_topics
 
 
-def test_publish_sync_subscribes_return_topic_even_when_publish_raises(
+def test_publish_sync_subscribes_and_then_unsubscribes_when_publish_raises(
     agent_with_fake_broker,
 ):
-    """Subscribe happens before publish (agent.py:343-344); a publish
-    failure does not undo the subscribe. This compounds Risk R-02."""
+    """Subscribe happens before publish (agent.py:343-344); on publish
+    failure the finally block must still unsubscribe the return topic."""
     agent, broker = agent_with_fake_broker
     broker.publish_exception = RuntimeError('broker down')
     with pytest.raises(TimeoutError):
         agent.publish_sync('req', 'q', topic_wait='ret/4c', timeout=0.05)
     subscribed = [t for (t, _dt) in broker.subscribe_calls]
     assert 'ret/4c' in subscribed
+    assert 'ret/4c' in broker.unsubscribe_calls
+    assert 'ret/4c' not in _handlers(agent)
 
 
 # --------------------------------------------------------------------------
-# 5: duplicate response
+# 5: duplicate response (post-fix: does NOT reach the sync handler)
 # --------------------------------------------------------------------------
 
-def test_publish_sync_returns_first_response_and_duplicate_still_dispatches(
+def test_first_response_returned_and_duplicate_falls_through_to_on_message(
     agent_with_fake_broker,
 ):
+    """After a successful publish_sync, the handler is cleaned up. A
+    duplicate delivery must fall through to Agent.on_message (default
+    no-op), NOT re-invoke the completed sync handler."""
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('first')
     first = agent.publish_sync('req', 'q', topic_wait='ret/5', timeout=1.0)
     assert first.content == 'first'
 
-    assert 'ret/5' in _handlers(agent), (
-        'handler must still be registered after success (R-02)'
-    )
-    original = _handlers(agent)['ret/5']
-    second_seen = threading.Event()
+    # R-02 fix invariant: handler is removed after success.
+    assert 'ret/5' not in _handlers(agent)
+    assert 'ret/5' in broker.unsubscribe_calls
 
-    def spy(topic, pcl):
-        try:
-            return original(topic, pcl)
-        finally:
-            second_seen.set()
+    # Route the fall-through to on_message to a spy.
+    fallback_seen = threading.Event()
+    fallback_calls = []
 
-    _handlers(agent)['ret/5'] = spy
+    def track_fallback(topic, pcl):
+        fallback_calls.append((topic, pcl.content))
+        fallback_seen.set()
+
+    agent.on_message = track_fallback
+
     broker.deliver('ret/5', TextParcel('second').payload())
-    assert second_seen.wait(1.0), (
-        'duplicate response should still reach leaked handler'
+    assert fallback_seen.wait(1.0), (
+        'duplicate response should reach on_message via fall-through'
     )
+    assert fallback_calls == [('ret/5', 'second')]
 
 
 # --------------------------------------------------------------------------
-# 6: late response after timeout
+# 6: late response after timeout (post-fix: does NOT reach the sync handler)
 # --------------------------------------------------------------------------
 
-def test_late_response_after_timeout_still_dispatches_to_leaked_handler(
+def test_late_response_after_timeout_falls_through_to_on_message(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
     with pytest.raises(TimeoutError):
         agent.publish_sync('req', 'q', topic_wait='ret/6', timeout=0.05)
 
-    assert 'ret/6' in _handlers(agent), (
-        'handler must still be registered after timeout (R-02)'
-    )
-    original = _handlers(agent)['ret/6']
-    late_seen = threading.Event()
+    # R-02 fix invariant: handler is removed after timeout.
+    assert 'ret/6' not in _handlers(agent)
+    assert 'ret/6' in broker.unsubscribe_calls
 
-    def spy(topic, pcl):
-        try:
-            return original(topic, pcl)
-        finally:
-            late_seen.set()
+    fallback_seen = threading.Event()
+    fallback_calls = []
 
-    _handlers(agent)['ret/6'] = spy
+    def track_fallback(topic, pcl):
+        fallback_calls.append((topic, pcl.content))
+        fallback_seen.set()
+
+    agent.on_message = track_fallback
+
     broker.deliver('ret/6', TextParcel('too-late').payload())
-    assert late_seen.wait(1.0), (
-        'late response should still reach leaked handler'
+    assert fallback_seen.wait(1.0), (
+        'late response should reach on_message via fall-through'
     )
+    assert fallback_calls == [('ret/6', 'too-late')]
 
 
 # --------------------------------------------------------------------------
-# 7: 100 consecutive successes
+# 7: 100 consecutive successes  (post-fix: no accumulation)
 # --------------------------------------------------------------------------
 
 def test_100_consecutive_publish_sync_all_return_correct_response(
@@ -206,7 +203,7 @@ def test_100_consecutive_publish_sync_all_return_correct_response(
 
 
 # --------------------------------------------------------------------------
-# 8: 100 consecutive timeouts
+# 8: 100 consecutive timeouts  (post-fix: no accumulation)
 # --------------------------------------------------------------------------
 
 def test_100_consecutive_publish_sync_all_timeout(agent_with_fake_broker):
@@ -219,143 +216,91 @@ def test_100_consecutive_publish_sync_all_timeout(agent_with_fake_broker):
 
 
 # --------------------------------------------------------------------------
-# 9: __topic_handlers count after success  (Risk R-02)
+# 9: __topic_handlers cleaned after success  (R-02 fix invariant)
 # --------------------------------------------------------------------------
 
-def test_topic_handlers_grows_by_one_per_successful_publish_sync(
-    agent_with_fake_broker,
-):
-    """CHARACTERIZATION: publish_sync never cleans __topic_handlers.
-    Pins the observed leak so a future cleanup causes this test to
-    fail — at which point the xfail below should be flipped."""
-    agent, broker = agent_with_fake_broker
-    broker.auto_respond_with('x')
-    before = len(_handlers(agent))
-    N = 10
-    for i in range(N):
-        agent.publish_sync('req', 'q', topic_wait=f'ret/9/{i}', timeout=1.0)
-    assert len(_handlers(agent)) - before == N
-
-
-@pytest.mark.xfail(
-    reason=('R-02: publish_sync does not clean up __topic_handlers '
-            'after success (agent.py:321-349 has no delete path)'),
-    strict=True,
-)
-def test_topic_handlers_should_be_cleaned_after_successful_publish_sync(
+def test_topic_handlers_cleaned_after_successful_publish_sync(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('x')
     before = len(_handlers(agent))
     for i in range(10):
-        agent.publish_sync('req', 'q', topic_wait=f'ret/9x/{i}', timeout=1.0)
+        agent.publish_sync('req', 'q', topic_wait=f'ret/9/{i}', timeout=1.0)
     assert len(_handlers(agent)) == before
 
 
 # --------------------------------------------------------------------------
-# 10: __topic_handlers count after timeout  (Risk R-02)
+# 10: __topic_handlers cleaned after timeout  (R-02 fix invariant)
 # --------------------------------------------------------------------------
 
-def test_topic_handlers_grows_by_one_per_timed_out_publish_sync(
+def test_topic_handlers_cleaned_after_timed_out_publish_sync(
     agent_with_fake_broker,
 ):
     agent, _broker = agent_with_fake_broker
     before = len(_handlers(agent))
-    N = 10
-    for i in range(N):
+    for i in range(10):
         with pytest.raises(TimeoutError):
             agent.publish_sync(
                 'req', 'q', topic_wait=f'ret/10/{i}', timeout=0.01,
             )
-    assert len(_handlers(agent)) - before == N
-
-
-@pytest.mark.xfail(
-    reason=('R-02: publish_sync does not clean up __topic_handlers '
-            'after timeout (agent.py:346-349 raises without cleanup)'),
-    strict=True,
-)
-def test_topic_handlers_should_be_cleaned_after_timed_out_publish_sync(
-    agent_with_fake_broker,
-):
-    agent, _broker = agent_with_fake_broker
-    before = len(_handlers(agent))
-    for i in range(10):
-        with pytest.raises(TimeoutError):
-            agent.publish_sync(
-                'req', 'q', topic_wait=f'ret/10x/{i}', timeout=0.01,
-            )
     assert len(_handlers(agent)) == before
 
 
 # --------------------------------------------------------------------------
-# 11: broker.subscribe_calls after success  (Risk R-02)
+# 11: broker.subscribe grows +N, broker.unsubscribe grows +N (success)
 # --------------------------------------------------------------------------
 
-def test_broker_subscribe_calls_grow_by_one_per_successful_publish_sync(
+def test_broker_subscribe_and_unsubscribe_grow_together_on_success(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('x')
-    before = len(broker.subscribe_calls)
+    subs_before = len(broker.subscribe_calls)
+    unsubs_before = len(broker.unsubscribe_calls)
     N = 10
     for i in range(N):
         agent.publish_sync('req', 'q', topic_wait=f'ret/11/{i}', timeout=1.0)
-    assert len(broker.subscribe_calls) - before == N
-    # Positive witness: Agent's current API has no unsubscribe path.
-    assert broker.unsubscribe_calls == []
+    assert len(broker.subscribe_calls) - subs_before == N
+    assert len(broker.unsubscribe_calls) - unsubs_before == N
 
 
-@pytest.mark.xfail(
-    reason=('R-02: Agent has no unsubscribe path; broker subscriptions '
-            'accumulate one per publish_sync call and are never released'),
-    strict=True,
-)
-def test_broker_should_unsubscribe_after_successful_publish_sync(
+def test_broker_unsubscribes_specific_topic_after_success(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('x')
-    for i in range(10):
-        agent.publish_sync('req', 'q', topic_wait=f'ret/11x/{i}', timeout=1.0)
-    assert len(broker.unsubscribe_calls) == 10
+    agent.publish_sync('req', 'q', topic_wait='ret/11-spec', timeout=1.0)
+    assert 'ret/11-spec' in broker.unsubscribe_calls
 
 
 # --------------------------------------------------------------------------
-# 12: broker.subscribe_calls after timeout  (Risk R-02)
+# 12: broker.subscribe grows +N, broker.unsubscribe grows +N (timeout)
 # --------------------------------------------------------------------------
 
-def test_broker_subscribe_calls_grow_by_one_per_timed_out_publish_sync(
+def test_broker_subscribe_and_unsubscribe_grow_together_on_timeout(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
-    before = len(broker.subscribe_calls)
+    subs_before = len(broker.subscribe_calls)
+    unsubs_before = len(broker.unsubscribe_calls)
     N = 10
     for i in range(N):
         with pytest.raises(TimeoutError):
             agent.publish_sync(
                 'req', 'q', topic_wait=f'ret/12/{i}', timeout=0.01,
             )
-    assert len(broker.subscribe_calls) - before == N
-    assert broker.unsubscribe_calls == []
+    assert len(broker.subscribe_calls) - subs_before == N
+    assert len(broker.unsubscribe_calls) - unsubs_before == N
 
 
-@pytest.mark.xfail(
-    reason=('R-02: subscriptions from timed-out publish_sync are '
-            'never released'),
-    strict=True,
-)
-def test_broker_should_unsubscribe_after_timed_out_publish_sync(
+def test_broker_unsubscribes_specific_topic_after_timeout(
     agent_with_fake_broker,
 ):
     agent, broker = agent_with_fake_broker
-    for i in range(10):
-        with pytest.raises(TimeoutError):
-            agent.publish_sync(
-                'req', 'q', topic_wait=f'ret/12x/{i}', timeout=0.01,
-            )
-    assert len(broker.unsubscribe_calls) == 10
+    with pytest.raises(TimeoutError):
+        agent.publish_sync('req', 'q', topic_wait='ret/12-spec', timeout=0.01)
+    assert 'ret/12-spec' in broker.unsubscribe_calls
 
 
 # --------------------------------------------------------------------------
@@ -364,8 +309,8 @@ def test_broker_should_unsubscribe_after_timed_out_publish_sync(
 
 def test_generated_return_topics_are_unique_across_100_calls():
     """Directly exercise Agent.__generate_return_topic (name-mangled).
-    10 base-36 chars → ~40 bits of entropy; 100 samples give a
-    collision probability on the order of 1e-11 — treated as zero."""
+    10 base-36 chars ~ 40 bits of entropy; 100 samples give a collision
+    probability on the order of 1e-11."""
     agent = Agent(name='rt', agent_config={})
     topics = {
         agent._Agent__generate_return_topic('req') for _ in range(100)
@@ -423,8 +368,6 @@ def test_published_parcel_topic_return_equals_topic_wait_when_provided(
 def test_publish_sync_preserves_existing_topic_return_on_parcel(
     agent_with_fake_broker,
 ):
-    """Characterization: agent.py:325-326 keeps the parcel's own
-    topic_return when set and no topic_wait is given."""
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('x')
     preset = TextParcel('data')
@@ -439,9 +382,6 @@ def test_publish_sync_preserves_existing_topic_return_on_parcel(
 def test_publish_sync_preserves_existing_topic_return_even_when_topic_wait_supplied(
     agent_with_fake_broker,
 ):
-    """Characterization: agent.py:325-327. When both are set, the
-    parcel's own topic_return wins and topic_wait is only logged as a
-    warning."""
     agent, broker = agent_with_fake_broker
     broker.auto_respond_with('x')
     preset = TextParcel('data')
@@ -452,3 +392,87 @@ def test_publish_sync_preserves_existing_topic_return_even_when_topic_wait_suppl
     subscribed = [t for (t, _dt) in broker.subscribe_calls]
     assert 'preset/ret/15b' in subscribed
     assert 'ignored/topic_wait' not in subscribed
+
+
+# --------------------------------------------------------------------------
+# New: concurrency & identity guard  (RFC-001 §11)
+# --------------------------------------------------------------------------
+
+def test_concurrent_publish_sync_with_distinct_topic_wait_all_clean_up(
+    agent_with_fake_broker,
+):
+    agent, broker = agent_with_fake_broker
+    broker.auto_respond_with('ok')
+    handlers_before = len(_handlers(agent))
+    unsubs_before = len(broker.unsubscribe_calls)
+
+    N = 5
+    results = [None] * N
+    errors = [None] * N
+
+    def worker(i):
+        try:
+            results[i] = agent.publish_sync(
+                'req', 'q', topic_wait=f'ret/conc/{i}', timeout=2.0,
+            )
+        except BaseException as ex:
+            errors[i] = ex
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(3.0)
+
+    for i in range(N):
+        assert errors[i] is None, f'worker {i} raised: {errors[i]!r}'
+        assert results[i] is not None
+        assert results[i].content == 'ok'
+    assert len(_handlers(agent)) == handlers_before
+    assert len(broker.unsubscribe_calls) - unsubs_before == N
+
+
+def test_identity_guard_preserves_foreign_handler_on_same_topic(
+    agent_with_fake_broker,
+):
+    """If a foreign handler races onto the same topic between
+    publish_sync's subscribe and its finally, the identity guard must
+    prevent finally from evicting that foreign handler."""
+    agent, broker = agent_with_fake_broker
+    topic = 'ret/identity/foreign'
+    foreign_handler = lambda t, p: None  # noqa: E731 (test sentinel)
+
+    original_publish = broker.publish
+
+    def evil_publish(topic_arg, payload):
+        # Simulate a concurrent subscribe() overwrite between our
+        # publish_sync's subscribe and its finally.
+        _handlers(agent)[topic] = foreign_handler
+        # Do NOT deliver a response; let publish_sync time out.
+        original_publish(topic_arg, payload)
+
+    broker.publish = evil_publish
+
+    with pytest.raises(TimeoutError):
+        agent.publish_sync('req', 'q', topic_wait=topic, timeout=0.05)
+
+    # Identity guard: finally sees a foreign handler and leaves it alone.
+    assert _handlers(agent).get(topic) is foreign_handler
+    # Because we skipped cleanup, no unsubscribe was called for this topic.
+    assert topic not in broker.unsubscribe_calls
+
+
+def test_agent_unsubscribe_is_idempotent_and_broker_agnostic():
+    """Agent.unsubscribe on an unknown topic must not raise, and must
+    work when _broker is None."""
+    agent = Agent(name='u', agent_config={})
+    # Before broker is attached: no crash.
+    agent.unsubscribe('never/subscribed')
+    # After attaching a fake broker: passes through.
+    broker = FakeBroker(notifier=agent)
+    agent._broker = broker
+    agent.unsubscribe('also/unknown')
+    assert broker.unsubscribe_calls == ['also/unknown']
+    # Second call still safe.
+    agent.unsubscribe('also/unknown')
+    assert broker.unsubscribe_calls == ['also/unknown', 'also/unknown']

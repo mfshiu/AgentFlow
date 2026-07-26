@@ -336,32 +336,54 @@ class Agent(BrokerNotifier):
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
-            # logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {str(pcl_resp)[:400]}.."))
+            # Duplicate arriving before cleanup: keep the first response.
+            if data_event.event.is_set():
+                return
             data_event.data = pcl_resp
             data_event.event.set()
 
         self.subscribe(pcl.topic_return, topic_handler=handle_response)
-        self.publish(topic, pcl)
-
-        if data_event.event.wait(timeout):
-            return data_event.data
-        else:
+        try:
+            self.publish(topic, pcl)
+            if data_event.event.wait(timeout):
+                return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
+        finally:
+            # Identity guard: only tear down if the handler in the
+            # registry is still the one this call installed. Protects a
+            # foreign handler that raced onto the same topic.
+            try:
+                if self.__topic_handlers.get(pcl.topic_return) is handle_response:
+                    self.unsubscribe(pcl.topic_return)
+            except Exception as cleanup_ex:
+                logger.exception(cleanup_ex)
 
 
     @final
     def subscribe(self, topic, data_type:str="str", topic_handler=None):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
-        
+
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
-        
+
         if topic_handler:
             if topic in self.__topic_handlers:
                 logger.warning(self.M(f"Exist the handler for topic: {topic}"))
             self.__topic_handlers[topic] = topic_handler
 
         return self._broker.subscribe(topic, data_type) if self._broker else None
+
+
+    @final
+    def unsubscribe(self, topic: str) -> None:
+        """Reverse a prior subscribe(topic, topic_handler=...) call.
+        Removes the handler entry from __topic_handlers if present and
+        asks the broker to unsubscribe. Idempotent: calling twice or on
+        an unknown topic does not raise. Safe to call when the broker
+        has not been created yet (_broker is None)."""
+        self.__topic_handlers.pop(topic, None)
+        if self._broker:
+            self._broker.unsubscribe(topic)
     
     
     def __register_child(self, child_id:str, child_info:dict):

@@ -75,3 +75,18 @@ def test_subscribe_does_not_forward_data_type_to_paho(broker, fake_client):
     args, kwargs = fake_client.subscribe.call_args
     assert "data_type" not in kwargs
     assert args == ()
+
+
+# --------------------------------------------------------------------------
+# unsubscribe() — added for R-02 (RFC-001)
+# --------------------------------------------------------------------------
+
+def test_unsubscribe_delegates_topic_to_client(broker, fake_client):
+    broker.unsubscribe("some/topic")
+    fake_client.unsubscribe.assert_called_once_with("some/topic")
+
+
+def test_unsubscribe_returns_underlying_client_result(broker, fake_client):
+    sentinel = object()
+    fake_client.unsubscribe.return_value = sentinel
+    assert broker.unsubscribe("t") is sentinel

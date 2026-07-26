@@ -108,3 +108,6 @@ class MqttBroker(MessageBroker):
 
     def subscribe(self, topic: str, data_type):
         return self._client.subscribe(topic=topic)
+
+    def unsubscribe(self, topic: str):
+        return self._client.unsubscribe(topic)

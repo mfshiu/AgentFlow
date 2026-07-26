@@ -85,6 +85,11 @@ class FakeBroker:
     def subscribe(self, topic: str, data_type):
         self.subscribe_calls.append((topic, data_type))
 
+    def unsubscribe(self, topic: str) -> None:
+        # Record the call. FakeBroker holds no real subscription table,
+        # so there is nothing else to tear down.
+        self.unsubscribe_calls.append(topic)
+
     # ------------------------------------------------------------------
     # Test-only helpers
     # ------------------------------------------------------------------
