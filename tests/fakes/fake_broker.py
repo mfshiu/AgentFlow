@@ -8,7 +8,8 @@ observe that thread's completion wrap the registered handler with a
 threading.Event-setting spy.
 """
 
-from typing import Any, List, Optional, Tuple
+import threading
+from typing import Any, List, Optional, Set, Tuple
 
 from agentflow.core.parcel import Parcel, TextParcel
 
@@ -56,6 +57,11 @@ class FakeBroker:
         self.publish_exception: Optional[BaseException] = None
         self._auto_response_active: bool = False
         self._auto_response_content: Any = None
+        # Self-echo mode + subscription set (added for R-05 loop tests).
+        self.subscribed_topics: Set[str] = set()
+        self._self_echo_enabled: bool = False
+        self.max_publish_dispatches: Optional[int] = None
+        self._publish_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # MessageBroker-shaped interface used by Agent
@@ -68,27 +74,52 @@ class FakeBroker:
         self.stop_calls += 1
 
     def publish(self, topic: str, payload):
-        self.publish_calls.append((topic, payload))
+        # Bound check first (thread-safe): once max is reached, silently
+        # drop further publishes so bounded reply-loop tests terminate.
+        with self._publish_lock:
+            if (self.max_publish_dispatches is not None and
+                    len(self.publish_calls) >= self.max_publish_dispatches):
+                return
+            self.publish_calls.append((topic, payload))
         if self.publish_exception is not None:
             raise self.publish_exception
         if self._auto_response_active:
             try:
                 req_parcel = Parcel.from_payload(payload)
             except Exception:
-                return
-            if req_parcel.topic_return:
-                # Reply carries no topic_return, so Agent._on_message
-                # takes the non-reply branch and does not re-emit.
-                reply = TextParcel(self._auto_response_content)
-                self.deliver(req_parcel.topic_return, reply.payload())
+                pass
+            else:
+                if req_parcel.topic_return:
+                    # Reply carries no topic_return, so Agent._on_message
+                    # takes the non-reply branch and does not re-emit.
+                    reply = TextParcel(self._auto_response_content)
+                    self.deliver(req_parcel.topic_return, reply.payload())
+        if self._self_echo_enabled and topic in self.subscribed_topics:
+            # Loop-scenario delivery: send the payload back through the
+            # notifier as if a paho self-published message came in.
+            try:
+                self.deliver(topic, payload)
+            except Exception:
+                pass
 
     def subscribe(self, topic: str, data_type):
         self.subscribe_calls.append((topic, data_type))
+        self.subscribed_topics.add(topic)
 
     def unsubscribe(self, topic: str) -> None:
         # Record the call. FakeBroker holds no real subscription table,
         # so there is nothing else to tear down.
         self.unsubscribe_calls.append(topic)
+        self.subscribed_topics.discard(topic)
+
+    def enable_self_echo(self, max_dispatches: int = 50) -> None:
+        """Turn on self-echo delivery: every publish() to a currently
+        subscribed topic will synchronously invoke deliver() with the
+        same payload, as a paho broker would for a client subscribed
+        to the topic it publishes to. Bounded by `max_dispatches` so
+        that reply-loop tests cannot spin forever."""
+        self._self_echo_enabled = True
+        self.max_publish_dispatches = max_dispatches
 
     # ------------------------------------------------------------------
     # Test-only helpers
