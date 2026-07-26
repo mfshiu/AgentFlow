@@ -1,10 +1,20 @@
 # RFC-004 — bounded message dispatch
 
-- **Status**: Draft
+- **Status**: **Implemented (2026-07-26)**
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-04; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md), [RFC-002](RFC-002-publish-error-propagation.md), [RFC-003](RFC-003-auto-reply-contract.md)
 - **Scope**: `Agent._on_message` dispatch strategy — bounded concurrency, bounded queue depth, explicit backpressure, graceful shutdown
 - **Explicitly out of scope**: asyncio full rewrite, ProcessWorker refactor (R-06/R-08), MQTT reconnect (R-03), Parcel schema, pickle security (R-01), distributed backpressure
+- **Implementation summary** (2026-07-26):
+  - Landed the first-phase design from §6 in `src/agentflow/core/dispatcher.py` (new) with `MessageDispatcher` (bounded queue + fixed daemon consumers + `drop_newest` overflow + graceful bounded shutdown + thread-safe metrics snapshot) and `LegacyPerMessageDispatcher` (deprecated shim). `Agent._on_message` now enqueues instead of spawning a per-message Thread; `Agent.terminate()` calls `dispatcher.stop()`; `Agent.__init__` fires `DeprecationWarning(stacklevel=2)` on `dispatch={'mode': 'per_message_thread'}`.
+  - Two linearization races surfaced during characterization testing and were fixed with minimal changes:
+    - `enqueue` moved the `_accepting` check and `queue.put_nowait` **atomically under `_state_lock`** so a concurrent `stop()` cannot land an accepted task after the shutdown sentinel.
+    - `stop` added `_stop_complete_event`: only the first caller performs the actual shutdown; subsequent callers wait on the event and read the coherent cached `_stop_result`, eliminating the "second caller sees `bool(None)=False`" race.
+  - Test surface: `tests/unit/core/test_agent_message_threading.py` (33 tests) — bounded-dispatcher characterization, deterministic race reproductions (which fail on the pre-fix code and pass post-fix), 25-trial linearization stress test.
+  - Full unit regression: `PYTHONPATH=src python -m pytest tests/unit` → **168 passed, 0 failed, 0 xfailed, 0 xpassed** in 3.27 s. 5 independent re-runs of the race stress suite showed no flakes.
+  - No regression to R-02 (27), R-05 (21), R-13 (46) — combined 94 tests pass unchanged.
+  - See [R-04 resolution block](../audit/05-risk-register.md#r-04--per-message-unbounded-thread-creation) for the full contract, race analysis, and known remaining gaps.
+- **Implementation vs RFC difference**: dispatcher is created **lazily on the first `_on_message` call** (double-check locking in `Agent._get_dispatcher()`), not eagerly at `_activate` time as §7.16 recommended. Rationale: existing R-02/R-05/R-13 tests bypass `_activate` and construct Agents directly with manually-set `_broker` / `_agent_worker`; eager `_activate`-time construction would require rewriting ~90 pre-existing tests. The determinism guarantees §7.16 cited (dispatcher exists before first message; no construction race) are preserved by `_dispatcher_init_lock`. A future RFC may unify dispatcher lifecycle with the broker as part of ProcessWorker rework.
 
 ---
 
