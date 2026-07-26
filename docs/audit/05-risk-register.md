@@ -84,14 +84,98 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-04 — Per-message unbounded thread creation
 
+- **Status**: **RESOLVED** (2026-07-26) — see [RFC-004](../rfc/RFC-004-bounded-message-dispatch.md)
 - **Severity**: High
 - **Category**: Concurrency / Resource
-- **File / Function / Line**: `src/agentflow/core/agent.py:562` inside `Agent._on_message`
-- **Evidence**: `threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()`
-- **Trigger**: High-rate message stream (single burst or sustained load).
-- **Impact**: Thread count grows unbounded; program exit may block on non-daemon threads; native-thread limits may be reached.
-- **Confidence**: High
-- **Recommended verification test**: Publish 10k messages at high rate to a single subscribed topic; monitor `threading.active_count()` and process behaviour on shutdown.
+- **File / Function / Line** (historical): `src/agentflow/core/agent.py` inside `Agent._on_message`
+- **Evidence** (historical): `threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()` — one fresh non-daemon `threading.Thread` per received message. No pool, no queue, no upper bound on concurrency, no framework-side ownership of the spawned thread.
+- **Trigger** (historical): Any inbound message stream — a burst of N messages spawned N native threads simultaneously.
+- **Impact** (historical): (a) thread count grew unbounded with inbound rate; (b) no bounded queue meant no backpressure; (c) non-daemon threads blocked interpreter exit; (d) `Agent.terminate()` returned immediately without waiting for or observing handler threads; (e) same-topic handlers ran concurrently with unspecified completion order.
+- **Confidence at discovery**: High
+- **Recommended verification test** (was): publish 10k messages at high rate to a single subscribed topic; monitor `threading.active_count()` and process behaviour on shutdown.
+
+### Runtime confirmation (before fix)
+
+R-04 was upgraded from static-code to runtime-confirmed via 16 characterization tests in `tests/unit/core/test_agent_message_threading.py` (RFC-004 §2). Specifically:
+
+- 100 / 500 / 1000 deliveries each produced N `threading.Thread` objects (`test_N_messages_create_N_threads`).
+- Slow handlers caused `active_count` to scale 1:1 with delivered N (`test_slow_handler_active_thread_count_scales_with_n`).
+- `Agent.terminate()` returned in < 0.2 s regardless of live handler threads.
+- Handler threads were non-daemon.
+- Same-topic messages executed concurrently; completion order matched release order rather than delivery order.
+
+### Resolution
+
+- **Resolved on**: 2026-07-26
+- **RFC**: [RFC-004 — bounded message dispatch](../rfc/RFC-004-bounded-message-dispatch.md) (Implemented)
+
+**Final implementation** (RFC-004 first-phase scope):
+
+- New file `src/agentflow/core/dispatcher.py` — `MessageDispatcher` (bounded) + `LegacyPerMessageDispatcher` (deprecated shim).
+- `MessageDispatcher`:
+  - Fixed pool of **daemon** consumer threads (default `workers=8`, configurable).
+  - Bounded `queue.Queue(maxsize=queue_capacity)` (default `1024`, configurable).
+  - Overflow policy `drop_newest` (only policy implemented in this phase): `put_nowait` on full → `dropped_message_count` +1 → rate-limited WARNING → `enqueue()` returns `False`. Never raises to the caller.
+  - **Broker-callback safety invariant** (RFC-004 §7.3): `_on_message` invoked from the paho loop thread never sees `queue.Full`.
+  - **Lazy initialization**: dispatcher created on the first `Agent._on_message` call under `_dispatcher_init_lock` (double-check lock). See "RFC vs implementation" below.
+  - **Graceful bounded shutdown**: `stop(timeout_s)` sets `_accepting=False`, posts one sentinel per worker, joins each with the remaining budget from a single monotonic deadline. Consumers pull sentinel from tail of queue after processing all previously-enqueued tasks.
+  - **Thread-safe metrics** via `_metrics_lock`: `active_workers`, `queue_depth`, `dropped_message_count`, `rejected_after_stop_count`, `processed_count`, `error_count`. `metrics_snapshot()` returns a coherent single-lock dict.
+  - **Handler-exception isolation**: consumer's `except Exception` catches ordinary errors and increments `error_count`; `BaseException` (`KeyboardInterrupt`, `SystemExit`, `GeneratorExit`) propagates out and terminates that consumer (RFC-004 §7.10). `queue.task_done()` runs in a `finally` block for every dequeued item, including sentinels and BaseException paths.
+- `Agent`:
+  - `_on_message` now enqueues via `self._get_dispatcher().enqueue(handle_message, topic=topic)` instead of spawning a per-message Thread.
+  - `terminate()` calls `self._dispatcher.stop()` before `self._agent_worker.stop()`.
+  - Public signatures `publish` / `publish_sync` / `subscribe` / `unsubscribe` / `_publish_or_raise` unchanged.
+  - Legacy escape hatch: `agent_config['dispatch']['mode']='per_message_thread'` restores byte-for-byte pre-RFC-004 behaviour and emits a `DeprecationWarning` at `Agent.__init__`.
+
+### Race fixes (linearization)
+
+Two additional races were identified and fixed after the first-phase implementation:
+
+- **enqueue check-then-put race**: `_accepting` check and `queue.put_nowait` were originally outside `_state_lock`. A concurrent `stop()` could interleave: set `_accepting=False`, post the sentinel, and then the enqueue's `put_nowait` would land the task AFTER the sentinel — but `enqueue()` returned `True`. Consumers took the sentinel first, exited, and the task was never executed. **Fixed** by performing the check + `put_nowait` atomically under `_state_lock`. Deterministic reproduction: `test_race_stop_wins_between_enqueue_check_and_put_deterministic` (fails pre-fix, passes post-fix).
+- **Concurrent-stop race**: two threads calling `stop()` simultaneously — the second thread saw `_stopped=True` and returned `bool(self._stop_result)` before the first thread had set `_stop_result`, yielding `False` while the first thread returned `True`. **Fixed** by adding `_stop_complete_event`: only the first caller executes the actual shutdown; subsequent callers wait on the event and return the coherent cached `_stop_result`. Deterministic reproduction: `test_concurrent_stop_calls_execute_actual_shutdown_only_once` (fails pre-fix with `[False, False, False, False, True]`, passes post-fix).
+
+Post-fix linearization invariants (all runtime-verified):
+
+- Every `enqueue()` returning `True` is executed by a consumer before a successful `stop()` returns.
+- Every `enqueue()` returning `False` does NOT execute the task.
+- Sentinel items also go through `queue.task_done()` — `_queue.unfinished_tasks == 0` after clean shutdown.
+- Concurrent `stop()` callers post exactly `workers` sentinels total and all observe the same True/False outcome.
+
+### Runtime verification (as of 2026-07-26)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- Result: **168 passed, 0 failed, 0 xfailed, 0 xpassed** in 3.27 s.
+- R-04 dedicated file `tests/unit/core/test_agent_message_threading.py` — **33 passed**.
+- 5 independent re-runs of the race stress suite — 4/4 passing every time; no flakes observed.
+- R-02 (27), R-05 (21), R-13 (46) tests all pass **unchanged** — no regression from the dispatcher integration or the race fixes.
+
+### RFC vs implementation difference
+
+RFC-004 §7.16 recommended **eager dispatcher initialization at `_activate` time** (RFC-001 boundary, inside the worker context) for determinism. The implementation diverges to **lazy first-message initialization** for one reason:
+
+- Existing R-02 / R-05 / R-13 tests bypass `_activate` and construct Agents directly with `_broker` / `_agent_worker` set manually. Eager `_activate`-time initialization would either require dispatcher construction in `__init__` (spawning consumer threads even for tests that never receive a message — noisy) or require rewriting ~90 existing tests to call `_activate`.
+
+The two determinism guarantees the RFC cited (dispatcher exists before first message; no race between dispatcher construction and message dispatch) are preserved via **double-check locking** in `Agent._get_dispatcher()`:
+
+```python
+if self._dispatcher is None:
+    with self._dispatcher_init_lock:
+        if self._dispatcher is None:
+            self._dispatcher = self.__create_dispatcher()
+return self._dispatcher
+```
+
+The first `_on_message` call constructs the dispatcher under the lock; concurrent callers wait on the lock and observe the completed object. Subsequent calls hit the lock-free fast path. Symmetric with the broker in that both are created on first use; asymmetric with the broker in that the broker is still created inside `_activate` (RFC-001) — a follow-up RFC may unify these lifecycles as part of ProcessWorker rework.
+
+### Known issues NOT resolved by this fix (tracked separately)
+
+- **R-01** — `BinaryParcel.pickle.loads` on wire bytes.
+- **R-03** — MQTT reconnect + re-subscribe.
+- **`overflow_policy` variants**: `drop_oldest`, `block`, `raise` are **not implemented** in this phase (RFC-004 §7.3 opt-ins). Only `drop_newest` is supported.
+- **Per-topic serial queue** (RFC-004 Option E): same-topic ordering is not enforced. Deferred to a follow-up RFC iff ordering becomes required.
+- **ProcessWorker dispatcher semantics**: dispatcher is per-Agent-instance; in a hypothetical ProcessWorker future, dispatcher would live in the child process. Out of RFC-004 scope.
+- **External metrics export** (Prometheus / OpenTelemetry): only in-process attributes + log lines are exposed.
+- **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`.
 
 ---
 
@@ -484,7 +568,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 | R-01 | Critical | High | Open | `pickle.loads` on wire bytes |
 | R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
 | R-03 | High | High | Open | No MQTT reconnect / no re-subscribe |
-| R-04 | High | High | Open | Unbounded per-message thread creation |
+| R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | Open | `Worker.stop()` join without timeout |
