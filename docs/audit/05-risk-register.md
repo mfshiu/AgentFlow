@@ -227,15 +227,50 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-13 — publish result is discarded at every layer
 
+- **Status**: **RESOLVED** (2026-07-26) — see [RFC-002](../rfc/RFC-002-publish-error-propagation.md)
 - **Severity**: Medium
 - **Category**: Message Reliability / Observability
-- **File / Function / Line**:
-  - `src/agentflow/broker/mqtt_broker.py:106–107` `MqttBroker.publish` returns paho `MessageInfo`
-  - `src/agentflow/core/agent.py:305–314` `Agent.publish` returns `None` unconditionally
-- **Trigger**: Broker overload; disconnected client; QoS mismatch.
-- **Impact**: Caller cannot distinguish success from failure.
-- **Confidence**: High
-- **Recommended verification test**: Mock paho `client.publish` to return `MessageInfo(rc=1, mid=…)`; verify caller has no way to observe this.
+- **File / Function / Line** (historical): `src/agentflow/broker/mqtt_broker.py:106–107` `MqttBroker.publish` returns paho `MessageInfo`; `src/agentflow/core/agent.py:305–314` `Agent.publish` returns `None` unconditionally.
+- **Trigger** (historical): Broker overload; disconnected client; QoS mismatch.
+- **Impact** (historical): Caller could not distinguish success from failure; publish failures were silently swallowed by `Agent.publish` and, when reached from `publish_sync`, surfaced only as a plain `TimeoutError` after the full timeout elapsed, with no reference to the underlying cause.
+- **Confidence at discovery**: High
+- **Recommended verification test** (was): Mock paho `client.publish` to return `MessageInfo(rc=1, mid=…)`; verify caller has no way to observe this.
+
+### Resolution
+
+- **Resolved on**: 2026-07-26
+- **RFC**: [RFC-002 — publish error propagation](../rfc/RFC-002-publish-error-propagation.md) (Implemented)
+- **Scope of change** (RFC-002 §6):
+  - `src/agentflow/core/agent.py` — added `Agent._publish_or_raise(topic, data=None) -> None` as an **internal** (single-underscore) strict variant. Wraps `data` as a Parcel, forwards to the broker, propagates every broker exception unchanged, and raises `RuntimeError("Cannot publish: no broker attached")` when `self._broker is None`.
+  - `src/agentflow/core/agent.py` — `Agent.publish` refactored to call `_publish_or_raise` inside its existing `try/except Exception: logger.exception(...)`. Public signature and fire-and-forget contract preserved: still returns `None` on every outcome, still swallows every `Exception`.
+  - `src/agentflow/core/agent.py` — `Agent.publish_sync` now calls `self._publish_or_raise(topic, pcl)` in place of `self.publish(topic, pcl)`. The `try/finally` structure from RFC-001 is unchanged.
+- **Behavioural changes** (public signatures unchanged):
+  - `publish_sync` propagates the broker's **original exception object** (same type, same message, same traceback) instead of masking it as `TimeoutError`. Verified for `RuntimeError`, `ConnectionError`, `TimeoutError`, `OSError`.
+  - `publish_sync` fast-fails on publish error (measured elapsed < 50 ms against a mocked broker that raises synchronously) instead of waiting the full `timeout`.
+  - `publish_sync` with `_broker is None` raises `RuntimeError("Cannot publish: no broker attached")` immediately, not `TimeoutError` after the full timeout.
+  - The true-timeout case (broker accepted the publish but no response arrived within the deadline) continues to raise `TimeoutError` with the existing message shape.
+  - `Agent.publish` behaviour is byte-identical to the pre-RFC state — fire-and-forget callers see no difference.
+- **Interaction with R-02 cleanup**: intact. RFC-001's `try/finally` in `publish_sync` runs on every exit path (success, true timeout, broker-publish exception, missing broker). Verified by `test_publish_sync_cleans_up_handler_when_broker_publish_raises`, `test_publish_sync_calls_broker_unsubscribe_when_broker_publish_raises`, `test_publish_sync_cleans_up_handler_when_broker_is_none`, `test_publish_sync_with_none_broker_does_not_crash_on_cleanup`.
+- **Runtime verification** (as of 2026-07-26):
+  - Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+  - Result: **114 passed, 0 failed, 0 xfailed, 0 xpassed** in 1.82 s.
+  - Behaviours directly asserted:
+    - **Original exception type preserved** (4 types) — `test_publish_sync_propagates_broker_exception_unchanged[exc*]`, `test_publish_or_raise_reraises_broker_exception[exc*]`.
+    - **Original exception object preserved** (identity check) — `test_publish_sync_raises_original_broker_exception_object`.
+    - **Original message preserved** — `test_publish_sync_preserves_broker_exception_message`.
+    - **Fast fail** (< 50 ms with `timeout=1.0`) — `test_publish_sync_fast_fails_when_broker_publish_raises`, `test_publish_sync_fails_fast_when_broker_is_none`.
+    - **Missing broker** — `test_publish_sync_raises_RuntimeError_when_broker_is_none`, `test_publish_or_raise_raises_RuntimeError_when_broker_is_none`.
+    - **True timeout still surfaces as `TimeoutError`** — `test_publish_sync_TimeoutError_still_used_for_true_timeout`.
+    - **Fire-and-forget contract preserved** — `test_publish_swallows_broker_exception_and_returns_none[exc*]`, `test_publish_never_reraises_broker_exception[exc*]`, `test_publish_returns_none_when_broker_is_none`, `test_publish_return_value_cannot_distinguish_success_from_failure`.
+    - **Caller has an escape hatch** — `test_publish_or_raise_lets_caller_distinguish_success_from_failure`.
+  - Test files touching this fix: `tests/unit/core/test_agent_publish_errors.py` (46 tests), `tests/unit/core/test_agent_publish_sync.py` (3 R-02 crossover tests updated to reflect the new exception type on the publish-failure path).
+- **Known issues NOT resolved by this fix** (tracked separately):
+  - **R-01** — `BinaryParcel` still `pickle.loads` on wire bytes.
+  - **R-03** — MQTT reconnect + re-subscribe still not implemented.
+  - **R-04** — `Agent._on_message` still spawns one short-lived thread per received message.
+  - **R-05** — suspected reply loop still unverified.
+  - **Concurrent same-`topic_wait` race** — `Agent.subscribe` silently overwrites when two callers pick the same explicit `topic_wait`. RFC-001's identity guard prevents cleanup from making this worse, but the underlying race is unchanged.
+  - **Broker-side `MessageInfo`** — `MqttBroker.publish` and `_publish_or_raise` still discard the paho `MessageInfo` (rc/mid). RFC-002 explicitly deferred this to a future RFC on broker observability.
 
 ---
 
@@ -422,7 +457,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 | R-06 | High | Medium | Open | Process-mode pickling |
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
-| R-13 | Medium | High | Open | publish result discarded |
+| R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
 | R-14 | Medium | Medium | Open | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | Open | `from tkinter import N` |

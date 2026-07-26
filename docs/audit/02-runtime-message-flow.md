@@ -43,7 +43,7 @@ def publish(self, topic, data=None):
 ```
 
 Observed behaviour:
-- Return value is always `None`. paho's `MessageInfo` returned by `MqttBroker.publish` (`mqtt_broker.py:106–107`) is discarded — see Risk R-13.
+- Return value is always `None`. paho's `MessageInfo` returned by `MqttBroker.publish` (`mqtt_broker.py:106–107`) is discarded. Fire-and-forget contract is intentional and preserved by [RFC-002](../rfc/RFC-002-publish-error-propagation.md); callers who require raise-on-failure semantics use the internal `Agent._publish_or_raise` (see §2.8).
 - If `self._broker` is `None`, the call is silently logged and returns; caller cannot detect this. See Risk R-08.
 - Any exception is swallowed via `logger.exception`.
 
@@ -264,14 +264,22 @@ Filed as Risk R-05 with Confidence Medium and a specific reproduction plan.
 
 ## 2.8 Publish result / error propagation
 
-| Layer | Failure signal | Propagation |
-|---|---|---|
-| paho `client.publish` | Returns `MessageInfo(rc, mid)` | Discarded by `MqttBroker.publish` (`mqtt_broker.py:106–107`) |
-| `MqttBroker.publish` | Returns whatever paho returned | Ignored by `Agent.publish` (`agent.py:309`) |
-| `Agent.publish` | Wraps in try/except → logs | Caller receives `None` in all cases |
-| `Agent.publish_sync` | Wait on `Event` | Timeout → `TimeoutError`; broker-side failure is invisible |
+> **Update (2026-07-26)**: `Agent.publish` → `publish_sync` masking layer was **Resolved by [RFC-002](../rfc/RFC-002-publish-error-propagation.md)** — see [`docs/audit/05-risk-register.md` R-13](05-risk-register.md#r-13--publish-result-is-discarded-at-every-layer). The paho `MessageInfo` (rc/mid) at the broker adapter layer is still discarded; that residual observability gap is deferred to a future RFC on broker-level observability.
 
-**Consequence**: no code path can observe a lost publish. See Risk R-13.
+| Layer | Failure signal | Propagation (post-RFC-002) |
+|---|---|---|
+| paho `client.publish` | Returns `MessageInfo(rc, mid)` | Still discarded by `MqttBroker.publish` (out of RFC-002 scope). |
+| `MqttBroker.publish` | Returns whatever paho returned | Still ignored by `Agent.publish` / `Agent._publish_or_raise` (out of RFC-002 scope). Broker-raised exceptions, however, do propagate. |
+| `Agent._publish_or_raise` (new, internal) | Raises broker exceptions unchanged; raises `RuntimeError("Cannot publish: no broker attached")` when `_broker is None` | Reaches its direct caller (currently `publish_sync`; available to any internal caller that needs raise-on-fail semantics) |
+| `Agent.publish` | Wraps `_publish_or_raise` in `try/except Exception: logger.exception(...)` | **Unchanged**: fire-and-forget, returns `None` on every outcome. Preserves the pre-RFC-002 contract byte-for-byte. |
+| `Agent.publish_sync` | Calls `_publish_or_raise`; broker exceptions propagate through the RFC-001 `try/finally` (cleanup still runs) | **Original broker exception object** propagates to the caller (same type, message, traceback). True-timeout case (broker accepted the publish but no response) continues to raise `TimeoutError`. |
+
+**Consequence**:
+- Fire-and-forget publish (`Agent.publish`) callers see zero behavioural change — success and every failure still return `None`.
+- `publish_sync` callers now fast-fail on publish errors with the original exception; only genuine "no response in time" produces `TimeoutError`.
+- The residual broker-side observability gap (paho `MessageInfo` rc/mid) is documented and deferred.
+
+Verified by `tests/unit/core/test_agent_publish_errors.py` (46 tests) and the four R-02 crossover tests in `tests/unit/core/test_agent_publish_sync.py`.
 
 ---
 

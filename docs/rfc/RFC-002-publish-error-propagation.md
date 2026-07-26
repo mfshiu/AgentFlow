@@ -1,10 +1,17 @@
 # RFC-002 — publish error propagation
 
-- **Status**: Draft
+- **Status**: **Implemented (2026-07-26)**
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-13; builds on [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md)
 - **Scope**: only the error contract between `Agent.publish` / `publish_sync` and its callers when the broker layer fails
 - **Explicitly out of scope**: Parcel format, Message Schema, pickle (R-01), broker reconnect (R-03), retry policy, ProcessWorker architecture (R-06/R-08), logging framework, full `Result[T, E]` type migration
+- **Implementation summary** (2026-07-26):
+  - The recommended design in §6 landed with one minor variant: the strict method was named `_publish_or_raise` (single leading underscore, internal by convention) rather than the public `publish_or_raise` originally recommended in §6.1. Rationale: keep the public surface minimal while providing the raise-on-failure escape hatch for internal callers and (via Python's non-enforced privacy) any advanced user who explicitly opts in.
+  - `Agent.publish` was refactored to delegate to `_publish_or_raise` inside its existing `try/except Exception: logger.exception(...)`. Fire-and-forget contract preserved.
+  - `Agent.publish_sync` now uses `_publish_or_raise` on the publish step; the RFC-001 `try/finally` cleanup is unchanged.
+  - Test surface: `tests/unit/core/test_agent_publish_errors.py` (46 tests), plus 3 R-02 crossover tests in `tests/unit/core/test_agent_publish_sync.py` updated to reflect the new exception type on the publish-failure path.
+  - Full unit regression: `PYTHONPATH=src python -m pytest tests/unit` → **114 passed, 0 failed, 0 xfailed, 0 xpassed** in 1.82 s.
+  - See [R-13 resolution block](../audit/05-risk-register.md#r-13--publish-result-is-discarded-at-every-layer).
 
 ---
 
