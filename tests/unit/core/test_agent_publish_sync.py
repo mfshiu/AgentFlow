@@ -83,13 +83,13 @@ def test_publish_sync_timeout_wait_duration_is_bounded(agent_with_fake_broker):
 # 4: publish exception behaviour  (also witnesses Risk R-13)
 # --------------------------------------------------------------------------
 
-def test_publish_sync_still_times_out_when_publish_raises(agent_with_fake_broker):
-    """Agent.publish catches every Exception (agent.py:312-313) so
-    publish_sync sees no response and raises TimeoutError, NOT the
-    original exception. This is Risk R-13, unchanged by R-02 fix."""
+def test_publish_sync_propagates_broker_publish_exception(agent_with_fake_broker):
+    """Post-RFC-002: broker.publish exceptions propagate as their original
+    type through publish_sync. R-13 exception-masking is resolved; R-02
+    cleanup still runs on this path."""
     agent, broker = agent_with_fake_broker
     broker.publish_exception = RuntimeError('broker down')
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RuntimeError, match='broker down'):
         agent.publish_sync('req', 'q', topic_wait='ret/4', timeout=0.05)
 
 
@@ -98,7 +98,7 @@ def test_publish_sync_records_publish_attempt_even_when_publish_raises(
 ):
     agent, broker = agent_with_fake_broker
     broker.publish_exception = RuntimeError('broker down')
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RuntimeError):
         agent.publish_sync('req', 'q', topic_wait='ret/4b', timeout=0.05)
     published_topics = [t for (t, _p) in broker.publish_calls]
     assert 'req' in published_topics
@@ -111,7 +111,7 @@ def test_publish_sync_subscribes_and_then_unsubscribes_when_publish_raises(
     failure the finally block must still unsubscribe the return topic."""
     agent, broker = agent_with_fake_broker
     broker.publish_exception = RuntimeError('broker down')
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RuntimeError):
         agent.publish_sync('req', 'q', topic_wait='ret/4c', timeout=0.05)
     subscribed = [t for (t, _dt) in broker.subscribe_calls]
     assert 'ret/4c' in subscribed

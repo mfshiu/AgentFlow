@@ -303,14 +303,28 @@ class Agent(BrokerNotifier):
 
     @final
     def publish(self, topic, data=None):
-        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)      
+        # Fire-and-forget contract: catch every Exception so callers who
+        # ignore the return value never see a broker-side failure. To
+        # get the raise-on-failure variant, use publish_sync (which
+        # goes through _publish_or_raise) or call _publish_or_raise
+        # directly.
         try:
-            if self._broker:
-                self._broker.publish(topic, pcl.payload())
-            else:
-                logger.error("Cannot publish: _broker is None.")
+            self._publish_or_raise(topic, data)
         except Exception as ex:
             logger.exception(ex)
+
+
+    def _publish_or_raise(self, topic, data=None) -> None:
+        """Internal strict publish. Wraps `data` as a Parcel and forwards
+        it to the broker. Unlike Agent.publish, propagates every broker
+        exception to the caller and raises RuntimeError when no broker
+        is attached. Used by publish_sync to enable fast-fail semantics.
+        Marked with a single leading underscore to signal that this is
+        internal-use only; API stability is not guaranteed."""
+        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)
+        if self._broker is None:
+            raise RuntimeError("Cannot publish: no broker attached")
+        self._broker.publish(topic, pcl.payload())
 
         
     def __generate_return_topic(self, topic):
@@ -344,7 +358,10 @@ class Agent(BrokerNotifier):
 
         self.subscribe(pcl.topic_return, topic_handler=handle_response)
         try:
-            self.publish(topic, pcl)
+            # _publish_or_raise propagates broker exceptions so that the
+            # caller fails fast on publish errors instead of waiting for
+            # the full response timeout (RFC-002).
+            self._publish_or_raise(topic, pcl)
             if data_event.event.wait(timeout):
                 return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
