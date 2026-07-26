@@ -27,14 +27,43 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-02 — `publish_sync` leaks handler entries and broker subscriptions
 
+- **Status**: **RESOLVED** (2026-07-26) — see [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md)
 - **Severity**: High
 - **Category**: Resource / Message Reliability
-- **File / Function / Line**: `src/agentflow/core/agent.py:321–349`, `Agent.publish_sync`
-- **Evidence**: `subscribe(pcl.topic_return, handle_response)` at line 343 writes into `__topic_handlers`; there is no matching delete anywhere in the file (grep-confirmed). `MessageBroker` (`broker/message_broker.py`) does not define `unsubscribe`; `MqttBroker` does not implement one.
-- **Trigger**: Any long-running agent that calls `publish_sync` repeatedly.
-- **Impact**: Unbounded growth of `__topic_handlers`; unbounded growth of the broker's subscription table for that client.
-- **Confidence**: High
-- **Recommended verification test**: Loop `publish_sync` N times against a mock broker; assert `len(agent._Agent__topic_handlers)` does not grow.
+- **File / Function / Line** (historical, at time of discovery): `src/agentflow/core/agent.py:321–349`, `Agent.publish_sync`
+- **Evidence** (historical): `subscribe(pcl.topic_return, handle_response)` at line 343 wrote into `__topic_handlers`; no matching delete existed anywhere in the file. `MessageBroker` did not define `unsubscribe`; `MqttBroker` did not implement one.
+- **Trigger** (historical): Any long-running agent that called `publish_sync` repeatedly.
+- **Impact** (historical): Unbounded growth of `__topic_handlers`; unbounded growth of the broker's subscription table for that client.
+- **Confidence at discovery**: High
+- **Recommended verification test** (was): Loop `publish_sync` N times against a mock broker; assert `len(agent._Agent__topic_handlers)` does not grow.
+
+### Resolution
+
+- **Resolved on**: 2026-07-26
+- **RFC**: [RFC-001 — publish_sync subscription lifecycle](../rfc/RFC-001-publish-sync-subscription-lifecycle.md) (Accepted)
+- **Scope of change**:
+  - `src/agentflow/broker/message_broker.py` — added `MessageBroker.unsubscribe(topic) -> None` as a **non-abstract** method with a default no-op body. Backward compatible with existing third-party subclasses.
+  - `src/agentflow/broker/mqtt_broker.py` — added `MqttBroker.unsubscribe(topic)` that delegates to `self._client.unsubscribe(topic)`.
+  - `src/agentflow/core/agent.py`:
+    - Added `@final Agent.unsubscribe(topic)` — public method symmetric to `Agent.subscribe`. Pops the entry from `__topic_handlers` and calls `broker.unsubscribe` when a broker is attached. Idempotent.
+    - `publish_sync` now wraps `publish` + `event.wait` in a `try/finally`. The `finally` block uses an **identity guard** so it only tears down the subscription if `__topic_handlers[topic_return]` is still the specific `handle_response` closure that this call installed. Cleanup exceptions are swallowed via `logger.exception` so they cannot mask the original return value or `TimeoutError`.
+    - `handle_response` closure gained a `data_event.event.is_set()` early-return guard so a duplicate arriving before the finally cleanup cannot mutate `data_event.data`.
+- **Runtime verification** (as of 2026-07-26):
+  - Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v`
+  - Result: **68 passed, 0 failed, 0 xfailed, 0 xpassed** in 1.90 s.
+  - Behaviours directly asserted:
+    - **Success cleanup** — `test_topic_handlers_cleaned_after_successful_publish_sync`, `test_broker_subscribe_and_unsubscribe_grow_together_on_success`, `test_broker_unsubscribes_specific_topic_after_success`.
+    - **Timeout cleanup** — `test_topic_handlers_cleaned_after_timed_out_publish_sync`, `test_broker_subscribe_and_unsubscribe_grow_together_on_timeout`, `test_broker_unsubscribes_specific_topic_after_timeout`.
+    - **Publish-exception cleanup** — `test_publish_sync_subscribes_and_then_unsubscribes_when_publish_raises`.
+    - **Late response fallback** — `test_late_response_after_timeout_falls_through_to_on_message`.
+    - **Duplicate response fallback** — `test_first_response_returned_and_duplicate_falls_through_to_on_message`.
+    - **Identity guard** — `test_identity_guard_preserves_foreign_handler_on_same_topic`.
+    - **Concurrent cleanup** — `test_concurrent_publish_sync_with_distinct_topic_wait_all_clean_up`.
+  - Test files touching this fix: `tests/unit/core/test_agent_publish_sync.py` (27 tests), `tests/unit/test_mqtt_broker_lifecycle.py` (`unsubscribe` delegation × 2), `tests/unit/test_empty_broker.py` (default no-op path × 3).
+- **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
+  - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
+  - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
+  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. Tracked for a future RFC.
 
 ---
 
@@ -379,30 +408,30 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## Summary table (sorted by severity, then confidence)
 
-| ID | Severity | Confidence | Title |
-|---|---|---|---|
-| R-01 | Critical | High | `pickle.loads` on wire bytes |
-| R-02 | High | High | `publish_sync` handler / subscription leak |
-| R-03 | High | High | No MQTT reconnect / no re-subscribe |
-| R-04 | High | High | Unbounded per-message thread creation |
-| R-08 | High | High | Parent-process `publish` silently fails in process mode |
-| R-09 | High | High | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | `Worker.stop()` join without timeout |
-| R-18 | High | High | No child/parent unregister / heartbeat |
-| R-05 | High | Medium | Suspected reply loop |
-| R-06 | High | Medium | Process-mode pickling |
-| R-07 | High | Medium | BaseException handlers |
-| R-11 | Medium | Medium | `_on_connect` `setattr(...None...)` overwrites methods |
-| R-13 | Medium | High | publish result discarded |
-| R-14 | Medium | Medium | Shared dicts without locks |
-| R-15 | Medium | High | `ConfigName` referenced but missing |
-| R-16 | Medium | Medium | `from tkinter import N` |
-| R-19 | Medium | High | Parcel `version` never validated |
-| R-20 | Medium | High | No message metadata for tracing |
-| R-25 | Medium | High | Broker config default shape mismatch |
-| R-12 | Low | High | Dead signature branch in `_activate` |
-| R-17 | Low | High | `dict[str, function]` |
-| R-21 | Low | High | `wrapper.py` `VERSION` undefined |
-| R-22 | Low | High | Stub / broken broker implementations |
-| R-23 | Low | High | README / directory drift |
-| R-24 | Low | Medium | Unexplained sleep in `_on_connect` |
+| ID | Severity | Confidence | Status | Title |
+|---|---|---|---|---|
+| R-01 | Critical | High | Open | `pickle.loads` on wire bytes |
+| R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
+| R-03 | High | High | Open | No MQTT reconnect / no re-subscribe |
+| R-04 | High | High | Open | Unbounded per-message thread creation |
+| R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
+| R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
+| R-10 | High | High | Open | `Worker.stop()` join without timeout |
+| R-18 | High | High | Open | No child/parent unregister / heartbeat |
+| R-05 | High | Medium | Open | Suspected reply loop |
+| R-06 | High | Medium | Open | Process-mode pickling |
+| R-07 | High | Medium | Open | BaseException handlers |
+| R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
+| R-13 | Medium | High | Open | publish result discarded |
+| R-14 | Medium | Medium | Open | Shared dicts without locks |
+| R-15 | Medium | High | Open | `ConfigName` referenced but missing |
+| R-16 | Medium | Medium | Open | `from tkinter import N` |
+| R-19 | Medium | High | Open | Parcel `version` never validated |
+| R-20 | Medium | High | Open | No message metadata for tracing |
+| R-25 | Medium | High | Open | Broker config default shape mismatch |
+| R-12 | Low | High | Open | Dead signature branch in `_activate` |
+| R-17 | Low | High | Open | `dict[str, function]` |
+| R-21 | Low | High | Open | `wrapper.py` `VERSION` undefined |
+| R-22 | Low | High | Open | Stub / broken broker implementations |
+| R-23 | Low | High | Open | README / directory drift |
+| R-24 | Low | Medium | Open | Unexplained sleep in `_on_connect` |

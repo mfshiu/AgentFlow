@@ -5,6 +5,42 @@
 
 ---
 
+## 6.0 Status update (2026-07-26)
+
+The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved R-02 via [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md).
+
+Current authoritative pytest command:
+
+```bash
+PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
+```
+
+Result as of 2026-07-26:
+
+```
+68 passed, 0 failed, 0 xfailed, 0 xpassed  in 1.90s
+```
+
+Suite composition:
+
+| File | Purpose | Tests |
+|---|---:|---:|
+| `tests/unit/core/test_agent_publish_sync.py` | R-02 characterization + fix invariants | 27 |
+| `tests/unit/test_mqtt_broker_start.py` | MqttBroker start + wait paths | 13 |
+| `tests/unit/test_mqtt_broker_auth.py` | username / password walrus edges | 6 |
+| `tests/unit/test_mqtt_broker_lifecycle.py` | stop / publish / subscribe / **unsubscribe** delegation | 11 |
+| `tests/unit/test_mqtt_broker_callbacks.py` | `_on_connect` / `_on_message` / exception isolation | 8 |
+| `tests/unit/test_empty_broker.py` | `MessageBroker.unsubscribe` default no-op via EmptyBroker | 3 |
+
+Coverage changes since baseline:
+
+- **R-02** — was uncovered; now covered by `tests/unit/core/test_agent_publish_sync.py` (success cleanup, timeout cleanup, publish-exception cleanup, late-response fallback, duplicate-response fallback, identity guard, concurrent cleanup). See §6.4 for the updated matrix.
+- **R-04 / R-13** — still uncovered; explicitly out of RFC-001 scope.
+
+Legacy trees (`unit_test/`, `exe_test/`) remain excluded from pytest collection via `pyproject.toml` `norecursedirs`. No change to §6.1–6.7 inventory.
+
+---
+
 ## 6.1 Inventory
 
 ### `unit_test/`
@@ -105,7 +141,7 @@ Cross-referenced with `05-risk-register.md`.
 | Risk | Not covered by any test |
 |---|---|
 | R-01 pickle payload | ✓ no malformed payload test |
-| R-02 `publish_sync` leaks | ✓ no `publish_sync` test at all |
+| R-02 `publish_sync` leaks | **Resolved 2026-07-26 (RFC-001); covered by `tests/unit/core/test_agent_publish_sync.py`** |
 | R-03 broker reconnect / re-subscribe | ✓ |
 | R-04 unbounded per-message threads | ✓ |
 | R-05 suspected reply loop | ✓ |
@@ -114,7 +150,7 @@ Cross-referenced with `05-risk-register.md`.
 | R-08 parent-side publish silent failure | ✓ |
 | R-09 topic sanitisation | ✓ |
 | R-10 `join()` without timeout on stuck handler | ✓ |
-| R-13 publish-result observability | ✓ |
+| R-13 publish-result observability | ✓ (still open; R-02 fix did NOT change publish's exception-swallowing behaviour) |
 | R-14 dict concurrency | ✓ |
 | R-18 no unregister / heartbeat | ✓ |
 | R-19 parcel version drift | ✓ |

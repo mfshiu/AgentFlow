@@ -190,7 +190,9 @@ Observations:
 
 ## 2.7 Sync request/response — `publish_sync`
 
-`Agent.publish_sync` (`src/agentflow/core/agent.py:321–349`):
+> **Update (2026-07-26)**: sections 2.7's "Explicit lifecycle gaps" #1 and #2 were **Resolved by [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md)** — see [`docs/audit/05-risk-register.md` R-02](05-risk-register.md#r-02--publish_sync-leaks-handler-entries-and-broker-subscriptions). Gaps #3 and #4 remain open. The sequence diagram and narrative below have been updated to reflect the resolved cleanup path.
+
+`Agent.publish_sync` (`src/agentflow/core/agent.py:321–353`):
 
 ```mermaid
 sequenceDiagram
@@ -204,23 +206,41 @@ sequenceDiagram
     AS->>AS: generate return_topic = tag-<10 alnum>/topic
     AS->>AS: create DataEvent(worker.create_event())
     AS->>AS: subscribe(return_topic, handle_response)<br/>__topic_handlers[return_topic] = handler
-    AS->>BR: publish(topic, pcl with topic_return)
-    BR-->>AR: _on_message(topic, payload)
-    AR->>AR: handle_message thread<br/>topic_handler → business logic
-    AR->>BR: publish(return_topic, data_resp)
-    BR-->>AS: _on_message(return_topic, payload)
-    AS->>HR: handle_response(topic, pcl_resp)
-    HR->>HR: data_event.data = pcl_resp<br/>data_event.event.set()
-    AS->>Caller: return data_event.data
-    Note over AS: NO unsubscribe, NO handler cleanup<br/>see Risk R-02
+    rect rgba(220, 245, 220, 0.5)
+      Note over AS: try:
+      AS->>BR: publish(topic, pcl with topic_return)
+      BR-->>AR: _on_message(topic, payload)
+      AR->>AR: handle_message thread<br/>topic_handler → business logic
+      AR->>BR: publish(return_topic, data_resp)
+      BR-->>AS: _on_message(return_topic, payload)
+      AS->>HR: handle_response(topic, pcl_resp)
+      HR->>HR: if data_event.event.is_set(): return<br/>data_event.data = pcl_resp<br/>data_event.event.set()
+      AS->>Caller: return data_event.data
+    end
+    rect rgba(255, 235, 220, 0.7)
+      Note over AS: finally:
+      AS->>AS: if __topic_handlers[return_topic] is handle_response:
+      AS->>AS: __topic_handlers.pop(return_topic)
+      AS->>BR: broker.unsubscribe(return_topic)
+    end
 ```
 
 ### Explicit lifecycle gaps
 
-1. **No handler cleanup**: `__topic_handlers[return_topic]` is never deleted. Confirmed by grep — the only writes to `__topic_handlers` are the assignment in `subscribe` (`agent.py:362`) and initial `{}` in `__init__` (`agent.py:45`).
-2. **No broker unsubscribe**: `MessageBroker` does not define `unsubscribe` (`message_broker.py`), and `MqttBroker` does not implement it (`mqtt_broker.py`). Any topic subscribed via `publish_sync` remains subscribed for the lifetime of the process.
-3. **No correlation id**: return topic is the only demultiplexer. Concurrent requests to the same `topic` with `topic_wait=None` get distinct return topics via random suffix (10 base-36 chars → ~40 bits); with `topic_wait` reused explicitly, they race.
-4. **Timeout only on `event.wait`**: publish/subscribe I/O has no timeout.
+1. ~~**No handler cleanup**~~ — **RESOLVED 2026-07-26 (RFC-001).** `publish_sync` now runs an identity-guarded `finally` that pops `__topic_handlers[return_topic]` when it is still the specific `handle_response` this call installed. Verified by `tests/unit/core/test_agent_publish_sync.py::test_topic_handlers_cleaned_after_successful_publish_sync` and `_timed_out_publish_sync`.
+2. ~~**No broker unsubscribe**~~ — **RESOLVED 2026-07-26 (RFC-001).** `MessageBroker` now declares `unsubscribe(topic) -> None` as a non-abstract default no-op; `MqttBroker.unsubscribe` delegates to `self._client.unsubscribe(topic)`. Verified by `tests/unit/core/test_agent_publish_sync.py::test_broker_subscribe_and_unsubscribe_grow_together_on_success` and `_on_timeout`, plus `tests/unit/test_mqtt_broker_lifecycle.py::test_unsubscribe_delegates_topic_to_client`.
+3. **No correlation id** (still open): return topic is the only demultiplexer. Concurrent requests to the same `topic` with `topic_wait=None` get distinct return topics via random suffix (10 base-36 chars → ~40 bits); with `topic_wait` reused explicitly, they still race — `Agent.subscribe` silently overwrites. RFC-001 added an identity guard so the cleanup path does not make this race worse, but the race itself is unresolved.
+4. **Timeout only on `event.wait`** (still open): publish/subscribe I/O has no timeout.
+
+### Post-resolution observable invariants
+
+For every `publish_sync` call, regardless of exit path (success, `TimeoutError`, or broker-`publish` exception):
+
+- `return_topic not in agent._Agent__topic_handlers`
+- `broker.unsubscribe_calls` grew by exactly one entry equal to `return_topic`
+- Any late or duplicate response arriving after cleanup is routed to the default `Agent.on_message` (no-op) via fall-through, not to the completed `handle_response`.
+
+The one exception is the **identity-guard bypass**: if a foreign handler races onto the same topic between `subscribe` and `finally`, the guard skips both the pop and the unsubscribe. In that case the foreign handler is preserved and the (already lost) subscription is not torn down. Verified by `test_identity_guard_preserves_foreign_handler_on_same_topic`.
 
 ### Suspected reply loop (Confidence: Medium — not verified)
 

@@ -1,10 +1,15 @@
 # RFC-001 — publish_sync subscription lifecycle
 
-- **Status**: Draft
+- **Status**: **Accepted & Implemented (2026-07-26)**
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-02
 - **Scope**: only the cleanup of return-topic subscription and handler for `Agent.publish_sync`
 - **Explicitly out of scope**: Parcel format changes, pickle security (R-01), version migration (R-19), message metadata (R-20), correlation ID as a message field, ProcessWorker architecture (R-06/R-08), broker reconnect (R-03)
+- **Implementation summary** (2026-07-26):
+  - Landed changes to `src/agentflow/broker/message_broker.py`, `src/agentflow/broker/mqtt_broker.py`, `src/agentflow/core/agent.py`.
+  - Test surface: `tests/unit/core/test_agent_publish_sync.py` (27 tests), `tests/unit/test_mqtt_broker_lifecycle.py` (`unsubscribe` × 2), `tests/unit/test_empty_broker.py` (default no-op × 3), `tests/fakes/fake_broker.py` (unsubscribe recorder).
+  - Full unit regression: `PYTHONPATH=src python -m pytest tests/unit -v` → **68 passed, 0 failed, 0 xfailed, 0 xpassed** in 1.90 s.
+  - See [R-02 resolution block](../audit/05-risk-register.md#r-02--publish_sync-leaks-handler-entries-and-broker-subscriptions).
 
 ---
 
