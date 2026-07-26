@@ -574,24 +574,39 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
-        # logger.debug(self.M(f"topic: {topic}, data: {data}"))        
+        # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         pcl = Parcel.from_payload(data)
 
+        # RFC-003 R-fallback-silent: only topics with a specifically
+        # registered handler in __topic_handlers may trigger an
+        # auto-reply. Fall-through to on_message still dispatches the
+        # handler but must never emit an implicit reply.
+        is_specific_handler = topic in self.__topic_handlers
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
-        
+        should_auto_reply = bool(pcl.topic_return) and is_specific_handler
+
         def handle_message(topic_handler, topic, p:Parcel):
-            if p.topic_return:
+            if should_auto_reply:
                 try:
                     logger.debug(f"topic: {topic}, topic_return: {p.topic_return}")
                     data_resp = topic_handler(topic, p)
                 except Exception as ex:
                     logger.exception(ex)
-                    p.error = str(ex)
-                    p.content = None
-                    data_resp = p
+                    # RFC-003 R-exception-fresh: build a new parcel for
+                    # the error echo; do NOT mutate or reuse p.
+                    err_pcl = Parcel.from_content(None)
+                    err_pcl.error = str(ex)
+                    data_resp = err_pcl
                     logger.debug(data_resp)
-                finally:
-                    self.publish(pcl.topic_return, data_resp)
+                # RFC-003 R-strip-topic_return: the auto-reply must
+                # never carry topic_return. If the handler returned a
+                # Parcel whose topic_return is truthy, reconstruct
+                # instead of mutating the caller's object.
+                if isinstance(data_resp, Parcel) and data_resp.topic_return:
+                    stripped = type(data_resp)(data_resp.content)
+                    stripped.error = data_resp.error
+                    data_resp = stripped
+                self.publish(pcl.topic_return, data_resp)
             else:
                 try:
                     topic_handler(topic, p)
