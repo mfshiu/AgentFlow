@@ -1,41 +1,29 @@
-"""Characterization tests for Agent._on_message per-message thread
-creation (Risk R-04 in docs/audit/05-risk-register.md).
+"""Tests for RFC-004 bounded message dispatch (Risk R-04).
 
-Agent._on_message (agent.py) spawns one fresh threading.Thread per
-received message via:
+Post-RFC-004:
 
-    threading.Thread(target=handle_message, args=(...)).start()
+  - Agent._on_message enqueues a task onto a bounded queue.
+  - A fixed pool of daemon consumer threads drains the queue.
+  - Queue full → drop_newest with metric increment + rate-limited warn.
+  - Agent.terminate() calls dispatcher.stop() which drains within a
+    bounded shutdown_timeout_s deadline. Idempotent.
+  - Legacy per_message_thread mode remains available (deprecated) for
+    one release cycle; it emits a DeprecationWarning at Agent init.
 
-This test file documents:
-
-  - Every message spawns a NEW Thread (no pool, no reuse).
-  - Bounded stress runs of 100/500/1000 messages each spawn N threads.
-  - Slow handlers cause active-thread count to grow with N (unbounded).
-  - The framework holds no reference to spawned threads; Agent.terminate
-    does not wait for handler threads to complete.
-  - Handler threads inherit non-daemon status (block interpreter exit).
-  - Handler exceptions terminate the spawned thread cleanly.
-  - Delivery order is not enforced across threads.
-  - Multiple messages on the same topic execute concurrently.
-  - Shared mutable state accessed inside handlers is exposed to the
-    Python GIL without additional framework locking.
-  - Auto-reply publish runs on the same handler thread.
-
-Constraints:
-  - No real MQTT / socket / ProcessWorker.
-  - All stress tests have bounded upper limits.
-  - No modification of Agent.
-  - No introduction of a ThreadPoolExecutor.
+RFC-003 auto-reply contract is preserved: the dispatcher runs the
+same handle_message body that used to run on a per-message Thread.
 """
 
 import threading as real_threading
 import time
 import types
-from typing import List
+import warnings
+from typing import Any, Dict, List
 
 import pytest
 
 from agentflow.core.agent import Agent
+from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 from agentflow.core.parcel import Parcel, TextParcel
 
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
@@ -45,9 +33,11 @@ from tests.fakes.fake_broker import FakeBroker, FakeWorker
 # Fixtures + helpers
 # --------------------------------------------------------------------------
 
-@pytest.fixture
-def agent_with_fake_broker():
-    a = Agent(name='test_r04', agent_config={})
+def _make_agent(dispatch_cfg=None):
+    cfg: Dict[str, Any] = {}
+    if dispatch_cfg is not None:
+        cfg['dispatch'] = dispatch_cfg
+    a = Agent(name='test_r04', agent_config=cfg)
     b = FakeBroker(notifier=a)
     a._broker = b
     a._agent_worker = FakeWorker()
@@ -55,12 +45,22 @@ def agent_with_fake_broker():
 
 
 @pytest.fixture
+def agent_with_fake_broker():
+    a, b = _make_agent()
+    try:
+        yield a, b
+    finally:
+        a.terminate()
+
+
+@pytest.fixture
 def thread_recorder(monkeypatch):
-    """Replace agentflow.core.agent.threading with a proxy module whose
-    only override is Thread → RecordingThread. All other threading
-    attributes (Event, Lock, Barrier, ...) delegate to the real module,
-    and no test outside agent.py is affected."""
+    """Replace agentflow.core.agent.threading AND
+    agentflow.core.dispatcher.threading with proxy modules whose only
+    override is Thread → RecordingThread. All other threading
+    attributes delegate to the real module."""
     from agentflow.core import agent as agent_mod
+    from agentflow.core import dispatcher as dispatcher_mod
 
     recorded: List[real_threading.Thread] = []
     lock = real_threading.Lock()
@@ -71,12 +71,15 @@ def thread_recorder(monkeypatch):
             with lock:
                 recorded.append(self)
 
-    proxy = types.ModuleType('threading_proxy_for_agent_r04')
-    for name in dir(real_threading):
-        setattr(proxy, name, getattr(real_threading, name))
-    proxy.Thread = RecordingThread
+    def _install(module):
+        proxy = types.ModuleType(f'threading_proxy_for_{module.__name__}')
+        for name in dir(real_threading):
+            setattr(proxy, name, getattr(real_threading, name))
+        proxy.Thread = RecordingThread
+        monkeypatch.setattr(module, 'threading', proxy)
 
-    monkeypatch.setattr(agent_mod, 'threading', proxy)
+    _install(agent_mod)
+    _install(dispatcher_mod)
 
     class Recorder:
         threads = recorded
@@ -112,323 +115,394 @@ def _wait_until(predicate, timeout: float = 1.0) -> bool:
 
 
 # ==========================================================================
-# 1. Every message spawns a new thread
+# Bounded dispatcher: fixed worker pool
 # ==========================================================================
 
-def test_every_message_spawns_one_new_thread(
+def test_dispatcher_is_created_lazily_on_first_message(agent_with_fake_broker):
+    agent, broker = agent_with_fake_broker
+    assert agent._dispatcher is None, 'dispatcher must not be built at __init__'
+    broker.deliver('T', TextParcel('m').payload())
+    assert agent._dispatcher is not None
+    assert isinstance(agent._dispatcher, MessageDispatcher)
+
+
+def test_1000_slow_messages_do_not_create_1000_threads(
     agent_with_fake_broker, thread_recorder,
 ):
-    """Each broker delivery spawns a distinct threading.Thread OBJECT.
-    (OS-level thread IDs can be recycled when threads exit quickly, so
-    we assert on the identity of the Thread instances rather than on
-    threading.get_ident() values.)"""
+    """RFC-004 core: N messages must NOT create N Threads."""
     agent, broker = agent_with_fake_broker
-    counter = {'v': 0}
-    counter_lock = real_threading.Lock()
+    release = real_threading.Event()
+
+    def slow_handler(topic, pcl):
+        release.wait(timeout=5.0)
+
+    agent.subscribe('T', topic_handler=slow_handler)
+    for i in range(1000):
+        broker.deliver('T', TextParcel(str(i)).payload())
+
+    # Only the dispatcher's fixed worker pool was created (default 8).
+    # No per-message Thread objects.
+    assert thread_recorder.count() == 8
+    release.set()
+
+
+def test_active_workers_never_exceeds_configured_max(thread_recorder):
+    a, broker = _make_agent(dispatch_cfg={'workers': 4, 'queue_capacity': 32})
+    try:
+        release = real_threading.Event()
+
+        def slow(topic, pcl):
+            release.wait(timeout=5.0)
+
+        a.subscribe('T', topic_handler=slow)
+        for _ in range(20):
+            broker.deliver('T', TextParcel('m').payload())
+
+        ok = _wait_until(
+            lambda: a._dispatcher.active_workers >= 4, timeout=2.0,
+        )
+        assert ok
+        # Never exceeds the configured cap.
+        assert a._dispatcher.active_workers == 4
+        assert thread_recorder.count() == 4
+        release.set()
+    finally:
+        a.terminate()
+
+
+def test_workers_are_daemon_threads(agent_with_fake_broker, thread_recorder):
+    """RFC-004 §7.7: workers are daemon as a process-exit safety net."""
+    agent, broker = agent_with_fake_broker
+    broker.deliver('T', TextParcel('m').payload())
+    time.sleep(0.05)  # let dispatcher init complete
+    assert thread_recorder.count() == 8
+    assert all(t.daemon for t in thread_recorder.threads)
+
+
+# ==========================================================================
+# Bounded queue + drop_newest overflow policy
+# ==========================================================================
+
+def test_queue_depth_never_exceeds_capacity():
+    a, broker = _make_agent(dispatch_cfg={'workers': 1, 'queue_capacity': 5})
+    try:
+        release = real_threading.Event()
+
+        def slow(topic, pcl):
+            release.wait(timeout=5.0)
+
+        a.subscribe('T', topic_handler=slow)
+        for _ in range(20):
+            broker.deliver('T', TextParcel('m').payload())
+
+        # 1 in flight + 5 in queue; the rest dropped.
+        assert a._dispatcher.queue_depth <= 5
+        release.set()
+    finally:
+        a.terminate()
+
+
+def test_queue_full_drops_newest_and_increments_metric():
+    a, broker = _make_agent(dispatch_cfg={'workers': 1, 'queue_capacity': 3})
+    try:
+        release = real_threading.Event()
+        started = real_threading.Event()
+        processed = []
+
+        def slow(topic, pcl):
+            started.set()
+            release.wait(timeout=5.0)
+            processed.append(pcl.content)
+
+        a.subscribe('T', topic_handler=slow)
+        # First delivery starts the handler and consumes the slot.
+        broker.deliver('T', TextParcel('first').payload())
+        assert started.wait(1.0)
+        # Fill the queue (3 slots).
+        broker.deliver('T', TextParcel('q1').payload())
+        broker.deliver('T', TextParcel('q2').payload())
+        broker.deliver('T', TextParcel('q3').payload())
+        # These MUST be dropped (queue full).
+        for i in range(5):
+            broker.deliver('T', TextParcel(f'drop-{i}').payload())
+
+        snap = a._dispatcher.metrics_snapshot()
+        assert snap['queue_depth'] == 3
+        assert snap['dropped_message_count'] == 5
+
+        release.set()
+        # Wait for consumer to drain the queue.
+        ok = _wait_until(lambda: len(processed) == 4, timeout=2.0)
+        assert ok
+        # First 4 processed; the 5 dropped were never handled.
+        assert 'first' in processed
+        assert all(p.startswith('drop-') is False for p in processed)
+    finally:
+        a.terminate()
+
+
+def test_dropped_count_matches_number_of_dropped_deliveries():
+    a, broker = _make_agent(dispatch_cfg={'workers': 1, 'queue_capacity': 2})
+    try:
+        release = real_threading.Event()
+        started = real_threading.Event()
+
+        def slow(topic, pcl):
+            started.set()
+            release.wait(timeout=5.0)
+
+        a.subscribe('T', topic_handler=slow)
+        broker.deliver('T', TextParcel('go').payload())
+        assert started.wait(1.0)
+        for _ in range(2):  # fill capacity
+            broker.deliver('T', TextParcel('q').payload())
+        for _ in range(17):  # every one must be dropped
+            broker.deliver('T', TextParcel('d').payload())
+
+        assert a._dispatcher.dropped_message_count == 17
+        release.set()
+    finally:
+        a.terminate()
+
+
+def test_broker_callback_never_raises_on_queue_full():
+    """RFC-004 §7.3 broker-callback safety invariant: queue.Full must
+    NEVER escape to the paho loop thread."""
+    a, broker = _make_agent(dispatch_cfg={'workers': 1, 'queue_capacity': 1})
+    try:
+        release = real_threading.Event()
+        started = real_threading.Event()
+
+        def slow(topic, pcl):
+            started.set()
+            release.wait(timeout=5.0)
+
+        a.subscribe('T', topic_handler=slow)
+        broker.deliver('T', TextParcel('go').payload())
+        assert started.wait(1.0)
+        # Fill queue.
+        broker.deliver('T', TextParcel('q1').payload())
+        # Now every further delivery would hit queue.Full inside enqueue.
+        # broker.deliver invokes agent._on_message on the current thread
+        # (simulating the paho loop). It MUST NOT raise.
+        for i in range(10):
+            broker.deliver('T', TextParcel(f'drop-{i}').payload())  # no raise
+
+        assert a._dispatcher.dropped_message_count == 10
+        release.set()
+    finally:
+        a.terminate()
+
+
+# ==========================================================================
+# Handler exception isolation (RFC-004 §7.10)
+# ==========================================================================
+
+def test_handler_exception_does_not_kill_consumer(agent_with_fake_broker):
+    """Two-layer exception isolation:
+      - handle_message (RFC-003) catches the handler's Exception first,
+        so the task itself returns normally and the dispatcher counts
+        it as processed.
+      - Even if a rogue task raised out to the dispatcher, the
+        consumer's try/except Exception (RFC-004 §7.10) would still
+        keep it alive.
+
+    This test verifies the consumer keeps processing after a raising
+    handler. Dispatcher-level error_count is exercised separately in
+    `test_dispatcher_counts_task_exceptions_from_direct_enqueue`."""
+    agent, broker = agent_with_fake_broker
+    processed = []
+
+    def sometimes_raising(topic, pcl):
+        if pcl.content == 'boom':
+            raise RuntimeError('handler boom')
+        processed.append(pcl.content)
+
+    agent.subscribe('T', topic_handler=sometimes_raising)
+    broker.deliver('T', TextParcel('boom').payload())
+    broker.deliver('T', TextParcel('after-boom-1').payload())
+    broker.deliver('T', TextParcel('after-boom-2').payload())
+
+    ok = _wait_until(lambda: len(processed) == 2, timeout=1.0)
+    assert ok
+    assert processed == ['after-boom-1', 'after-boom-2']
+    # All three tasks returned normally from the dispatcher's viewpoint
+    # (handle_message caught the RuntimeError internally).
+    snap = agent._dispatcher.metrics_snapshot()
+    assert snap['processed_count'] == 3
+    assert snap['error_count'] == 0
+
+
+def test_dispatcher_counts_task_exceptions_from_direct_enqueue():
+    """Dispatcher-level error_count fires when the enqueued task itself
+    raises (i.e. bypasses handle_message's inner try/except)."""
+    d = MessageDispatcher(workers=1, queue_capacity=4, shutdown_timeout_s=1.0,
+                          name='err-count-test')
+    try:
+        done = real_threading.Event()
+
+        def raising_task():
+            raise RuntimeError('task-level boom')
+
+        def marker_task():
+            done.set()
+
+        assert d.enqueue(raising_task, topic='X') is True
+        assert d.enqueue(marker_task, topic='X') is True
+        assert done.wait(1.0)  # consumer survived and ran the next task
+        assert d.error_count == 1
+        assert d.processed_count == 1  # marker_task
+    finally:
+        d.stop(timeout_s=1.0)
+
+
+def test_dispatcher_metrics_snapshot_is_consistent():
+    """metrics_snapshot returns a dict sampled under one lock."""
+    d = MessageDispatcher(workers=2, queue_capacity=4, shutdown_timeout_s=1.0,
+                          name='snap-test')
+    try:
+        snap = d.metrics_snapshot()
+        assert set(snap.keys()) == {
+            'active_workers', 'queue_depth', 'dropped_message_count',
+            'rejected_after_stop_count', 'processed_count', 'error_count',
+        }
+        assert snap['active_workers'] == 0
+        assert snap['queue_depth'] == 0
+    finally:
+        d.stop(timeout_s=1.0)
+
+
+# ==========================================================================
+# Graceful shutdown  (RFC-004 §7.5 – §7.7)
+# ==========================================================================
+
+def test_graceful_shutdown_drains_completable_tasks():
+    a, broker = _make_agent(dispatch_cfg={
+        'workers': 2, 'queue_capacity': 50, 'shutdown_timeout_s': 3.0,
+    })
+    try:
+        processed = []
+        lock = real_threading.Lock()
+
+        def quick(topic, pcl):
+            with lock:
+                processed.append(pcl.content)
+
+        a.subscribe('T', topic_handler=quick)
+        for i in range(20):
+            broker.deliver('T', TextParcel(f'm-{i}').payload())
+
+        # Terminate — must drain all 20 within the 3-second budget.
+        result = a._dispatcher.stop(timeout_s=3.0)
+        assert result is True
+        assert len(processed) == 20
+        snap = a._dispatcher.metrics_snapshot()
+        assert snap['processed_count'] == 20
+        assert snap['queue_depth'] == 0
+    finally:
+        a.terminate()  # idempotent
+
+
+def test_shutdown_timeout_is_bounded():
+    a, broker = _make_agent(dispatch_cfg={
+        'workers': 1, 'queue_capacity': 4, 'shutdown_timeout_s': 0.1,
+    })
+    try:
+        release = real_threading.Event()
+
+        def wedged(topic, pcl):
+            release.wait(timeout=10.0)
+
+        a.subscribe('T', topic_handler=wedged)
+        broker.deliver('T', TextParcel('m').payload())
+        # Give the consumer a moment to start the wedged handler.
+        time.sleep(0.02)
+
+        start = time.monotonic()
+        result = a._dispatcher.stop(timeout_s=0.1)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.6, f'stop() blocked for {elapsed:.3f}s'
+        assert result is False  # straggler
+        release.set()
+    finally:
+        a.terminate()
+
+
+def test_shutdown_is_idempotent():
+    a, broker = _make_agent()
+    try:
+        broker.deliver('T', TextParcel('m').payload())
+        time.sleep(0.05)
+
+        first = a._dispatcher.stop(timeout_s=1.0)
+        assert first is True
+
+        # Second stop returns the cached first-call outcome quickly.
+        start = time.monotonic()
+        second = a._dispatcher.stop(timeout_s=5.0)
+        elapsed = time.monotonic() - start
+        assert second is True
+        assert elapsed < 0.05
+
+        # Third invocation via Agent.terminate() also safe.
+        a.terminate()
+    finally:
+        pass
+
+
+def test_agent_terminate_can_be_called_twice(agent_with_fake_broker):
+    agent, broker = agent_with_fake_broker
+    broker.deliver('T', TextParcel('m').payload())
+    time.sleep(0.05)
+
+    agent.terminate()
+    agent.terminate()  # must not raise, must not regress metrics
+
+
+def test_post_shutdown_enqueue_is_rejected():
+    a, broker = _make_agent()
+    try:
+        processed = []
+
+        def h(topic, pcl):
+            processed.append(pcl.content)
+
+        a.subscribe('T', topic_handler=h)
+        broker.deliver('T', TextParcel('pre').payload())
+        _wait_until(lambda: len(processed) == 1, timeout=1.0)
+
+        a._dispatcher.stop(timeout_s=1.0)
+
+        # Any delivery after stop is rejected — handler MUST NOT run.
+        broker.deliver('T', TextParcel('post-1').payload())
+        broker.deliver('T', TextParcel('post-2').payload())
+        time.sleep(0.05)
+
+        assert processed == ['pre']
+        snap = a._dispatcher.metrics_snapshot()
+        assert snap['rejected_after_stop_count'] == 2
+    finally:
+        a.terminate()
+
+
+def test_post_shutdown_broker_delivery_does_not_raise(agent_with_fake_broker):
+    """The paho loop calling _on_message after stop must not raise."""
+    agent, broker = agent_with_fake_broker
+    broker.deliver('T', TextParcel('m').payload())
+    time.sleep(0.05)
+    agent._dispatcher.stop(timeout_s=1.0)
+    # No pytest.raises: any propagation is a failure.
+    broker.deliver('T', TextParcel('post').payload())
+
+
+# ==========================================================================
+# Auto-reply preserved on consumer thread
+# ==========================================================================
+
+def test_auto_reply_still_runs_on_consumer_thread(agent_with_fake_broker):
+    agent, broker = agent_with_fake_broker
     main_tid = real_threading.get_ident()
-    handler_tids: List[int] = []
-    handler_tids_lock = real_threading.Lock()
-
-    def h(topic, pcl):
-        with handler_tids_lock:
-            handler_tids.append(real_threading.get_ident())
-        with counter_lock:
-            counter['v'] += 1
-
-    agent.subscribe('T', topic_handler=h)
-    for i in range(5):
-        broker.deliver('T', TextParcel(f'msg-{i}').payload())
-
-    ok = _wait_until(lambda: counter['v'] == 5, timeout=1.0)
-    assert ok
-    thread_recorder.wait_all(1.0)
-
-    # Five Thread OBJECTS were created — one per delivery.
-    assert thread_recorder.count() == 5
-    assert len({id(t) for t in thread_recorder.threads}) == 5
-    # No handler ran on the main test thread.
-    assert main_tid not in handler_tids
-
-
-# ==========================================================================
-# 2. 100 / 500 / 1000 messages → N threads
-# ==========================================================================
-
-@pytest.mark.parametrize('n', [100, 500, 1000])
-def test_N_messages_create_N_threads(
-    n, agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    counter_lock = real_threading.Lock()
-    counter = {'v': 0}
-
-    def h(topic, pcl):
-        with counter_lock:
-            counter['v'] += 1
-
-    agent.subscribe('T', topic_handler=h)
-    for i in range(n):
-        broker.deliver('T', TextParcel(f'{i}').payload())
-
-    ok = _wait_until(lambda: counter['v'] == n, timeout=15.0)
-    assert ok, f'only {counter["v"]}/{n} handlers completed'
-    thread_recorder.wait_all(5.0)
-    assert thread_recorder.count() == n, (
-        f'expected {n} threads created; got {thread_recorder.count()}'
-    )
-
-
-# ==========================================================================
-# 3. Slow handler → active-thread count grows with N
-# ==========================================================================
-
-@pytest.mark.parametrize('n', [10, 50, 100])
-def test_slow_handler_active_thread_count_scales_with_n(
-    n, agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    release = real_threading.Event()
-
-    def slow_handler(topic, pcl):
-        release.wait(timeout=5.0)
-
-    agent.subscribe('T', topic_handler=slow_handler)
-    for i in range(n):
-        broker.deliver('T', TextParcel(f'{i}').payload())
-
-    # Wait for all handler threads to start blocking.
-    ok = _wait_until(lambda: thread_recorder.alive_count() >= n, timeout=3.0)
-    assert ok, (
-        f'expected >= {n} alive threads; got {thread_recorder.alive_count()}'
-    )
-    # Framework has no upper bound: alive threads == N (all in flight).
-    assert thread_recorder.alive_count() == n
-    assert thread_recorder.count() == n
-
-    # Release; every thread should die.
-    release.set()
-    ok = _wait_until(lambda: thread_recorder.alive_count() == 0, timeout=3.0)
-    assert ok
-
-
-# ==========================================================================
-# 4. Agent.terminate does NOT wait for handler threads
-# ==========================================================================
-
-def test_agent_terminate_does_not_join_handler_threads(
-    agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    started = real_threading.Event()
-    release = real_threading.Event()
-
-    def slow_handler(topic, pcl):
-        started.set()
-        release.wait(timeout=5.0)
-
-    agent.subscribe('T', topic_handler=slow_handler)
-    broker.deliver('T', TextParcel('msg').payload())
-    assert started.wait(1.0)
-
-    handler_thread = thread_recorder.threads[-1]
-    assert handler_thread.is_alive()
-
-    t0 = time.monotonic()
-    agent.terminate()  # calls FakeWorker.stop() — no-op
-    elapsed = time.monotonic() - t0
-
-    # terminate did NOT wait for the handler thread.
-    assert elapsed < 0.2, f'terminate blocked for {elapsed:.3f}s'
-    assert handler_thread.is_alive(), (
-        'agent.terminate() must not have joined handler threads'
-    )
-
-    release.set()
-    handler_thread.join(1.0)
-    assert not handler_thread.is_alive()
-
-
-# ==========================================================================
-# 5. Handler thread is not daemon
-# ==========================================================================
-
-def test_handler_thread_is_not_daemon(agent_with_fake_broker, thread_recorder):
-    agent, broker = agent_with_fake_broker
-    started = real_threading.Event()
-    release = real_threading.Event()
-
-    def h(topic, pcl):
-        started.set()
-        release.wait(timeout=5.0)
-
-    agent.subscribe('T', topic_handler=h)
-    broker.deliver('T', TextParcel('msg').payload())
-    assert started.wait(1.0)
-
-    handler_thread = thread_recorder.threads[-1]
-    # Non-daemon threads block interpreter exit until they finish;
-    # daemon threads do not. Agent does not set daemon=True.
-    assert handler_thread.daemon is False, (
-        'handler thread is non-daemon (blocks process exit)'
-    )
-    release.set()
-
-
-# ==========================================================================
-# 6. Handler exception terminates the thread cleanly
-# ==========================================================================
-
-def test_handler_exception_terminates_thread_cleanly(
-    agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    entered = real_threading.Event()
-
-    def raising_handler(topic, pcl):
-        entered.set()
-        raise RuntimeError('handler exploded')
-
-    agent.subscribe('T', topic_handler=raising_handler)
-    broker.deliver('T', TextParcel('req').payload())
-    assert entered.wait(1.0)
-
-    handler_thread = thread_recorder.threads[-1]
-    handler_thread.join(1.0)
-    assert not handler_thread.is_alive(), (
-        'handler thread should have terminated after exception'
-    )
-
-
-def test_handler_exception_does_not_leak_thread_when_auto_reply_active(
-    agent_with_fake_broker, thread_recorder,
-):
-    """RFC-002 / RFC-003: auto-reply path with a raising handler still
-    lets the thread complete after the error echo is published."""
-    agent, broker = agent_with_fake_broker
-
-    def raising(topic, pcl):
-        raise RuntimeError('boom')
-
-    agent.subscribe('T', topic_handler=raising)
-    broker.deliver('T', TextParcel('req', topic_return='R').payload())
-
-    ok = _wait_until(
-        lambda: any(t == 'R' for (t, _p) in broker.publish_calls),
-        timeout=1.0,
-    )
-    assert ok
-    handler_thread = thread_recorder.threads[-1]
-    handler_thread.join(1.0)
-    assert not handler_thread.is_alive()
-
-
-# ==========================================================================
-# 7. Message processing order is NOT guaranteed
-# ==========================================================================
-
-def test_message_processing_order_across_threads_is_not_guaranteed(
-    agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    completion_order: List[int] = []
-    completion_lock = real_threading.Lock()
-    # Per-message events so the test can control completion order.
-    releases = {i: real_threading.Event() for i in range(3)}
-
-    def h(topic, pcl):
-        msg_id = int(pcl.content)
-        releases[msg_id].wait(timeout=5.0)
-        with completion_lock:
-            completion_order.append(msg_id)
-
-    agent.subscribe('T', topic_handler=h)
-    for i in range(3):
-        broker.deliver('T', TextParcel(str(i)).payload())
-
-    # Wait until all 3 handlers have spawned and are blocking.
-    ok = _wait_until(lambda: thread_recorder.alive_count() >= 3, timeout=2.0)
-    assert ok
-
-    # Release in reverse order of delivery.
-    releases[2].set()
-    releases[0].set()
-    releases[1].set()
-
-    ok = _wait_until(lambda: len(completion_order) == 3, timeout=2.0)
-    assert ok
-    # Framework provides no ordering guarantee; the completion order
-    # matches the release order, NOT the delivery order [0, 1, 2].
-    assert completion_order != [0, 1, 2]
-    assert set(completion_order) == {0, 1, 2}
-
-
-# ==========================================================================
-# 8. Same topic, multiple messages → concurrent execution
-# ==========================================================================
-
-def test_same_topic_multiple_messages_execute_concurrently(
-    agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
-    N = 8
-    # Barrier requires all N handlers PLUS the main thread; if any
-    # handler is serialized instead of concurrent, the barrier deadlocks
-    # and BrokenBarrierError is raised on timeout.
-    barrier = real_threading.Barrier(N + 1, timeout=3.0)
-
-    def h(topic, pcl):
-        barrier.wait()
-
-    agent.subscribe('T', topic_handler=h)
-    for i in range(N):
-        broker.deliver('T', TextParcel(str(i)).payload())
-
-    # Main thread joins the barrier; success means all N handlers were
-    # concurrently in flight.
-    barrier.wait()
-    thread_recorder.wait_all(2.0)
-
-
-# ==========================================================================
-# 9. Shared mutable state is exposed under GIL without framework locking
-# ==========================================================================
-
-def test_framework_provides_no_lock_around_handler_dispatch(
-    agent_with_fake_broker, thread_recorder,
-):
-    """Positive proof that handlers run concurrently without any
-    framework-provided synchronization: N threads simultaneously
-    write into a shared list via the GIL-atomic list.append."""
-    agent, broker = agent_with_fake_broker
-    N = 10
-    shared: List[int] = []
-    barrier = real_threading.Barrier(N + 1, timeout=3.0)
-
-    def h(topic, pcl):
-        barrier.wait()  # force all N to run in parallel
-        # list.append is atomic under GIL; count remains correct.
-        shared.append(int(pcl.content))
-
-    agent.subscribe('T', topic_handler=h)
-    for i in range(N):
-        broker.deliver('T', TextParcel(str(i)).payload())
-
-    barrier.wait()
-    ok = _wait_until(lambda: len(shared) == N, timeout=2.0)
-    assert ok
-    # Atomic op → all N recorded. Non-atomic ops (e.g. `+= 1` on int)
-    # would race; the framework provides no protection either way.
-    assert sorted(shared) == list(range(N))
-
-
-# ==========================================================================
-# 10. Auto-reply publish runs on the handler thread
-# ==========================================================================
-
-def test_auto_reply_publish_runs_on_the_handler_thread(
-    agent_with_fake_broker, thread_recorder,
-):
-    agent, broker = agent_with_fake_broker
     handler_tids: List[int] = []
     publish_tids: List[int] = []
 
@@ -443,44 +517,480 @@ def test_auto_reply_publish_runs_on_the_handler_thread(
         return original_publish(topic, payload)
 
     broker.publish = spy_publish
-
     agent.subscribe('T', topic_handler=h)
     broker.deliver('T', TextParcel('req', topic_return='R').payload())
 
     ok = _wait_until(lambda: publish_tids, timeout=1.0)
     assert ok
-    # The auto-reply's broker.publish call ran on the SAME thread as
-    # the handler — i.e. handle_message inlines the publish, meaning
-    # a slow broker.publish (in real MQTT) would block the handler
-    # thread.
     assert handler_tids[0] == publish_tids[-1]
-    # And that thread is NOT the test's main thread.
-    assert real_threading.get_ident() != handler_tids[0]
+    assert publish_tids[-1] != main_tid
 
 
 # ==========================================================================
-# Supplementary: thread count == number of _on_message dispatches
+# Legacy per_message_thread mode
 # ==========================================================================
 
-def test_each_broker_deliver_causes_exactly_one_handler_thread(
-    agent_with_fake_broker, thread_recorder,
+def test_legacy_mode_emits_deprecation_warning_at_agent_init():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        Agent(name='legacy', agent_config={
+            'dispatch': {'mode': 'per_message_thread'},
+        })
+    dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert dep, 'expected a DeprecationWarning'
+    assert any('RFC-004' in str(w.message) for w in dep)
+
+
+def test_legacy_mode_preserves_per_message_thread_behaviour(thread_recorder):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        a, broker = _make_agent(
+            dispatch_cfg={'mode': 'per_message_thread'},
+        )
+    try:
+        counter_lock = real_threading.Lock()
+        counter = {'v': 0}
+
+        def h(topic, pcl):
+            with counter_lock:
+                counter['v'] += 1
+
+        a.subscribe('T', topic_handler=h)
+        for i in range(50):
+            broker.deliver('T', TextParcel(str(i)).payload())
+
+        ok = _wait_until(lambda: counter['v'] == 50, timeout=5.0)
+        assert ok
+        thread_recorder.wait_all(2.0)
+        # One Thread per message under legacy mode.
+        assert thread_recorder.count() == 50
+        # Dispatcher metrics remain zero in legacy mode (RFC-004 §7.13).
+        assert isinstance(a._dispatcher, LegacyPerMessageDispatcher)
+        assert a._dispatcher.dropped_message_count == 0
+    finally:
+        a.terminate()
+
+
+def test_legacy_mode_terminate_returns_immediately(agent_with_fake_broker):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        a, broker = _make_agent(
+            dispatch_cfg={'mode': 'per_message_thread'},
+        )
+    try:
+        broker.deliver('T', TextParcel('m').payload())
+        start = time.monotonic()
+        a.terminate()
+        elapsed = time.monotonic() - start
+        # Byte-for-byte pre-RFC-004: terminate does not wait for
+        # handler threads.
+        assert elapsed < 0.2, f'legacy terminate blocked {elapsed:.3f}s'
+    finally:
+        pass
+
+
+# ==========================================================================
+# Ordering / concurrency semantics preserved from R-04 characterization
+# ==========================================================================
+
+def test_message_processing_order_across_consumers_not_guaranteed(
+    agent_with_fake_broker,
 ):
-    """One broker.deliver() call ↔ one Agent._on_message ↔ one
-    Thread. No pooling, no batching, no coalescing."""
+    """Same-topic ordering is NOT guaranteed under Option D. Stage
+    releases with wait-for-completion so the resulting order is
+    deterministic in the test (= release order), and different from
+    delivery order [0, 1, 2]."""
     agent, broker = agent_with_fake_broker
-    counter = {'v': 0}
-    counter_lock = real_threading.Lock()
+    completion_order: List[int] = []
+    completion_lock = real_threading.Lock()
+    releases = {i: real_threading.Event() for i in range(3)}
 
     def h(topic, pcl):
-        with counter_lock:
-            counter['v'] += 1
+        msg_id = int(pcl.content)
+        releases[msg_id].wait(timeout=5.0)
+        with completion_lock:
+            completion_order.append(msg_id)
 
     agent.subscribe('T', topic_handler=h)
-    for i in range(7):
-        broker.deliver('T', TextParcel(f'{i}').payload())
-        # Between deliveries, publish_calls does not change (deliver
-        # goes through notifier, not through broker.publish).
-    ok = _wait_until(lambda: counter['v'] == 7, timeout=1.0)
+    for i in range(3):
+        broker.deliver('T', TextParcel(str(i)).payload())
+
+    ok = _wait_until(
+        lambda: agent._dispatcher.active_workers >= 3, timeout=2.0,
+    )
     assert ok
-    thread_recorder.wait_all(1.0)
-    assert thread_recorder.count() == 7
+
+    # Stage releases with wait-until between each so completion_order
+    # reflects release order (not delivery order or GIL scheduling).
+    releases[2].set()
+    assert _wait_until(lambda: completion_order == [2], timeout=1.0)
+    releases[0].set()
+    assert _wait_until(lambda: completion_order == [2, 0], timeout=1.0)
+    releases[1].set()
+    assert _wait_until(lambda: completion_order == [2, 0, 1], timeout=1.0)
+
+    # completion order differs from delivery order: framework did not
+    # enforce same-topic FIFO across consumers.
+    assert completion_order != [0, 1, 2]
+    assert set(completion_order) == {0, 1, 2}
+
+
+def test_same_topic_multiple_messages_execute_concurrently_up_to_workers():
+    a, broker = _make_agent(dispatch_cfg={'workers': 4, 'queue_capacity': 32})
+    try:
+        N = 4  # equal to workers, so Barrier can release
+        barrier = real_threading.Barrier(N + 1, timeout=3.0)
+
+        def h(topic, pcl):
+            barrier.wait()
+
+        a.subscribe('T', topic_handler=h)
+        for i in range(N):
+            broker.deliver('T', TextParcel(str(i)).payload())
+
+        barrier.wait()  # if concurrency < N, deadlock → BrokenBarrierError
+    finally:
+        a.terminate()
+
+
+# ==========================================================================
+# Direct MessageDispatcher unit tests
+# ==========================================================================
+
+def test_dispatcher_enqueue_returns_false_after_stop():
+    d = MessageDispatcher(workers=1, queue_capacity=4, shutdown_timeout_s=1.0,
+                          name='post-stop-test')
+    d.stop(timeout_s=1.0)
+    assert d.enqueue(lambda: None, topic='X') is False
+    assert d.rejected_after_stop_count == 1
+
+
+def test_dispatcher_enqueue_returns_false_when_full():
+    started = real_threading.Event()
+    release = real_threading.Event()
+
+    def blocking():
+        started.set()
+        release.wait(timeout=5.0)
+
+    d = MessageDispatcher(workers=1, queue_capacity=2, shutdown_timeout_s=1.0,
+                          name='full-test')
+    try:
+        assert d.enqueue(blocking, topic='X') is True
+        assert started.wait(1.0)
+        assert d.enqueue(lambda: None, topic='X') is True
+        assert d.enqueue(lambda: None, topic='X') is True
+        # Queue capacity exhausted — next enqueue drops.
+        assert d.enqueue(lambda: None, topic='X') is False
+        assert d.dropped_message_count == 1
+        release.set()
+    finally:
+        d.stop(timeout_s=2.0)
+
+
+def test_dispatcher_processed_count_matches_completions():
+    d = MessageDispatcher(workers=2, queue_capacity=64, shutdown_timeout_s=2.0,
+                          name='count-test')
+    try:
+        counter_lock = real_threading.Lock()
+        counter = {'v': 0}
+
+        def h():
+            with counter_lock:
+                counter['v'] += 1
+
+        for _ in range(30):
+            assert d.enqueue(h, topic='T') is True
+        ok = _wait_until(lambda: counter['v'] == 30, timeout=2.0)
+        assert ok
+    finally:
+        d.stop(timeout_s=2.0)
+    assert d.processed_count == 30
+    assert d.error_count == 0
+
+
+# ==========================================================================
+# stop / enqueue linearization  (race between enqueue check and put,
+# concurrent-stop safety)
+# ==========================================================================
+
+def test_all_accepted_tasks_processed_after_clean_shutdown():
+    """Invariant: if enqueue returned True and stop() returned True,
+    the task WAS executed by a consumer."""
+    d = MessageDispatcher(workers=2, queue_capacity=200, shutdown_timeout_s=5.0,
+                          name='invariant-1')
+    try:
+        processed = set()
+        lock = real_threading.Lock()
+        accepted = []
+        acc_lock = real_threading.Lock()
+
+        def make_task(i):
+            def t():
+                with lock:
+                    processed.add(i)
+            return t
+
+        for i in range(100):
+            if d.enqueue(make_task(i), topic='T'):
+                with acc_lock:
+                    accepted.append(i)
+
+        result = d.stop(timeout_s=5.0)
+        assert result is True
+        assert processed == set(accepted)
+    finally:
+        d.stop(timeout_s=1.0)
+
+
+def test_enqueue_returning_false_never_runs_task():
+    """Invariant: enqueue returning False MUST NOT execute the task."""
+    d = MessageDispatcher(workers=1, queue_capacity=2, shutdown_timeout_s=2.0,
+                          name='invariant-2')
+    try:
+        started = real_threading.Event()
+        release = real_threading.Event()
+        rejected_tasks_ran = []
+        rej_lock = real_threading.Lock()
+
+        def slow(_id='slow'):
+            started.set()
+            release.wait(timeout=5.0)
+
+        def make_reject_task(i):
+            def t():
+                with rej_lock:
+                    rejected_tasks_ran.append(i)
+            return t
+
+        assert d.enqueue(slow, topic='T') is True
+        assert started.wait(1.0)
+        # Fill queue.
+        assert d.enqueue(make_reject_task(-1), topic='T') is True
+        assert d.enqueue(make_reject_task(-2), topic='T') is True
+        # These MUST be rejected (drop_newest).
+        rejected = []
+        for i in range(10):
+            if not d.enqueue(make_reject_task(i), topic='T'):
+                rejected.append(i)
+
+        assert len(rejected) == 10
+        release.set()
+        d.stop(timeout_s=3.0)
+        # Every rejected task must NOT have executed.
+        assert set(rejected_tasks_ran) & set(rejected) == set()
+    finally:
+        d.stop(timeout_s=1.0)
+
+
+def test_sentinel_is_task_done_called_so_unfinished_tasks_reaches_zero():
+    """Invariant: sentinels must go through task_done in the consumer's
+    outer finally so that queue.unfinished_tasks reaches 0."""
+    d = MessageDispatcher(workers=3, queue_capacity=10, shutdown_timeout_s=2.0,
+                          name='invariant-3')
+    # No user tasks; stop immediately. Sentinels are the only items enqueued.
+    result = d.stop(timeout_s=2.0)
+    assert result is True
+    # If any sentinel was NOT task_done'd, unfinished_tasks > 0.
+    assert d._queue.unfinished_tasks == 0
+
+
+def test_queue_unfinished_tasks_is_zero_after_clean_shutdown_with_traffic():
+    """Same invariant but with real traffic beforehand."""
+    d = MessageDispatcher(workers=2, queue_capacity=50, shutdown_timeout_s=3.0,
+                          name='invariant-4')
+    try:
+        counter_lock = real_threading.Lock()
+        counter = {'v': 0}
+
+        def h():
+            with counter_lock:
+                counter['v'] += 1
+
+        for _ in range(40):
+            assert d.enqueue(h, topic='T') is True
+        result = d.stop(timeout_s=3.0)
+        assert result is True
+        assert counter['v'] == 40
+        assert d._queue.unfinished_tasks == 0
+    finally:
+        d.stop(timeout_s=1.0)
+
+
+def test_concurrent_stop_calls_execute_actual_shutdown_only_once():
+    """Invariant: concurrent stop() calls result in a SINGLE actual
+    shutdown — exactly `workers` sentinels are posted, and every
+    concurrent caller observes the same True/False outcome."""
+    d = MessageDispatcher(workers=3, queue_capacity=10, shutdown_timeout_s=2.0,
+                          name='invariant-5')
+
+    sentinel_puts = [0]
+    sentinel_lock = real_threading.Lock()
+    original_put_nowait = d._queue.put_nowait
+
+    def counting_put(item):
+        if item is MessageDispatcher._SHUTDOWN_SENTINEL:
+            with sentinel_lock:
+                sentinel_puts[0] += 1
+        return original_put_nowait(item)
+
+    d._queue.put_nowait = counting_put
+
+    N_STOPPERS = 5
+    barrier = real_threading.Barrier(N_STOPPERS)
+    results = [None] * N_STOPPERS
+
+    def do_stop(i):
+        barrier.wait(timeout=3.0)  # start all at once
+        results[i] = d.stop(timeout_s=2.0)
+
+    threads = [
+        real_threading.Thread(target=do_stop, args=(i,))
+        for i in range(N_STOPPERS)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(3.0)
+
+    # Only one stop() posted sentinels; count == workers.
+    assert sentinel_puts[0] == 3, (
+        f'expected exactly 3 sentinel puts (workers=3); got {sentinel_puts[0]}'
+    )
+    # All 5 callers observe the SAME outcome (True — clean shutdown).
+    assert results == [True] * N_STOPPERS, f'inconsistent results: {results}'
+
+
+def test_race_stop_wins_between_enqueue_check_and_put_deterministic():
+    """DETERMINISTIC reproduction of the enqueue check-then-put race.
+
+    Under a buggy implementation where enqueue reads `_accepting` and
+    calls `_queue.put_nowait` outside a shared lock, a concurrent
+    stop() can set _accepting=False AND post the shutdown sentinel
+    between those two steps. The task then lands AFTER the sentinel;
+    consumers see the sentinel first, exit, and never execute the
+    task — but enqueue returned True.
+
+    This test instruments _queue.put_nowait to pause when putting the
+    target task, then triggers stop() in the pause window. Under a
+    correct implementation, either the task is queued (and hence
+    processed) or enqueue returns False."""
+    d = MessageDispatcher(
+        workers=1, queue_capacity=100, shutdown_timeout_s=5.0,
+        name='race-det',
+    )
+    processed: List[str] = []
+    proc_lock = real_threading.Lock()
+
+    # Prime a slow task so the consumer is busy while we set up the race.
+    consumer_started = real_threading.Event()
+    consumer_release = real_threading.Event()
+
+    def slow_prime():
+        consumer_started.set()
+        consumer_release.wait(timeout=5.0)
+
+    assert d.enqueue(slow_prime, topic='prime') is True
+    assert consumer_started.wait(1.0)
+
+    def target():
+        with proc_lock:
+            processed.append('target')
+
+    original_put_nowait = d._queue.put_nowait
+    pause_at_put = real_threading.Event()
+    resume_put = real_threading.Event()
+
+    def instrumented_put_nowait(item):
+        if item is target:
+            pause_at_put.set()
+            resume_put.wait(timeout=5.0)
+        return original_put_nowait(item)
+
+    d._queue.put_nowait = instrumented_put_nowait
+
+    accepted = [None]
+
+    def do_enqueue():
+        accepted[0] = d.enqueue(target, topic='target')
+
+    enq_thread = real_threading.Thread(target=do_enqueue)
+    enq_thread.start()
+    assert pause_at_put.wait(1.0), 'enqueue never reached the put step'
+
+    stop_result = [None]
+
+    def do_stop():
+        stop_result[0] = d.stop(timeout_s=5.0)
+
+    stop_thread = real_threading.Thread(target=do_stop)
+    stop_thread.start()
+    # Give stop a moment to try to run. Under buggy code, stop
+    # completes its state flip + sentinel post here. Under a correct
+    # (linearized) implementation, stop blocks on the same lock that
+    # enqueue's put is inside.
+    time.sleep(0.05)
+
+    resume_put.set()
+    enq_thread.join(1.0)
+    consumer_release.set()
+    stop_thread.join(5.0)
+
+    if accepted[0] is True:
+        assert 'target' in processed, (
+            'RACE: enqueue returned True but target was queued after '
+            'the shutdown sentinel and never executed. '
+            'accepted=%r processed=%r' % (accepted[0], processed)
+        )
+
+
+def test_stop_and_enqueue_linearization_under_concurrency_stress():
+    """LINEARIZATION invariant: for any interleaving of concurrent
+    producer + stop, every enqueue returning True is executed before
+    the (successful) shutdown completes.
+
+    Runs multiple trials to widen the window in which the race between
+    the `_accepting` check and the `put_nowait` inside enqueue can
+    interleave with stop's `_accepting=False` + sentinel post."""
+    trials = 25
+    per_trial_msgs = 300
+    for trial in range(trials):
+        d = MessageDispatcher(
+            workers=2, queue_capacity=per_trial_msgs * 2,
+            shutdown_timeout_s=5.0, name=f'lin-stress-{trial}',
+        )
+        processed = set()
+        proc_lock = real_threading.Lock()
+        accepted = []
+        acc_lock = real_threading.Lock()
+        producer_done = real_threading.Event()
+
+        def make_task(tid):
+            def t():
+                with proc_lock:
+                    processed.add(tid)
+            return t
+
+        def producer():
+            for i in range(per_trial_msgs):
+                if d.enqueue(make_task(i), topic='T'):
+                    with acc_lock:
+                        accepted.append(i)
+            producer_done.set()
+
+        prod = real_threading.Thread(target=producer)
+        prod.start()
+        # Race window: producer is enqueueing while we call stop().
+        result = d.stop(timeout_s=5.0)
+        producer_done.wait(3.0)
+        prod.join(1.0)
+
+        assert result is True, f'trial {trial}: stop did not drain cleanly'
+        with acc_lock:
+            accepted_snapshot = set(accepted)
+        missing = accepted_snapshot - processed
+        assert not missing, (
+            f'trial {trial}: {len(missing)} accepted tasks were queued '
+            f'after sentinel and never ran; sample={sorted(missing)[:5]}, '
+            f'accepted={len(accepted_snapshot)}, processed={len(processed)}'
+        )

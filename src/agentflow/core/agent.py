@@ -4,7 +4,8 @@ import queue
 import random
 import string
 import threading
-import time 
+import time
+import warnings
 from tkinter import N
 from typing import final, Optional
 import uuid
@@ -16,6 +17,7 @@ from agentflow.broker.broker_maker import BrokerMaker
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
+from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 
 
 import logging, os
@@ -46,7 +48,24 @@ class Agent(BrokerNotifier):
         
         self._broker = None
         self._connected_once = False
-        
+
+        # RFC-004: bounded message dispatch. Dispatcher is created
+        # lazily on first _on_message so that tests / lifecycles that
+        # never receive a message do not pay for consumer threads.
+        # DeprecationWarning for the legacy escape hatch fires eagerly
+        # so users see it at Agent construction time even before any
+        # message flows.
+        self._dispatcher = None
+        self._dispatcher_init_lock = threading.Lock()
+        if self.config.get('dispatch', {}).get('mode') == 'per_message_thread':
+            warnings.warn(
+                "Agent dispatch mode 'per_message_thread' is deprecated "
+                "(RFC-004). This escape hatch will be removed in a future "
+                "release; migrate to the bounded dispatcher (the default).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
 
 # ==================
 #  Agent Initializing
@@ -96,7 +115,13 @@ class Agent(BrokerNotifier):
 
     def terminate(self):
         logger.info(self.M(f"self.__agent_worker: {self._agent_worker}"))
-        
+
+        # RFC-004: stop the dispatcher first so consumer threads can
+        # drain their queue while the broker is still up. Idempotent —
+        # safe to call from both terminate() and __deactivating().
+        if self._dispatcher is not None:
+            self._dispatcher.stop()
+
         if self._agent_worker:
             self._agent_worker.stop()
         else:
@@ -585,15 +610,15 @@ class Agent(BrokerNotifier):
         topic_handler = self.__topic_handlers.get(topic, self.on_message)
         should_auto_reply = bool(pcl.topic_return) and is_specific_handler
 
-        def handle_message(topic_handler, topic, p:Parcel):
+        def handle_message():
             if should_auto_reply:
                 try:
-                    logger.debug(f"topic: {topic}, topic_return: {p.topic_return}")
-                    data_resp = topic_handler(topic, p)
+                    logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
+                    data_resp = topic_handler(topic, pcl)
                 except Exception as ex:
                     logger.exception(ex)
                     # RFC-003 R-exception-fresh: build a new parcel for
-                    # the error echo; do NOT mutate or reuse p.
+                    # the error echo; do NOT mutate or reuse pcl.
                     err_pcl = Parcel.from_content(None)
                     err_pcl.error = str(ex)
                     data_resp = err_pcl
@@ -609,11 +634,44 @@ class Agent(BrokerNotifier):
                 self.publish(pcl.topic_return, data_resp)
             else:
                 try:
-                    topic_handler(topic, p)
+                    topic_handler(topic, pcl)
                 except Exception as ex:
                     logger.exception(ex)
 
-        threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()
+        # RFC-004: dispatch via the bounded message dispatcher instead
+        # of spawning one Thread per message. enqueue() never raises
+        # (broker-callback safety invariant, §7.3).
+        self._get_dispatcher().enqueue(handle_message, topic=topic)
+
+
+    def __create_dispatcher(self):
+        """RFC-004: build the dispatcher configured for this Agent.
+        Default is the bounded MessageDispatcher; the legacy
+        per-message-thread mode is available as a deprecated escape
+        hatch."""
+        dispatch_cfg = self.config.get('dispatch', {}) or {}
+        mode = dispatch_cfg.get('mode', 'bounded')
+        if mode == 'per_message_thread':
+            return LegacyPerMessageDispatcher()
+        workers = int(dispatch_cfg.get('workers', 8))
+        queue_capacity = int(dispatch_cfg.get('queue_capacity', 1024))
+        shutdown_timeout_s = float(dispatch_cfg.get('shutdown_timeout_s', 5.0))
+        return MessageDispatcher(
+            workers=workers,
+            queue_capacity=queue_capacity,
+            shutdown_timeout_s=shutdown_timeout_s,
+            name=f'MessageDispatcher-{self.tag}',
+        )
+
+
+    def _get_dispatcher(self):
+        """Lazy, thread-safe dispatcher accessor. First call creates
+        the dispatcher (and its consumer threads)."""
+        if self._dispatcher is None:
+            with self._dispatcher_init_lock:
+                if self._dispatcher is None:
+                    self._dispatcher = self.__create_dispatcher()
+        return self._dispatcher
 
 
     def on_connected(self):
