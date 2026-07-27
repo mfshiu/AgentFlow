@@ -311,23 +311,110 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 ---
 
-## R-06 — Process-mode pickling of Agent + Worker + Process handle
+## R-06 — Process-mode pickling of Agent + ProcessWorker lifecycle
 
+- **Status**: **PARTIALLY RESOLVED** (2026-07-28) — R-06.1 / R-06.2 / R-06.4 addressed by [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); R-06.3 and child-exception forwarding remain Deferred / Open.
 - **Severity**: High
 - **Category**: Process / Correctness
-- **File / Function / Line**: `src/agentflow/core/agent_worker.py:56–65`, `ProcessWorker.start`
-- **Evidence**: `multiprocessing.Process(target=self.initiator_agent._activate, args=(cfg,))` requires pickling the bound method → the Agent → its `_agent_worker` → the `work_process` field it just set.
-- **Trigger**: Default configuration (`CONCURRENCY_TYPE='process'`, `agent.py:75–76`) combined with any user callback that is a closure or a lambda (e.g., `unit_test/test_parcel.py:57` places a closure into `EventHandler.ON_CONNECTED`).
-- **Impact**: `spawn` fails with `AttributeError: Can't pickle local object` or `TypeError: cannot pickle …`.
-- **Confidence**: Medium — the Agent-worker cycle may or may not be resolvable by pickle; not empirically tested.
-- **Recommended verification test**:
-  ```python
-  Agent(name='x', agent_config={
-      'broker_type': 'empty',
-      EventHandler.ON_ACTIVATE: lambda: None,
-  }).start()  # defaults to process
-  ```
-  observe whether `start()` succeeds and whether the child process runs `_activate`.
+- **File / Function / Line** (historical): `src/agentflow/core/agent_worker.py:56–65`, `ProcessWorker.start`
+- **Evidence** (historical): `multiprocessing.Process(target=self.initiator_agent._activate, args=(cfg,))` required pickling the bound method → the Agent → its `_handlers_lock: threading.RLock` (introduced by RFC-006 / RFC-007). `RLock` is not picklable. Every `start_process()` call raised `TypeError: cannot pickle '_thread.RLock' object` at pickle time in the parent; no child was ever launched. Additionally `ProcessWorker.stop()` called `Process.join()` with no timeout — a wedged child hung the caller forever; `Process.daemon = False` (unchanged); no liveness / exitcode / restart API; parent-side Agent state (`_broker`, `_dispatcher`, `__topic_handlers`) never populated because `_activate` runs in the child.
+- **Trigger** (historical): Default configuration (`CONCURRENCY_TYPE='process'`, `agent.py:75–76`) — every `start_process()` call, regardless of user handlers.
+- **Impact** (historical): `spawn` failed at pickle time; process mode was effectively dead. Any user who selected process mode (the framework default) saw the framework fall over. Once a child would have started, `stop()` had no bounded shutdown path.
+- **Confidence at discovery**: Medium (Agent-worker cycle + lock pickling both suspect). Upgraded to **High** on 2026-07-27 via 27 characterisation tests in `tests/unit/core/test_process_worker_lifecycle.py` (RFC-008 §2), including runtime confirmation that `Agent` was unpicklable due to `_handlers_lock`, that `ProcessWorker.start` raised at pickle time, and that `stop()` hung on a wedged child.
+
+### Sub-risk breakdown
+
+| ID | Sub-risk | Status |
+|---|---|---|
+| **R-06.1** | Spawn pickle failure (Agent's `_handlers_lock: RLock` is not picklable → `ProcessWorker.start` raises at pickle time; no child ever launches) | **RESOLVED** (RFC-008) |
+| **R-06.2** | Unbounded `Process.join()` in `stop()` (wedged child blocks the caller forever; no `terminate` / `kill` fallback; no `Optional[int]` exitcode return) | **RESOLVED** (RFC-008) |
+| **R-06.3** | No heartbeat / liveness / automatic restart on child crash (parent has no watchdog; a dead child is only observable via post-hoc `stop()` + `exitcode`) | **DEFERRED / OPEN** (out of RFC-008 scope) |
+| **R-06.4** | Parent-side Agent state divergence (parent-side `_broker` / `_dispatcher` / `__topic_handlers` never populate because `_activate` runs in the child; parent-side `publish` / `subscribe` do not proxy) | **DOCUMENTED architectural constraint** (RFC-008 §6.5, §7.16, §7.17) |
+| Child exception forwarding | No IPC surface for child-side handler exceptions; parent observes only exit code | **DEFERRED / OPEN** (out of RFC-008 scope) |
+
+### Resolution (R-06.1 / R-06.2 / R-06.4)
+
+- **Resolved on**: 2026-07-28
+- **RFC**: [RFC-008 — ProcessWorker lifecycle](../rfc/RFC-008-process-worker-lifecycle.md) (Implemented)
+
+**Final implementation** (RFC-008 first-phase scope):
+
+**Agent pickle protocol** (`src/agentflow/core/agent.py`):
+
+- `Agent.__getstate__` / `__setstate__` implement the pickle protocol. A `_RUNTIME_ONLY_FIELDS` whitelist excludes non-picklable / not-meaningful-in-child fields: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`.
+- `__getstate__` **probes every remaining field for picklability**: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests moving the handler / callback into `on_activate()`. **Fail-fast** — no silent omission.
+- `__setstate__` reinstates every runtime-only field fresh: new `threading.RLock` × 2, `None` for `_broker` / `_dispatcher` / `_agent_worker` / `_message_broker`, empty `{}` for `_children` / `_parents`. The RFC-006 / RFC-007 `_HandlerRecord` ownership shape survives pickle; only the guarding lock is rebuilt.
+
+**ProcessWorker lifecycle** (`src/agentflow/core/agent_worker.py`):
+
+- New `WorkerState(Enum)`: `NEW → STARTING → RUNNING → STOPPING → STOPPED` (or `START_FAILED` on start error). All transitions under `_state_lock: RLock`. Read-only `state` / `exitcode` properties.
+- `start()`: single-shot state machine. Repeated `start()` on `STARTING`/`RUNNING`/`STOPPING`/`STOPPED`/`START_FAILED` raises `RuntimeError` — restart is not supported (construct a fresh worker). **`agent.config` is not mutated**: `start()` builds `child_config = dict(self.initiator_agent.config)` locally and puts the `work_queue` reference on the copy. `Process(daemon=False)`.
+- `_cleanup_after_start_failure()`: bounded rollback — `terminate + join(1s)`, `kill + join(1s)` if still alive; queue `close + join_thread`; all in best-effort swallowers. Sets `work_process = None`, `work_queue = None`, state `START_FAILED`.
+- `stop(graceful_timeout_s=5.0, terminate_timeout_s=2.0, kill_timeout_s=1.0) -> Optional[int]`: **bounded escalation ladder** — cooperative `terminate` via queue → `join(graceful)` → `Process.terminate()` → `join(terminate)` → `Process.kill()` → `join(kill)`. Total wall time ≤ `graceful + terminate + kill = 8.0s` at defaults. State-dispatch:
+  - `NEW` → **no-op, state stays `NEW`, subsequent `start()` still allowed** (implementation refinement of RFC-008 §7.12).
+  - `START_FAILED` → no-op (resources already cleaned).
+  - `STOPPED` → cached-exitcode replay (idempotent, §7.11).
+  - `STOPPING` → concurrent caller waits on `_stop_complete_event` and returns the same `_exitcode` (RFC-004 pattern).
+  - `STARTING` → `RuntimeError`.
+  - `RUNNING` → transitions to `STOPPING`, runs escalation, caches `_exitcode = proc.exitcode`, queue cleanup, `finally` sets `STOPPED` and signals `_stop_complete_event` so waiters unblock even if the body raised.
+- `exitcode` property: `None` before `stop()`; cached `Optional[int]` after.
+
+### Parent-child contract (R-06.4, documented architectural constraint)
+
+- Under `CONCURRENCY_TYPE='process'`, the **parent-side `Agent` instance is a lifecycle controller stub**. Its role is to orchestrate `start()` / `terminate()` / observation of `is_active()` / `worker.exitcode`.
+- Effective runtime state — `_broker`, `_dispatcher`, `__topic_handlers` dispatch — lives in the **child** process. The parent-side `Agent`'s corresponding fields stay at their `__init__` values (`None` / `{}`).
+- Parent-side calls to `Agent.publish` / `subscribe` / `publish_sync` are **not proxied** to the child. They operate on the empty parent-side state and produce no broker traffic (`_broker is None`; publish is a silent no-op that logs an error per RFC-002).
+- Callers that need to interact with the running child Agent must connect to the same broker (from the same or a different process) using a **separate Agent instance** — or wait for a future RFC that introduces a transparent parent-side proxy / IPC layer.
+
+### Pickle contract (R-06.1)
+
+- Runtime-only fields (`_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`) are **excluded** from `__getstate__` and reinstated fresh in `__setstate__`.
+- `_children` / `_parents` are rebuilt as empty `{}` in the child. Populated by broker callbacks after the child's `_activate` runs.
+- Non-picklable handler in `__topic_handlers` → `TypeError` at `start()` naming the offending topic.
+- Non-picklable value in `config` → `TypeError` at `start()` naming `Agent.config`.
+- Both errors carry a suggestion to **register the handler / bind the callback inside `on_activate()`** (which runs in the child, avoiding the pickle boundary).
+- RFC-006 / RFC-007 ownership model — `_HandlerRecord(owner_type, handler)` — survives pickle unchanged; only the guarding `_handlers_lock` is rebuilt fresh in the child.
+
+### Shutdown ladder (R-06.2)
+
+- **Step 1** — cooperative terminate: `send_data('terminate')` on the child's work queue.
+- **Step 2** — `join(graceful_timeout_s=5.0)`.
+- **Step 3** — if still alive: `Process.terminate()` (SIGTERM on POSIX / TerminateProcess on Windows).
+- **Step 4** — `join(terminate_timeout_s=2.0)`.
+- **Step 5** — if still alive: `Process.kill()` (SIGKILL / TerminateProcess with force).
+- **Step 6** — `join(kill_timeout_s=1.0)`. If still alive after this, log ERROR and abandon (potential zombie).
+- Total wall time strictly bounded by `graceful + terminate + kill = 8.0s` at defaults; per-call configurable.
+- **Idempotence**: `STOPPED` state → cached-exitcode replay.
+- **Concurrent callers**: only the first caller executes the escalation; others block on `_stop_complete_event` and return the same cached exitcode. Verified via `test_concurrent_stop_all_callers_return_same_result_single_escalation` (5 threads through a `threading.Barrier`).
+- **No orphan process**: verified via `os.kill(pid, 0) → ProcessLookupError` in `test_no_orphan_process_after_stop`.
+
+### Runtime verification (as of 2026-07-28)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/`
+- RFC-008 dedicated file `tests/unit/core/test_process_worker_lifecycle.py` — **33 passed** in ~14 s (categories A pickle × 8, B state-machine × 5, C real-spawn × 3, D restart guards × 2, E escalation × 3, F concurrent × 2, G start-failure × 3, H observability × 2, I parent-child × 1, J baseline × 4).
+- Full combined regression: **289 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in ~26 s.
+- 2 xfails preserved from RFC-007 (correlation ID / multi-handler fan-out — deferred).
+- R-02 (27), R-03 (48), R-04 (33), R-05 (21), R-13 (46), RFC-006 same-API (21), RFC-007 (19) — combined 215 tests pass **unchanged**. No regression from adding `__getstate__` / `__setstate__` on Agent or from rewriting `ProcessWorker`.
+
+### Observable behavioural changes
+
+Four narrow, all in the correctness / bounded-shutdown direction:
+
+1. `ProcessWorker.start()` now **actually functions** end-to-end. Previously it raised at pickle time in every configuration; now a minimal Agent with `broker_type='empty'` (or an equivalent picklable broker config) spawns a live child that runs `_activate` and terminates cleanly on `stop()`.
+2. `ProcessWorker.stop()` return type widened from `None` to `Optional[int]` — callers who ignored the return still ignore it; callers can now observe the child's exit code without a new API.
+3. Lambda / closure handlers on `Agent.subscribe` before `start_process()` **now fail-fast** with a `TypeError` naming the offending topic. Previously they blocked at pickle in ProcessWorker.start with a generic `TypeError: cannot pickle '_thread.RLock' object`.
+4. `Agent.config` is **no longer mutated** by `ProcessWorker.start()` — the `work_queue` reference is added to a shallow copy shipped to the child. Callers who inspected `agent.config` post-start would previously find a stray `work_queue` key; now they do not.
+
+### Known issues NOT resolved by this fix (tracked separately)
+
+- **R-06.3 heartbeat / watchdog / automatic restart** — no liveness monitoring; a dead child is only observable via post-hoc `stop()` + `exitcode`. Deferred to a future RFC.
+- **Child exception forwarding** — parent observes only exit code; child-side handler exceptions are not marshalled back over an IPC channel. Deferred.
+- **Transparent parent-side `publish` / `subscribe` proxy** — parent-side calls remain no-op / silent-log per R-08. A cross-process proxy would require IPC on every message. Out of RFC-008 scope; documented architectural constraint (R-06.4).
+- **`ProcessDispatcher`** — a dispatcher purpose-built for cross-process work. Deferred (RFC-004 Appendix C).
+- **`ThreadWorker.stop` bounded shutdown** — RFC-008 explicitly scoped to `ProcessWorker`; `ThreadWorker.stop` still uses blocking `join()` (R-10 partial residual). Deferred.
+- **R-01** — `BinaryParcel.pickle.loads` on wire bytes.
+- **R-07** — handler `BaseException` handling.
+- **R-08** — parent-side `publish` silent failure (documented via R-06.4).
 
 ---
 
@@ -730,10 +817,10 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | Open | `Worker.stop()` join without timeout |
+| R-10 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — `ProcessWorker.stop` bounded escalation; `ThreadWorker.stop` still uses unbounded `join()` | `Worker.stop()` join without timeout |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
-| R-06 | High | Medium | Open | Process-mode pickling |
+| R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |

@@ -284,7 +284,126 @@ Verified by `tests/unit/core/test_agent_publish_errors.py` (46 tests) and the fo
 
 ---
 
-## 2.9 Unknowns
+## 2.9 Process-mode worker lifecycle (post-RFC-008, 2026-07-28)
+
+> **Update (2026-07-28)**: `ProcessWorker` is fully functional under `CONCURRENCY_TYPE='process'`. Agent is pickle-safe via `__getstate__` / `__setstate__`; `ProcessWorker` runs on a `WorkerState` machine with a bounded stop-escalation ladder. See [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md) and [`docs/audit/05-risk-register.md` R-06](05-risk-register.md#r-06--process-mode-pickling-of-agent--processworker-lifecycle).
+
+### Parent-side Agent contract
+
+Under `CONCURRENCY_TYPE='process'`, the parent-side `Agent` instance is a **lifecycle controller stub**:
+
+- Effective runtime state — `_broker`, `_dispatcher`, `__topic_handlers` dispatch — lives in the **child** process, established by `_activate` after unpickling.
+- Parent-side `_broker` / `_dispatcher` remain `None`; parent-side `_children` / `_parents` remain `{}`. Parent-side `Agent.publish` / `subscribe` / `publish_sync` are **not proxied** to the child — they operate on empty local state and produce no broker traffic (per R-02 + RFC-002 `_broker is None` fast-fail).
+- Callers that need to interact with the running child Agent must construct a **separate Agent** that connects to the same broker (from the same or a different process).
+
+A transparent parent-side publish/subscribe proxy is explicitly out of RFC-008 scope; deferred to a future RFC that would introduce an IPC-based proxy or a `ProcessDispatcher`.
+
+### Pickle contract (Agent)
+
+`Agent.__getstate__` / `__setstate__` (`src/agentflow/core/agent.py`) implement the pickle protocol:
+
+- **Runtime-only fields excluded** from `__getstate__`: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`.
+- **Picklability probe** in `__getstate__`: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests registering the handler / binding the callback inside `on_activate()` (which runs in the child, avoiding the pickle boundary).
+- `__setstate__` reinstates every runtime-only field fresh in the child: new `threading.RLock` × 2, `None` for the broker / dispatcher / worker back-references, empty `{}` for `_children` / `_parents`.
+- The RFC-006 / RFC-007 `_HandlerRecord(owner_type, handler)` shape survives pickle intact; only the guarding `_handlers_lock` is rebuilt.
+
+### ProcessWorker state machine
+
+`WorkerState(Enum)` = `NEW → STARTING → RUNNING → STOPPING → STOPPED` (or `NEW → STARTING → START_FAILED` on start error). All transitions under `_state_lock: threading.RLock`. Read-only `state` / `exitcode` properties.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> STARTING: start()
+    STARTING --> RUNNING: Process.start() OK
+    STARTING --> START_FAILED: pickle / spawn error<br/>→ _cleanup_after_start_failure
+    RUNNING --> STOPPING: stop() (first caller)
+    STOPPING --> STOPPED: escalation ladder complete<br/>_exitcode cached<br/>_stop_complete_event.set()
+    STOPPED --> STOPPED: stop() idempotent replay
+    NEW --> NEW: stop() (no-op — subsequent start() still allowed)
+    START_FAILED --> START_FAILED: stop() (no-op)
+    RUNNING --> RUNNING: start() raises RuntimeError
+    STOPPING --> STOPPING: concurrent stop() waits on _stop_complete_event<br/>returns same _exitcode
+```
+
+Key implementation notes:
+
+- **`agent.config` is NOT mutated**: `start()` builds `child_config = dict(self.initiator_agent.config)` locally and puts the `work_queue` reference on the copy. `Process(daemon=False)`.
+- **`stop()` before `start()`** is a pure no-op; state stays `NEW` so a subsequent `start()` is still allowed.
+- **Restart is not supported**: `start()` after any of `STOPPING` / `STOPPED` / `START_FAILED` raises `RuntimeError("ProcessWorker cannot be restarted … construct a fresh worker")`.
+
+### Shutdown escalation ladder
+
+`stop(graceful_timeout_s=5.0, terminate_timeout_s=2.0, kill_timeout_s=1.0) -> Optional[int]`:
+
+1. **Cooperative** — `send_data('terminate')` on the child's work queue.
+2. `join(graceful_timeout_s)`.
+3. If alive → **`Process.terminate()`** (SIGTERM on POSIX / TerminateProcess on Windows).
+4. `join(terminate_timeout_s)`.
+5. If alive → **`Process.kill()`** (SIGKILL / TerminateProcess with force).
+6. `join(kill_timeout_s)`. If still alive after this, log ERROR and abandon.
+
+Total wall time strictly bounded by `graceful + terminate + kill = 8.0s` at defaults; per-call configurable.
+
+**Idempotence**: `STOPPED` state → cached-exitcode replay.
+**Concurrent callers**: only the first caller executes the escalation; others block on `_stop_complete_event` and return the same cached exitcode. `finally` sets `STOPPED` and signals the event **even if the escalation body raised** — so concurrent waiters never hang.
+
+### End-to-end sequence — process-mode start / stop
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Parent process
+    participant PW as ProcessWorker (parent)
+    participant Py as multiprocessing.Process
+    participant C as Child process
+    participant CA as Child-side Agent
+    P->>PW: pw = ProcessWorker(agent)
+    P->>PW: pw.start()
+    PW->>PW: state NEW → STARTING (under _state_lock)
+    PW->>PW: child_config = dict(agent.config)<br/>child_config['work_queue'] = mp.Queue()
+    PW->>Py: mp.Process(target=agent._activate, args=(child_config,))
+    Py->>Py: pickle(target + args)<br/>→ Agent.__getstate__<br/>(probe handlers + config)
+    Py->>C: fork/spawn
+    C->>CA: Agent.__setstate__<br/>fresh locks, None broker, empty _children/_parents
+    C->>CA: _activate(child_config)<br/>→ broker init, on_activate, work-queue loop
+    PW->>PW: state STARTING → RUNNING
+    Note over P,CA: agent.config in parent is unchanged (child_config was a copy)
+    Note over P,CA: parent Agent._broker / _dispatcher stay None
+    P->>PW: pw.stop(5.0, 2.0, 1.0)
+    PW->>PW: state RUNNING → STOPPING
+    PW->>C: send 'terminate' via work_queue
+    PW->>PW: join(5.0)
+    alt child cooperates
+        C-->>Py: exit(0)
+        PW->>PW: cache _exitcode=0
+    else child ignores 'terminate'
+        PW->>Py: Process.terminate() → SIGTERM
+        PW->>PW: join(2.0)
+        alt child ignores SIGTERM
+            PW->>Py: Process.kill() → SIGKILL
+            PW->>PW: join(1.0)
+        end
+    end
+    PW->>PW: state STOPPING → STOPPED<br/>_stop_complete_event.set()
+    PW-->>P: return _exitcode
+```
+
+`stop()` runtime evidence: `test_stop_returns_exitcode_zero_when_child_cooperates` (cooperative), `test_stop_escalates_to_terminate_when_child_ignores_terminate_message` (SIGTERM path), `test_stop_escalates_to_kill_when_child_ignores_sigterm` (SIGKILL path), `test_concurrent_stop_all_callers_return_same_result_single_escalation` (concurrent coordination), `test_no_orphan_process_after_stop` (`os.kill(pid, 0) → ProcessLookupError`).
+
+### R-06 sub-risk status
+
+| Sub-risk | Status |
+|---|---|
+| R-06.1 spawn pickle failure | **Resolved** by pickle protocol above |
+| R-06.2 unbounded `Process.join()` | **Resolved** by escalation ladder |
+| R-06.3 heartbeat / liveness / automatic restart | **Deferred / Open** (out of RFC-008 scope) |
+| R-06.4 parent-child state divergence | **Documented architectural constraint** (§ above) |
+| Child exception forwarding | **Deferred / Open** — parent observes only exit code |
+
+---
+
+## 2.10 Unknowns
 
 - ~~**U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05~~ — **Resolved**: reproduced against a bounded self-echo FakeBroker in `tests/unit/core/test_agent_reply_behavior.py`, then fixed by RFC-003 (§2.7 update above).
 - **U-2.2**: Behaviour of MQTT topics containing `.` under paho v2 — assumed to be a normal character (only `+ # / $` are special), but not empirically tested against a broker.

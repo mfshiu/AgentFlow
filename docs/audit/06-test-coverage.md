@@ -5,7 +5,7 @@
 
 ---
 
-## 6.0 Status update (2026-07-27)
+## 6.0 Status update (2026-07-28)
 
 The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved:
 
@@ -16,22 +16,30 @@ The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state
 - R-03 via [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
 - R.4 (publish_sync-vs-publish_sync collision) via [RFC-006](../rfc/RFC-006-publish-sync-topic-collision.md)
 - R-14 (partially — `__topic_handlers` slice) via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md), which also closed the R.6-1 / R.6-2 / R.6-3 residual risks from the RFC-006 cross-API characterisation
+- R-06 (partially — R-06.1 spawn pickle failure / R-06.2 unbounded `Process.join` / R-06.4 parent-child state divergence) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); R-06.3 heartbeat/watchdog and child-exception IPC remain Deferred / Open
 
 Current authoritative pytest command:
 
 ```bash
-PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
+PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/ -v
 ```
 
-Result as of 2026-07-27 (after RFC-007 implementation):
+Result as of 2026-07-28 (after RFC-008 implementation):
 
 ```
-256 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed  in 12.03s
+289 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed  in ~26s combined
 ```
+
+Broken down:
+- Non-RFC-008 suite: **256 passed, 2 xfailed** in ~12 s
+- RFC-008 suite (`tests/unit/core/test_process_worker_lifecycle.py`): **33 passed** in ~14 s
 
 The two remaining xfails (`test_both_callers_should_receive_own_response_with_shared_topic_wait`, `test_framework_should_support_multiple_handlers_per_topic`) are deferred to a future RFC on correlation ID / multi-handler fan-out.
 
-Historical intermediate result (pre-RFC-006/007) was 216 passed / 0 xfailed. RFC-006 added 21 passing publish_sync-vs-publish_sync collision tests + 2 aspirational xfails; RFC-007 added 19 cross-API tests and migrated ~5 existing tests for the new `_HandlerRecord` shape.
+Historical intermediate results:
+- Pre-RFC-006/007: 216 passed / 0 xfailed.
+- Post-RFC-007 (2026-07-27): 256 passed / 2 xfailed.
+- Post-RFC-008 (2026-07-28): 289 passed / 2 xfailed (RFC-008 added 33 tests; no other suite changed).
 
 Suite composition:
 
@@ -43,6 +51,7 @@ Suite composition:
 | `tests/unit/core/test_agent_message_threading.py` | R-04 characterization + bounded dispatcher + linearization / concurrent-stop race fixes (RFC-004) | 33 |
 | `tests/unit/core/test_agent_publish_sync_concurrency.py` | R.4 (publish_sync-vs-publish_sync) characterization + fail-fast collision (RFC-006) + 2 aspirational xfails (correlation ID / multi-handler fan-out) | 21 + 2 xfail |
 | `tests/unit/core/test_agent_publish_sync_cross_api.py` | R.6-1 / R.6-2 / R.6-3 residual risks + handler registry ownership (RFC-007): fail-fast cross-API protection, HandlerRecord shape, atomic _on_message snapshot, lock hygiene | 19 |
+| `tests/unit/core/test_process_worker_lifecycle.py` | **R-06 (R-06.1 / R-06.2 / R-06.4) + Agent pickle protocol + ProcessWorker state machine / bounded escalation / concurrent-stop coordination / start-failure rollback / parent-child contract (RFC-008)** — 10 categories: A pickle × 8, B state-machine × 5, C real-spawn × 3, D restart guards × 2, E escalation × 3, F concurrent × 2, G start-failure × 3, H observability × 2, I parent-child × 1, J baseline × 4 | 33 |
 | `tests/unit/test_mqtt_broker_reconnect.py` | R-03 characterization + subscription registry + reconnect recovery + planned/unexpected disconnect classification + stop-vs-callback races (RFC-005) | 48 |
 | `tests/unit/test_mqtt_broker_start.py` | MqttBroker start + wait paths | 13 |
 | `tests/unit/test_mqtt_broker_auth.py` | username / password walrus edges | 6 |
@@ -59,6 +68,18 @@ Coverage changes since baseline:
 - **R-03** — was uncovered; now covered by `tests/unit/test_mqtt_broker_reconnect.py` (registry maintenance, first-connect vs reconnect classification, disconnected subscribe/unsubscribe, per-topic recovery failure isolation, planned/unexpected disconnect classification, stop short-circuit, post-stop rejection, `_state_lock` never held across paho client calls, stop-during-recovery / unsubscribe-during-recovery / subscribe-during-recovery races, concurrent producer thread safety, metrics snapshot). The 6 aspirational strict xfails from the R-03 characterization phase all converted to positive assertions.
 - **R.4** (RFC-001 §10 pre-existing race) — was documented as an unresolvable side-effect of RFC-001; now covered by `tests/unit/core/test_agent_publish_sync_concurrency.py` (RFC-006): publish_sync-vs-publish_sync collision raises `TopicWaitCollisionError` fast-fail; 21 pass + 2 aspirational xfails (correlation ID, multi-handler fan-out).
 - **R-14 (`__topic_handlers` slice)** — was uncovered; now covered by `tests/unit/core/test_agent_publish_sync_cross_api.py` (RFC-007): `_HandlerRecord` + `_HandlerOwnerType.{NORMAL, PUBLISH_SYNC}` ownership tagging; all registry mutations and reads under `_handlers_lock`; direct subscribe/unsubscribe on PUBLISH_SYNC-owned topic fail-fast; NORMAL rebind preserved; `_on_message` reads single snapshot (closing R.6-3 TOCTOU); four lock-hygiene tests verify `_handlers_lock` is never held across `broker.subscribe`/`broker.unsubscribe`/`dispatcher.enqueue`/handler invocation. R-14 remains partially open for `_children` / `_parents` (out of RFC-007 scope).
+- **R-06 (R-06.1 / R-06.2 / R-06.4 slices)** — was uncovered (all previous tests used `start_thread` — see §6.4 baseline row); now covered by `tests/unit/core/test_process_worker_lifecycle.py` (RFC-008):
+  - **A. Agent pickle round-trip (8 tests)** — `__getstate__` / `__setstate__` produce a functional child-side Agent; runtime-only fields excluded and reinstated fresh; `_children` / `_parents` reset to empty; RFC-006 / RFC-007 `_HandlerRecord` ownership shape preserved across pickle; **fail-fast** on non-picklable handler (`TypeError` naming the topic + `on_activate()` suggestion); fail-fast on non-picklable value in `config`.
+  - **B. Worker state machine (5 tests)** — `NEW` initial state; `stop()` before `start()` is a no-op that keeps `NEW` and allows a subsequent `start()`; `START_FAILED` after pickle failure; restart guards raise `RuntimeError`.
+  - **C. Real spawn success path (3 tests)** — end-to-end: child unpickles Agent, runs `_activate`, exits cleanly on `terminate`; `Process.daemon = False`; **`agent.config` is not mutated** (no `work_queue` key added / left behind on the parent-side dict).
+  - **D. Repeated / restart guards (2 tests)** — repeated `start()` while `RUNNING` raises; `start()` after successful `stop()` raises.
+  - **E. Stop escalation ladder (3 tests)** — escalates to `Process.terminate()` when child ignores `terminate` message (verified with wedged child); escalates to `Process.kill()` when child installs `SIG_IGN` for SIGTERM; returns `exitcode=0` when child cooperates. Total wall time bounded per-call.
+  - **F. Concurrent stop semantics (2 tests)** — idempotent `stop()` returns cached exitcode; 5 concurrent callers through a `threading.Barrier` all observe the same result — escalation body runs exactly once (verified via `_stop_complete_event` coordination).
+  - **G. Start failure cleanup (3 tests)** — lambda in `config` → pickle fails → `work_process` / `work_queue` cleared; `agent.config` remains uncontaminated; lambda handler → `TypeError` at `start()` naming the topic; state `START_FAILED`.
+  - **H. Observability + orphan sanity (2 tests)** — `exitcode` property is `None` before `stop()`, `int` after; no orphan process (`os.kill(pid, 0) → ProcessLookupError`).
+  - **I. Parent-child contract (1 test)** — parent-side `Agent._broker` / `_dispatcher` / `__topic_handlers` / `_children` / `_parents` all stay uninitialised after child starts (RFC-008 §6.5 architectural constraint verified).
+  - **J. Baseline preservation (4 tests)** — `Worker.__init__` still forces `spawn`; `ThreadWorker` still returns `threading.Event`; `ProcessWorker` still returns `mp.Event`; `_HandlerRecord` ownership survives pickle across the process boundary.
+  - **R-06.3** (heartbeat / liveness / automatic restart) and **child exception forwarding** remain uncovered — Deferred / Open per RFC-008 scope.
 
 Legacy trees (`unit_test/`, `exe_test/`) remain excluded from pytest collection via `pyproject.toml` `norecursedirs`. No change to §6.1–6.7 inventory.
 
@@ -168,7 +189,7 @@ Cross-referenced with `05-risk-register.md`.
 | R-03 broker reconnect / re-subscribe | **Resolved 2026-07-27 (RFC-005); covered by `tests/unit/test_mqtt_broker_reconnect.py`.** MqttBroker owns a thread-safe subscription registry; reconnect drives per-topic recovery with per-topic failure isolation; stop / unsubscribe / subscribe races against recovery covered by dedicated tests; `_state_lock` never held across paho client calls (verified). |
 | R-04 unbounded per-message threads | **Resolved 2026-07-26 (RFC-004); covered by `tests/unit/core/test_agent_message_threading.py`.** MessageDispatcher with fixed daemon consumer pool + bounded queue + drop_newest + graceful shutdown. Two race fixes (enqueue check-then-put linearization + concurrent-stop `_stop_complete_event`) verified with deterministic reproductions. |
 | R-05 suspected reply loop | **Resolved 2026-07-26 (RFC-003); covered by `tests/unit/core/test_agent_reply_behavior.py`.** Three loop patterns (handler exception, handler-returns-loopy-Parcel, two-agent mutual reply) are verified to terminate in ≤ 3 publishes each under a bounded self-echo broker. |
-| R-06 process-mode pickling | ✓ (all tests use `start_thread`) |
+| R-06 process-mode pickling + ProcessWorker lifecycle | **Partially Resolved 2026-07-28 (RFC-008); covered by `tests/unit/core/test_process_worker_lifecycle.py` (33 tests across 10 categories A–J).** R-06.1 spawn pickle failure — Agent `__getstate__` / `__setstate__` with runtime-only field whitelist + fail-fast picklability probe on `config` and every handler. R-06.2 unbounded `Process.join` — `ProcessWorker.stop` bounded escalation ladder (`send terminate → join(graceful) → terminate + join → kill + join`), total ≤ 8 s at defaults; concurrent callers coordinate via `_stop_complete_event`. R-06.4 parent-child state divergence — documented architectural constraint; parent-side Agent stays a lifecycle controller stub. `agent.config` is not mutated. `_HandlerRecord` ownership survives pickle. No orphan process after `stop()`. R-06.3 heartbeat / watchdog / automatic restart and child-exception IPC remain **Open — deferred to a future RFC**. |
 | R-07 handler BaseException | ✓ |
 | R-08 parent-side publish silent failure | ✓ |
 | R-09 topic sanitisation | ✓ |
