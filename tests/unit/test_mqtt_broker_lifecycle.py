@@ -4,6 +4,20 @@ Target module: agentflow.broker.mqtt_broker (real code).
 """
 
 
+def _prime_connected(broker, fake_client):
+    """Post-RFC-005: subscribe/unsubscribe only forward to the paho
+    client when the broker is currently connected. Fire _on_connect
+    once so the broker enters the connected state, then reset the
+    fake client's mock counters so tests can assert on the calls that
+    matter to them."""
+    broker._on_connect(
+        client=fake_client, userdata=None, flags={},
+        reasonCode=0, properties=None,
+    )
+    fake_client.subscribe.reset_mock()
+    fake_client.unsubscribe.reset_mock()
+
+
 # --------------------------------------------------------------------------
 # stop()
 # --------------------------------------------------------------------------
@@ -58,19 +72,21 @@ def test_publish_forwards_non_bytes_payload_unchanged(broker, fake_client):
 # --------------------------------------------------------------------------
 
 def test_subscribe_delegates_topic_by_keyword(broker, fake_client):
+    _prime_connected(broker, fake_client)
     broker.subscribe("some/topic", data_type="str")
     fake_client.subscribe.assert_called_once_with(topic="some/topic")
 
 
 def test_subscribe_returns_underlying_client_result(broker, fake_client):
+    _prime_connected(broker, fake_client)
     sentinel = object()
     fake_client.subscribe.return_value = sentinel
     assert broker.subscribe("t", "str") is sentinel
 
 
 def test_subscribe_does_not_forward_data_type_to_paho(broker, fake_client):
-    # MqttBroker.subscribe (mqtt_broker.py:109-110) drops data_type.
-    # If a future change forwards it, this pins the current contract.
+    # MqttBroker.subscribe drops data_type. Pin the current contract.
+    _prime_connected(broker, fake_client)
     broker.subscribe("t", data_type="bytes")
     args, kwargs = fake_client.subscribe.call_args
     assert "data_type" not in kwargs
@@ -82,11 +98,17 @@ def test_subscribe_does_not_forward_data_type_to_paho(broker, fake_client):
 # --------------------------------------------------------------------------
 
 def test_unsubscribe_delegates_topic_to_client(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    # Register the topic first so unsubscribe has something to remove.
+    broker.subscribe("some/topic", "str")
+    fake_client.unsubscribe.reset_mock()
     broker.unsubscribe("some/topic")
     fake_client.unsubscribe.assert_called_once_with("some/topic")
 
 
 def test_unsubscribe_returns_underlying_client_result(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    broker.subscribe("t", "str")
     sentinel = object()
     fake_client.unsubscribe.return_value = sentinel
     assert broker.unsubscribe("t") is sentinel
