@@ -76,8 +76,9 @@ def subscribe(self, topic, data_type:str="str", topic_handler=None):
 
 Observed:
 - Duplicate subscribe on the same topic only warns and overwrites the handler; no rejection.
-- `data_type` is a string ("str" by default) and is passed through to `MessageBroker.subscribe`. `MqttBroker.subscribe` ignores it (`mqtt_broker.py:109–110`). Only `RosNoeticBroker` uses it — but that broker is unregistered.
+- `data_type` is a string ("str" by default) and is passed through to `MessageBroker.subscribe`. `MqttBroker.subscribe` ignores it (records it in the RFC-005 registry only). Only `RosNoeticBroker` would use it — but that broker is unregistered.
 - `__topic_handlers` is a plain dict (`agent.py:45`) with no synchronization — see Risk R-14.
+- **Broker-side subscription recovery (post-RFC-005, 2026-07-27)**: `MqttBroker.subscribe` now maintains a thread-safe `_registry: dict[topic, data_type]`. When connected, the call forwards to `client.subscribe` as before; when disconnected, only the registry is updated. On the next successful `_on_connect`, the broker snapshots the registry and re-emits `client.subscribe(topic=topic)` for each entry (per-topic try/except; recheck `_stopping` and live-registry membership between iterations). `MqttBroker.unsubscribe` mirrors this: it deletes the registry entry so recovery does not resurrect it. `stop()` sets `_stopping=True` before `client.disconnect()`, so any late `_on_connect` callback observes the flag and skips both recovery and notifier delegation. See [`docs/audit/05-risk-register.md` R-03](05-risk-register.md#r-03--mqtt-reconnect-and-subscription-recovery-are-not-implemented) for the full contract and race analysis; `Agent.subscribe` / `Agent.unsubscribe` public signatures are unchanged.
 
 ---
 

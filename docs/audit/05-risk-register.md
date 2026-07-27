@@ -69,16 +69,97 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-03 — MQTT reconnect and subscription recovery are not implemented
 
+- **Status**: **RESOLVED** (2026-07-27) — see [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
 - **Severity**: High
 - **Category**: Fault Isolation / Message Reliability
-- **File / Function / Line**:
-  - `src/agentflow/broker/mqtt_broker.py:17–18` (`reconnect_on_failure=False`)
-  - `src/agentflow/broker/mqtt_broker.py:52–53` (`_on_disconnect` only logs)
-  - `src/agentflow/core/agent.py:509–512` (`_on_connect` early-return via `_connected_once`)
-- **Trigger**: MQTT broker restart or transient network loss.
-- **Impact**: Even if paho reconnected, `Agent._on_connect` would refuse to re-subscribe. Agent silently becomes deaf; parent/child registration cannot be re-established.
-- **Confidence**: High
-- **Recommended verification test**: Use toxiproxy to sever the MQTT TCP connection for 3 seconds, restore it, and verify whether messages published to previously-subscribed topics still arrive at the agent.
+- **File / Function / Line** (historical): `src/agentflow/broker/mqtt_broker.py:17-18` (`reconnect_on_failure=False`); `mqtt_broker.py:52-53` (`_on_disconnect` only logs); `src/agentflow/core/agent.py:509-512` (`_on_connect` early-return via `_connected_once`)
+- **Evidence** (historical):
+  - MqttBroker was a pass-through with **no subscription registry**.
+  - `_on_disconnect` only issued `logger.warning`; `_connect_ok` / `_connected_evt` never cleared.
+  - Even if a second `_on_connect` fired, `Agent._connected_once` would return early — no path could re-issue prior `client.subscribe` calls.
+  - `stop()` set no observable flag; a late `_on_connect` callback still delegated to the notifier.
+- **Trigger** (historical): MQTT broker restart or transient network loss; also stop / late-callback race.
+- **Impact** (historical): Agent silently deaf after any disconnect. Prior `subscribe(topic, handler)` bindings held in `Agent.__topic_handlers` still existed but no messages arrived because the broker-side subscription was gone. Stop / reconnect race could resurface the notifier after the caller had already asked to terminate.
+- **Confidence at discovery**: High.
+- **Recommended verification test** (was): Use toxiproxy to sever the MQTT TCP connection for 3 seconds, restore it, and verify whether messages published to previously-subscribed topics still arrive at the agent.
+
+### Runtime confirmation (before fix)
+
+R-03 was upgraded from static-code to runtime-confirmed via 32 characterization tests in `tests/unit/test_mqtt_broker_reconnect.py` (RFC-005 §2). Six aspirational tests were marked `xfail(strict=True)` and formed the acceptance-check set.
+
+### Resolution
+
+- **Resolved on**: 2026-07-27
+- **RFC**: [RFC-005 — MQTT subscription recovery](../rfc/RFC-005-mqtt-subscription-recovery.md) (Implemented)
+
+**Final implementation** (Option C from RFC-005 §5 — MqttBroker owns the desired-state registry):
+
+- `MqttBroker` now maintains a thread-safe `_registry: Dict[str, Any]` (topic → data_type) protected by `_state_lock`.
+- Lifecycle state: `_connected`, `_ever_connected`, `_stopping`, `_last_disconnect_was_planned` — all under the same lock.
+- Recovery metrics: `_resubscribe_success_count`, `_resubscribe_error_count`, `_recovery_run_count`. Exposed via `recovery_metrics()` snapshot.
+- **`subscribe(topic, data_type)`**: writes registry under lock; forwards to `client.subscribe` only when `_connected=True`. Returns `None` if disconnected or stopping.
+- **`unsubscribe(topic)`**: symmetric — deletes registry entry; forwards only when connected.
+- **`_on_connect(rc=0)`**: under lock, checks `_stopping` (returns early if True), classifies first vs subsequent via `_ever_connected`, marks `_connected=True`, and snapshots the registry for reconnect. Outside the lock: runs `_recover_subscriptions` on the snapshot (skipped on first connect), then notifies the notifier. `_connected_evt.set()` in a `finally`.
+- **`_recover_subscriptions`**: iterates the snapshot **outside** the lock; before each `client.subscribe(topic)`, re-acquires the lock briefly to re-check `_stopping` (breaks if True) and re-check `topic in _registry` (skips if removed).
+- **`_on_disconnect`**: under lock, classifies planned (rc==0 or `_stopping=True`) vs unexpected; clears `_connected`; sets `_last_disconnect_was_planned`. Outside the lock: clears `_connect_ok` and `_connected_evt`. Registry is **preserved**.
+- **`stop()`**: flips `_stopping=True` **before** `client.disconnect()` so any inline callback observes the flag.
+- **Observability surface** (additive): `last_disconnect_was_planned` property; `recovery_metrics()` method.
+
+### Lifecycle summary
+
+- **Connected**: `subscribe`/`unsubscribe` immediately forward to client + update registry.
+- **Disconnected**: `subscribe`/`unsubscribe` only update the registry; no client call.
+- **Reconnect**: `_on_connect` snapshots the registry, runs `_recover_subscriptions` (per-topic try/except; recheck `_stopping` and `topic in _registry` between iterations); then notifies notifier.
+- **Stopped**: `subscribe`/`unsubscribe` return `None` without touching either the registry or the client; `_on_connect` skips both recovery and notifier delegation.
+
+### Race handling
+
+- **stop vs on_connect**: `stop()` acquires `_state_lock`, sets `_stopping=True`, releases, then calls `client.disconnect()`. Any callback that arrives inline or after observes the flag and short-circuits.
+- **stop during recovery**: recovery re-checks `_stopping` between topics; a stop() during recovery causes the loop to break with a WARNING that records `queue_depth` / `active_workers` (via broker's own log wording — not the dispatcher's).
+- **unsubscribe during recovery**: recovery re-checks `topic in _registry` between iterations; a topic unsubscribed after snapshot capture is skipped.
+- **subscribe during recovery**: new subscribe writes to registry under lock and is preserved for the next reconnect (or immediately forwards if `_connected=True`).
+- **Lock hygiene**: `_state_lock` is **never** held across `client.subscribe` / `client.unsubscribe` / `client.publish` / `client.disconnect` / `client.loop_stop`. Verified by three dedicated tests using a spy that would deadlock if the lock were held.
+
+### Failure isolation
+
+- Per-topic recovery wraps each `client.subscribe(topic)` in `try/except Exception`. Failures increment `_resubscribe_error_count` and log at ERROR; the loop **continues** with the next topic.
+- `BaseException` subclasses (`KeyboardInterrupt`, `SystemExit`, `GeneratorExit`) propagate — consistent with RFC-004 §7.10.
+- Direct `broker.subscribe` / `broker.unsubscribe` on the connected path: exception from `client.subscribe` propagates to the caller; registry has already been updated before the client call raised (verified).
+
+### Runtime verification (as of 2026-07-27)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- Result: **216 passed, 0 failed, 0 xfailed, 0 xpassed** in 3.34 s.
+- R-03 dedicated file `tests/unit/test_mqtt_broker_reconnect.py` — **48 passed** (16 categories per RFC-005 §7).
+- The 6 aspirational strict xfails from the R-03 characterization all **converted to passing tests**:
+  - `test_recovery_resubscribes_all_registered_topics_on_reconnect`
+  - `test_recovery_does_not_resurrect_unsubscribed_topic`
+  - `test_on_connect_after_stop_does_not_notify_notifier`
+  - `test_on_disconnect_distinguishes_planned_from_unexpected`
+  - `test_on_disconnect_clears_connect_ok_flag`
+  - `test_broker_maintains_subscription_registry` (was `test_broker_should_expose_active_subscriptions_after_subscribe`)
+- R-02 (27), R-04 (33), R-05 (21), R-13 (46) tests all pass **unchanged** — no regression from the broker refactor.
+
+### Observable behavioural changes
+
+Three narrow, all in the recovery / safety direction:
+
+1. `broker.subscribe(topic, data_type)` and `broker.unsubscribe(topic)` return `None` when the broker is currently disconnected or has been stopped — previously they always attempted a client call (with undefined paho behaviour when disconnected).
+2. After `stop()`, `broker.subscribe` / `broker.unsubscribe` are silent no-ops (return `None`, no registry write, no client call) — previously they forwarded to paho regardless.
+3. `_on_disconnect` now clears `_connect_ok` and `_connected_evt` and records `last_disconnect_was_planned` — previously those flags were sticky-true after first successful connect.
+
+Callers that read `broker._connect_ok` as "was ever successfully connected" would notice the change; nothing in the codebase relied on that reading.
+
+### Known issues NOT resolved by this fix
+
+- **R-01** — `BinaryParcel.pickle.loads` on wire bytes.
+- **Custom retry / backoff policy**: `reconnect_on_failure=False` is unchanged. Recovery only runs when paho drives an `_on_connect` callback; AgentFlow does not itself reconnect.
+- **Offline publish queue**: `publish()` while disconnected still calls `client.publish` (paho decides).
+- **Stable `client_id`** management: paho auto-generates.
+- **Persistent MQTT session** (`clean_start=False`): not enabled — RFC-005 §Appendix B lists this as a future fast-path optimisation.
+- **Broker-cluster failover**: not implemented.
+- **Connection generation / epoch counter** (RFC-005 Option E): not implemented; `_ever_connected` boolean suffices for first-vs-reconnect classification.
+- **External metrics export** (Prometheus / OpenTelemetry): only in-process `recovery_metrics()` snapshot.
 
 ---
 
@@ -567,7 +648,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 |---|---|---|---|---|
 | R-01 | Critical | High | Open | `pickle.loads` on wire bytes |
 | R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
-| R-03 | High | High | Open | No MQTT reconnect / no re-subscribe |
+| R-03 | High | High | **Resolved 2026-07-27 (RFC-005)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
