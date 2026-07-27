@@ -12,7 +12,11 @@ import time
 
 import pytest
 
-from agentflow.core.agent import Agent
+from agentflow.core.agent import (
+    Agent,
+    _HandlerOwnerType,
+    _HandlerRecord,
+)
 from agentflow.core.parcel import Parcel, TextParcel
 
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
@@ -445,9 +449,12 @@ def test_identity_guard_preserves_foreign_handler_on_same_topic(
     original_publish = broker.publish
 
     def evil_publish(topic_arg, payload):
-        # Simulate a concurrent subscribe() overwrite between our
-        # publish_sync's subscribe and its finally.
-        _handlers(agent)[topic] = foreign_handler
+        # Simulate a corrupted registry state: a NORMAL foreign handler
+        # is installed between publish_sync's subscribe and its finally.
+        # RFC-007: registry values are _HandlerRecord.
+        _handlers(agent)[topic] = _HandlerRecord(
+            _HandlerOwnerType.NORMAL, foreign_handler,
+        )
         # Do NOT deliver a response; let publish_sync time out.
         original_publish(topic_arg, payload)
 
@@ -456,8 +463,10 @@ def test_identity_guard_preserves_foreign_handler_on_same_topic(
     with pytest.raises(TimeoutError):
         agent.publish_sync('req', 'q', topic_wait=topic, timeout=0.05)
 
-    # Identity guard: finally sees a foreign handler and leaves it alone.
-    assert _handlers(agent).get(topic) is foreign_handler
+    # Identity guard (RFC-006 + RFC-007 triple check): finally sees a
+    # NORMAL foreign record and leaves it alone.
+    assert _handlers(agent).get(topic).handler is foreign_handler
+    assert _handlers(agent).get(topic).owner_type is _HandlerOwnerType.NORMAL
     # Because we skipped cleanup, no unsubscribe was called for this topic.
     assert topic not in broker.unsubscribe_calls
 

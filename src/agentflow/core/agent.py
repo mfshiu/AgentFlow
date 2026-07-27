@@ -6,8 +6,10 @@ import string
 import threading
 import time
 import warnings
+from dataclasses import dataclass
+from enum import Enum
 from tkinter import N
-from typing import final, Optional
+from typing import Callable, final, Optional
 import uuid
 
 from agentflow.core.parcel import Parcel
@@ -26,9 +28,38 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 class TopicWaitCollisionError(RuntimeError):
-    """Raised by Agent.publish_sync when the caller-supplied
-    topic_wait is already actively awaited by another publish_sync
-    call on the same Agent (RFC-006)."""
+    """Raised when a topic is already reserved by an active
+    publish_sync waiter and another operation would trample it
+    (RFC-006, RFC-007).
+
+    Contexts that raise this exception:
+      - publish_sync-vs-publish_sync collision (RFC-006)
+      - publish_sync on a topic already held by a normal subscribe
+        handler (RFC-007)
+      - Agent.subscribe on a topic reserved by an active publish_sync
+        waiter (RFC-007)
+      - Agent.unsubscribe on a topic reserved by an active
+        publish_sync waiter (RFC-007)
+    The exception message distinguishes the context."""
+
+
+class _HandlerOwnerType(Enum):
+    """Internal (RFC-007): owner tag for an Agent handler registry
+    entry. NORMAL is registered via Agent.subscribe; PUBLISH_SYNC is
+    the transient closure registered by Agent.publish_sync while it
+    waits for a response."""
+    NORMAL = "normal"
+    PUBLISH_SYNC = "publish_sync"
+
+
+@dataclass(frozen=True)
+class _HandlerRecord:
+    """Internal (RFC-007): value type for Agent.__topic_handlers.
+    Bundles the caller-provided handler with an owner tag so that
+    Agent.subscribe / Agent.unsubscribe can refuse to trample an
+    active publish_sync waiter."""
+    owner_type: _HandlerOwnerType
+    handler: Callable
 
 
 
@@ -392,18 +423,29 @@ class Agent(BrokerNotifier):
             data_event.data = pcl_resp
             data_event.event.set()
 
-        # RFC-006: atomic collision check + register under _handlers_lock.
-        # Does NOT call self.subscribe here because we need the check and
-        # register to be atomic. Agent.subscribe's warn-then-overwrite
-        # semantics remain unchanged for direct subscribe callers
-        # (RFC-006 §7.11).
+        # RFC-006 + RFC-007: atomic collision check + register under
+        # _handlers_lock. Any pre-existing record (NORMAL or
+        # PUBLISH_SYNC) is a collision; distinguish in the exception
+        # message. Register as PUBLISH_SYNC owner so subscribe/unsubscribe
+        # from other callers can refuse to trample the waiter (RFC-007
+        # §7.3, §7.4).
         with self._handlers_lock:
-            if pcl.topic_return in self.__topic_handlers:
+            existing = self.__topic_handlers.get(pcl.topic_return)
+            if existing is not None:
+                if existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                    raise TopicWaitCollisionError(
+                        f"topic_wait {pcl.topic_return!r} is already awaited "
+                        f"by another publish_sync on this Agent"
+                    )
+                # NORMAL owner: publish_sync must not trample it.
                 raise TopicWaitCollisionError(
-                    f"topic_wait {pcl.topic_return!r} is already awaited by "
-                    f"another publish_sync on this Agent"
+                    f"topic_wait {pcl.topic_return!r} is already registered "
+                    f"by a normal subscribe handler; publish_sync would "
+                    f"trample it and is refused"
                 )
-            self.__topic_handlers[pcl.topic_return] = handle_response
+            self.__topic_handlers[pcl.topic_return] = _HandlerRecord(
+                _HandlerOwnerType.PUBLISH_SYNC, handle_response,
+            )
 
         try:
             # broker.subscribe outside the collision lock (RFC-005
@@ -418,11 +460,16 @@ class Agent(BrokerNotifier):
                 return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
         finally:
-            # RFC-006 §7.5: identity check + pop atomic under
-            # _handlers_lock. broker.unsubscribe outside the lock so we
-            # never hold a framework lock across broker I/O.
+            # RFC-006 §7.5 + RFC-007 §7.8: triple check under lock —
+            # record exists, owner is PUBLISH_SYNC, handler identity
+            # matches. Only then pop and unsubscribe. broker.unsubscribe
+            # outside the lock so we never hold a framework lock across
+            # broker I/O.
             with self._handlers_lock:
-                if self.__topic_handlers.get(pcl.topic_return) is handle_response:
+                record = self.__topic_handlers.get(pcl.topic_return)
+                if (record is not None
+                        and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+                        and record.handler is handle_response):
                     self.__topic_handlers.pop(pcl.topic_return, None)
                     need_broker_unsubscribe = True
                 else:
@@ -443,10 +490,24 @@ class Agent(BrokerNotifier):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
 
         if topic_handler:
-            if topic in self.__topic_handlers:
-                logger.warning(self.M(f"Exist the handler for topic: {topic}"))
-            self.__topic_handlers[topic] = topic_handler
+            # RFC-007 §7.3: refuse to trample an active publish_sync
+            # waiter; preserve warn+overwrite for normal rebind
+            # (RFC-006 §7.11 preserved).
+            with self._handlers_lock:
+                existing = self.__topic_handlers.get(topic)
+                if existing is not None and existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                    raise TopicWaitCollisionError(
+                        f"topic {topic!r} is currently reserved by an "
+                        f"active publish_sync waiter; direct subscribe "
+                        f"is refused"
+                    )
+                if existing is not None:
+                    logger.warning(self.M(f"Exist the handler for topic: {topic}"))
+                self.__topic_handlers[topic] = _HandlerRecord(
+                    _HandlerOwnerType.NORMAL, topic_handler,
+                )
 
+        # broker.subscribe outside the lock (RFC-005/006 lock hygiene).
         return self._broker.subscribe(topic, data_type) if self._broker else None
 
 
@@ -456,8 +517,22 @@ class Agent(BrokerNotifier):
         Removes the handler entry from __topic_handlers if present and
         asks the broker to unsubscribe. Idempotent: calling twice or on
         an unknown topic does not raise. Safe to call when the broker
-        has not been created yet (_broker is None)."""
-        self.__topic_handlers.pop(topic, None)
+        has not been created yet (_broker is None).
+
+        RFC-007 §7.4: refuses to remove a publish_sync-owned entry;
+        raises TopicWaitCollisionError instead.
+        """
+        # RFC-007: lock + owner check + pop under lock.
+        with self._handlers_lock:
+            existing = self.__topic_handlers.get(topic)
+            if existing is not None and existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                raise TopicWaitCollisionError(
+                    f"topic {topic!r} is currently reserved by an "
+                    f"active publish_sync waiter; direct unsubscribe "
+                    f"is refused"
+                )
+            self.__topic_handlers.pop(topic, None)
+        # broker.unsubscribe outside the lock.
         if self._broker:
             self._broker.unsubscribe(topic)
     
@@ -636,12 +711,23 @@ class Agent(BrokerNotifier):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         pcl = Parcel.from_payload(data)
 
+        # RFC-007 §7.7: atomic single-snapshot read of the handler
+        # registry under _handlers_lock. is_specific_handler and
+        # topic_handler are decided from ONE snapshot to eliminate the
+        # pre-RFC-007 TOCTOU between the 'in' check and the '.get()'
+        # call. Dispatch happens outside the lock via the RFC-004
+        # dispatcher.
+        with self._handlers_lock:
+            record = self.__topic_handlers.get(topic)
+            if record is not None:
+                is_specific_handler = True
+                topic_handler = record.handler
+            else:
+                is_specific_handler = False
+                topic_handler = self.on_message
         # RFC-003 R-fallback-silent: only topics with a specifically
         # registered handler in __topic_handlers may trigger an
-        # auto-reply. Fall-through to on_message still dispatches the
-        # handler but must never emit an implicit reply.
-        is_specific_handler = topic in self.__topic_handlers
-        topic_handler = self.__topic_handlers.get(topic, self.on_message)
+        # auto-reply.
         should_auto_reply = bool(pcl.topic_return) and is_specific_handler
 
         def handle_message():

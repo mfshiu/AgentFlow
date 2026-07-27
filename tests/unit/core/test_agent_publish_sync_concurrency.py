@@ -21,7 +21,12 @@ from typing import List
 
 import pytest
 
-from agentflow.core.agent import Agent, TopicWaitCollisionError
+from agentflow.core.agent import (
+    Agent,
+    TopicWaitCollisionError,
+    _HandlerOwnerType,
+    _HandlerRecord,
+)
 from agentflow.core.parcel import Parcel, TextParcel
 
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
@@ -98,10 +103,12 @@ def test_second_subscribe_overwrites_first_handler_in_registry():
             pass
 
         agent.subscribe('T', topic_handler=h_A)
-        assert _handlers(agent)['T'] is h_A
+        assert _handlers(agent)['T'].handler is h_A
+        assert _handlers(agent)['T'].owner_type is _HandlerOwnerType.NORMAL
 
-        agent.subscribe('T', topic_handler=h_B)   # unchanged: silent overwrite
-        assert _handlers(agent)['T'] is h_B
+        agent.subscribe('T', topic_handler=h_B)   # unchanged: silent overwrite (NORMAL rebind)
+        assert _handlers(agent)['T'].handler is h_B
+        assert _handlers(agent)['T'].owner_type is _HandlerOwnerType.NORMAL
     finally:
         agent.terminate()
 
@@ -256,7 +263,8 @@ def test_collision_does_not_touch_registry_for_other_topics():
         # Registry is unchanged (only 'T' matters; 'other/topic' still
         # bound to unrelated).
         assert _handlers(agent) == handlers_snapshot_before
-        assert _handlers(agent)['other/topic'] is unrelated
+        assert _handlers(agent)['other/topic'].handler is unrelated
+        assert _handlers(agent)['other/topic'].owner_type is _HandlerOwnerType.NORMAL
 
         a_thread.join(2.0)
     finally:
