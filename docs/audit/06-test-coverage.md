@@ -7,7 +7,15 @@
 
 ## 6.0 Status update (2026-07-27)
 
-The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved R-02 via [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md), R-13 via [RFC-002](../rfc/RFC-002-publish-error-propagation.md), R-05 via [RFC-003](../rfc/RFC-003-auto-reply-contract.md), R-04 via [RFC-004](../rfc/RFC-004-bounded-message-dispatch.md), and R-03 via [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md).
+The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state before any test-infrastructure work landed. Subsequent phases added a deterministic suite under `tests/` and resolved:
+
+- R-02 via [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md)
+- R-13 via [RFC-002](../rfc/RFC-002-publish-error-propagation.md)
+- R-05 via [RFC-003](../rfc/RFC-003-auto-reply-contract.md)
+- R-04 via [RFC-004](../rfc/RFC-004-bounded-message-dispatch.md)
+- R-03 via [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
+- R.4 (publish_sync-vs-publish_sync collision) via [RFC-006](../rfc/RFC-006-publish-sync-topic-collision.md)
+- R-14 (partially — `__topic_handlers` slice) via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md), which also closed the R.6-1 / R.6-2 / R.6-3 residual risks from the RFC-006 cross-API characterisation
 
 Current authoritative pytest command:
 
@@ -15,11 +23,15 @@ Current authoritative pytest command:
 PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
 ```
 
-Result as of 2026-07-27 (after RFC-005 implementation):
+Result as of 2026-07-27 (after RFC-007 implementation):
 
 ```
-216 passed, 0 failed, 0 xfailed, 0 xpassed  in 3.34s
+256 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed  in 12.03s
 ```
+
+The two remaining xfails (`test_both_callers_should_receive_own_response_with_shared_topic_wait`, `test_framework_should_support_multiple_handlers_per_topic`) are deferred to a future RFC on correlation ID / multi-handler fan-out.
+
+Historical intermediate result (pre-RFC-006/007) was 216 passed / 0 xfailed. RFC-006 added 21 passing publish_sync-vs-publish_sync collision tests + 2 aspirational xfails; RFC-007 added 19 cross-API tests and migrated ~5 existing tests for the new `_HandlerRecord` shape.
 
 Suite composition:
 
@@ -29,6 +41,8 @@ Suite composition:
 | `tests/unit/core/test_agent_publish_errors.py` | R-13 characterization + `_publish_or_raise` API | 46 |
 | `tests/unit/core/test_agent_reply_behavior.py` | R-05 characterization + auto-reply contract (RFC-003) | 21 |
 | `tests/unit/core/test_agent_message_threading.py` | R-04 characterization + bounded dispatcher + linearization / concurrent-stop race fixes (RFC-004) | 33 |
+| `tests/unit/core/test_agent_publish_sync_concurrency.py` | R.4 (publish_sync-vs-publish_sync) characterization + fail-fast collision (RFC-006) + 2 aspirational xfails (correlation ID / multi-handler fan-out) | 21 + 2 xfail |
+| `tests/unit/core/test_agent_publish_sync_cross_api.py` | R.6-1 / R.6-2 / R.6-3 residual risks + handler registry ownership (RFC-007): fail-fast cross-API protection, HandlerRecord shape, atomic _on_message snapshot, lock hygiene | 19 |
 | `tests/unit/test_mqtt_broker_reconnect.py` | R-03 characterization + subscription registry + reconnect recovery + planned/unexpected disconnect classification + stop-vs-callback races (RFC-005) | 48 |
 | `tests/unit/test_mqtt_broker_start.py` | MqttBroker start + wait paths | 13 |
 | `tests/unit/test_mqtt_broker_auth.py` | username / password walrus edges | 6 |
@@ -43,6 +57,8 @@ Coverage changes since baseline:
 - **R-05** — was uncovered; now covered by `tests/unit/core/test_agent_reply_behavior.py` (three loop patterns previously observed under a bounded self-echo broker now terminate in ≤ 3 publishes; R-fallback-silent verified; R-strip-topic_return verified across TextParcel / BinaryParcel / content / error field preservation; R-exception-fresh verified with non-mutation of incoming parcel; RFC-003 × RFC-001 interaction verified).
 - **R-04** — was uncovered; now covered by `tests/unit/core/test_agent_message_threading.py` (bounded dispatcher: workers cap, queue capacity, drop_newest metric, broker-callback safety invariant, two-layer exception isolation, metrics snapshot, graceful drain, bounded shutdown timeout, idempotent stop, post-stop rejection, legacy per-message-thread mode + DeprecationWarning). Two race fixes verified with deterministic reproductions: `test_race_stop_wins_between_enqueue_check_and_put_deterministic` and `test_concurrent_stop_calls_execute_actual_shutdown_only_once`; a 25-trial concurrency stress test (`test_stop_and_enqueue_linearization_under_concurrency_stress`) plus 5 independent re-runs confirmed no flakes.
 - **R-03** — was uncovered; now covered by `tests/unit/test_mqtt_broker_reconnect.py` (registry maintenance, first-connect vs reconnect classification, disconnected subscribe/unsubscribe, per-topic recovery failure isolation, planned/unexpected disconnect classification, stop short-circuit, post-stop rejection, `_state_lock` never held across paho client calls, stop-during-recovery / unsubscribe-during-recovery / subscribe-during-recovery races, concurrent producer thread safety, metrics snapshot). The 6 aspirational strict xfails from the R-03 characterization phase all converted to positive assertions.
+- **R.4** (RFC-001 §10 pre-existing race) — was documented as an unresolvable side-effect of RFC-001; now covered by `tests/unit/core/test_agent_publish_sync_concurrency.py` (RFC-006): publish_sync-vs-publish_sync collision raises `TopicWaitCollisionError` fast-fail; 21 pass + 2 aspirational xfails (correlation ID, multi-handler fan-out).
+- **R-14 (`__topic_handlers` slice)** — was uncovered; now covered by `tests/unit/core/test_agent_publish_sync_cross_api.py` (RFC-007): `_HandlerRecord` + `_HandlerOwnerType.{NORMAL, PUBLISH_SYNC}` ownership tagging; all registry mutations and reads under `_handlers_lock`; direct subscribe/unsubscribe on PUBLISH_SYNC-owned topic fail-fast; NORMAL rebind preserved; `_on_message` reads single snapshot (closing R.6-3 TOCTOU); four lock-hygiene tests verify `_handlers_lock` is never held across `broker.subscribe`/`broker.unsubscribe`/`dispatcher.enqueue`/handler invocation. R-14 remains partially open for `_children` / `_parents` (out of RFC-007 scope).
 
 Legacy trees (`unit_test/`, `exe_test/`) remain excluded from pytest collection via `pyproject.toml` `norecursedirs`. No change to §6.1–6.7 inventory.
 
@@ -158,7 +174,7 @@ Cross-referenced with `05-risk-register.md`.
 | R-09 topic sanitisation | ✓ |
 | R-10 `join()` without timeout on stuck handler | ✓ |
 | R-13 publish-result observability | **Resolved 2026-07-26 (RFC-002); covered by `tests/unit/core/test_agent_publish_errors.py`.** Note: broker-side paho `MessageInfo` (rc/mid) is still discarded — that residual observability gap is deferred to a future RFC. |
-| R-14 dict concurrency | ✓ |
+| R-14 dict concurrency | **Partially Resolved 2026-07-27 (RFC-007); `__topic_handlers` slice covered by `tests/unit/core/test_agent_publish_sync_cross_api.py`.** All registry mutations and reads under `_handlers_lock`; `_HandlerRecord` ownership tagging; cross-API fail-fast on PUBLISH_SYNC-reserved topics; NORMAL rebind preserved; `_on_message` single-snapshot lookup. `_children` and `_parents` slice remains Open — deferred to a future RFC. |
 | R-18 no unregister / heartbeat | ✓ |
 | R-19 parcel version drift | ✓ |
 | R-20 message-level tracing metadata | ✓ (not present in schema) |

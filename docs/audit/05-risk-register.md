@@ -63,7 +63,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
   - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
   - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
-  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. Tracked for a future RFC.
+  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details.
 
 ---
 
@@ -477,16 +477,94 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 ## R-14 — Shared dictionaries without locks
 
+- **Status**: **PARTIALLY RESOLVED** (2026-07-27) — `__topic_handlers` fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md); `_children` / `_parents` remain Open (not addressed in this RFC).
 - **Severity**: Medium
 - **Category**: Concurrency
-- **File / Function / Line**:
-  - `__topic_handlers` — `agent.py:45, 360–362, 541`
-  - `_children` — `agent.py:42, 369`
-  - `_parents` — `agent.py:42, 380`
-- **Trigger**: Concurrent subscribe and message delivery, or concurrent parent/child registrations.
-- **Impact**: Compound TOCTOU (`if topic in d: warn; d[topic] = h`) can lose a warning or overwrite unexpectedly; rare visibility issues.
-- **Confidence**: Medium — dict single-op atomicity mitigates many cases but not all.
-- **Recommended verification test**: Stress test with N threads registering distinct then colliding topics; observe warning counts vs actual final state.
+- **File / Function / Line** (historical): `__topic_handlers`, `_children`, `_parents` in `agent.py`
+- **Trigger** (historical): Concurrent subscribe and message delivery, or concurrent parent/child registrations.
+- **Impact** (historical): Compound TOCTOU (`if topic in d: warn; d[topic] = h`) could lose a warning or overwrite unexpectedly; rare visibility issues on `__topic_handlers` reads by `_on_message`.
+- **Confidence at discovery**: Medium.
+- **Recommended verification test** (was): Stress test with N threads registering distinct then colliding topics; observe warning counts vs actual final state.
+
+### Runtime confirmation of `__topic_handlers` residual risks (before RFC-007)
+
+The `__topic_handlers` slice of R-14 was upgraded to runtime-confirmed via `tests/unit/core/test_agent_publish_sync_cross_api.py` (12 characterisation tests documenting three residual risks after RFC-006 landed):
+
+- **R.6-1** — direct `Agent.subscribe('T', new_handler)` while a `publish_sync` waiter was active on `'T'` silently overwrote the waiter's handler. Waiter timed out; response was routed to the replacement.
+- **R.6-2** — direct `Agent.unsubscribe('T')` while a `publish_sync` waiter was active popped the waiter's handler and called `broker.unsubscribe('T')`. Waiter timed out; late response fell through to `Agent.on_message` (RFC-003 R-fallback-silent).
+- **R.6-3** — `Agent._on_message` read `__topic_handlers` with two independent operations (`in` check, then `.get()`) — a TOCTOU window between them could produce inconsistent dispatch decisions under concurrent mutation.
+
+### Resolution (for `__topic_handlers` only)
+
+- **Resolved on**: 2026-07-27
+- **RFC**: [RFC-007 — handler registry ownership](../rfc/RFC-007-handler-registry-ownership.md) (Implemented)
+
+**Final implementation** (RFC-007 A + C + D combined):
+
+- New internal types in `src/agentflow/core/agent.py` (leading-underscore, not re-exported):
+  - `_HandlerOwnerType(Enum)`: `NORMAL`, `PUBLISH_SYNC`.
+  - `_HandlerRecord(frozen dataclass)`: `(owner_type, handler)`.
+- `Agent.__topic_handlers` value type changed from `Callable` to `_HandlerRecord`.
+- **All registry mutations and reads** now happen inside `with self._handlers_lock:` (the RLock introduced in RFC-006):
+  - `Agent.subscribe`: check owner; if PUBLISH_SYNC → raise; else warn (rebind case) + register as NORMAL. `broker.subscribe` outside the lock.
+  - `Agent.unsubscribe`: check owner; if PUBLISH_SYNC → raise; else pop. `broker.unsubscribe` outside the lock.
+  - `Agent.publish_sync` register: check any existing record; if PUBLISH_SYNC → raise (`already awaited`); if NORMAL → raise (`would trample it`); else register as PUBLISH_SYNC. `broker.subscribe` outside the lock.
+  - `Agent.publish_sync` finally: **triple check** — record exists AND `owner_type is PUBLISH_SYNC` AND `handler is handle_response` → pop. `broker.unsubscribe` outside the lock.
+  - `Agent._on_message`: single-snapshot read under the lock decides `is_specific_handler` and `topic_handler` together. Dispatcher enqueue and handler invocation happen outside the lock.
+
+### Collision contract (four scenarios; all raise `TopicWaitCollisionError`)
+
+| Scenario | Message keyword |
+|---|---|
+| publish_sync vs publish_sync (RFC-006) | `"already awaited by another publish_sync"` |
+| publish_sync vs NORMAL (RFC-007) | `"already registered by a normal subscribe handler; publish_sync would trample it"` |
+| direct subscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct subscribe is refused"` |
+| direct unsubscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct unsubscribe is refused"` |
+
+### Compatibility
+
+- **`Agent.subscribe` NORMAL rebind**: preserved — warn + overwrite as before (RFC-006 §7.11 / RFC-007 §7.5).
+- **`Agent.unsubscribe` on NORMAL topic**: preserved — pop + broker.unsubscribe as before.
+- **Public signatures** of `Agent.publish` / `publish_sync` / `subscribe` / `unsubscribe` / `_on_message`: unchanged.
+- **Parcel, Message Schema, Broker API**: unchanged.
+- **`_HandlerRecord` / `_HandlerOwnerType`**: internal names (leading underscore); not re-exported.
+
+### Lock hygiene (RFC-007 §7.10)
+
+`_handlers_lock` is never held across:
+
+- `broker.subscribe` / `broker.unsubscribe` / `broker.publish`
+- `dispatcher.enqueue`
+- handler invocation
+- `_publish_or_raise` / `event.wait`
+
+Verified by four dedicated tests: `test_handlers_lock_is_reentrant_from_broker_subscribe_callback`, `test_handlers_lock_is_reentrant_from_broker_unsubscribe_callback`, `test_handler_can_safely_call_subscribe_from_within_dispatch`, `test_dispatcher_enqueue_happens_outside_handlers_lock`.
+
+### Runtime verification (as of 2026-07-27)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- Result: **256 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in 12.03 s.
+- RFC-007 dedicated file `tests/unit/core/test_agent_publish_sync_cross_api.py` — **19 passed** (4 categories: cross-API protection × 4, compatibility × 3, registry shape × 3, `_on_message` semantics + stress × 5, lock hygiene × 4).
+- 3 independent stability re-runs — all 19/19 pass, no flakes observed.
+- R-01 / R-02 (27) / R-03 (48) / R-04 (33) / R-05 (21) / R-13 (46) / RFC-006 same-API (21) — combined 196 tests pass **unchanged**.
+- 2 xfails preserved (correlation ID / multi-handler fan-out — deferred to future RFC).
+
+### Still open under R-14
+
+The `__topic_handlers` slice is resolved. The following R-14 residuals **remain Open** (out of RFC-007 scope):
+
+- `_children` — parent's child registry; still an unlocked dict.
+- `_parents` — child's parent registry; still an unlocked dict.
+
+Fixing these would require a similar lock + accessor policy for `Agent._notify_children` / `_notify_parents` / `_handle_children` / `_handle_parents`. Deferred to a future RFC.
+
+### Future work (deferred from RFC-007)
+
+- **Correlation ID** — a Parcel metadata field to distinguish concurrent same-topic requests; would allow multiple publish_sync callers to coexist on the same `topic_wait` and receive their own responses. Requires Parcel schema change (R-20 territory).
+- **Multi-handler fan-out per topic** — `__topic_handlers` value becomes a list; delivery notifies every handler; needed for pub-sub with multiple observers.
+- **Waiter queue** — publish_sync waiters chain rather than collide; needs correlation ID to route responses.
+- **Parcel metadata** — broader schema evolution (R-20).
+- **ProcessWorker** — cross-process registry synchronisation; requires shared-memory / IPC design.
 
 ---
 
@@ -659,7 +737,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
-| R-14 | Medium | Medium | Open | Shared dicts without locks |
+| R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | Open | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
