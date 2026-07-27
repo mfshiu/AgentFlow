@@ -25,6 +25,13 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
 
+class TopicWaitCollisionError(RuntimeError):
+    """Raised by Agent.publish_sync when the caller-supplied
+    topic_wait is already actively awaited by another publish_sync
+    call on the same Agent (RFC-006)."""
+
+
+
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
         logger.debug(f'name: {name}, agent_config: {agent_config}')
@@ -45,7 +52,11 @@ class Agent(BrokerNotifier):
         
         self._message_broker = None
         self.__topic_handlers: dict[str, function] = {}
-        
+        # RFC-006: guards atomic collision-check-and-register and
+        # atomic identity-check-and-pop for publish_sync. Uses RLock
+        # for future-proofing (RFC-006 Appendix B).
+        self._handlers_lock = threading.RLock()
+
         self._broker = None
         self._connected_once = False
 
@@ -381,8 +392,24 @@ class Agent(BrokerNotifier):
             data_event.data = pcl_resp
             data_event.event.set()
 
-        self.subscribe(pcl.topic_return, topic_handler=handle_response)
+        # RFC-006: atomic collision check + register under _handlers_lock.
+        # Does NOT call self.subscribe here because we need the check and
+        # register to be atomic. Agent.subscribe's warn-then-overwrite
+        # semantics remain unchanged for direct subscribe callers
+        # (RFC-006 §7.11).
+        with self._handlers_lock:
+            if pcl.topic_return in self.__topic_handlers:
+                raise TopicWaitCollisionError(
+                    f"topic_wait {pcl.topic_return!r} is already awaited by "
+                    f"another publish_sync on this Agent"
+                )
+            self.__topic_handlers[pcl.topic_return] = handle_response
+
         try:
+            # broker.subscribe outside the collision lock (RFC-005
+            # principle: never hold a framework lock across broker I/O).
+            if self._broker:
+                self._broker.subscribe(pcl.topic_return, "str")
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
@@ -391,14 +418,21 @@ class Agent(BrokerNotifier):
                 return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
         finally:
-            # Identity guard: only tear down if the handler in the
-            # registry is still the one this call installed. Protects a
-            # foreign handler that raced onto the same topic.
-            try:
+            # RFC-006 §7.5: identity check + pop atomic under
+            # _handlers_lock. broker.unsubscribe outside the lock so we
+            # never hold a framework lock across broker I/O.
+            with self._handlers_lock:
                 if self.__topic_handlers.get(pcl.topic_return) is handle_response:
-                    self.unsubscribe(pcl.topic_return)
-            except Exception as cleanup_ex:
-                logger.exception(cleanup_ex)
+                    self.__topic_handlers.pop(pcl.topic_return, None)
+                    need_broker_unsubscribe = True
+                else:
+                    need_broker_unsubscribe = False
+            if need_broker_unsubscribe:
+                try:
+                    if self._broker:
+                        self._broker.unsubscribe(pcl.topic_return)
+                except Exception as cleanup_ex:
+                    logger.exception(cleanup_ex)
 
 
     @final
