@@ -1,5 +1,6 @@
 import inspect
 import logging
+import pickle
 import queue
 import random
 import string
@@ -110,9 +111,101 @@ class Agent(BrokerNotifier):
 
 
 # ==================
+#  Agent Pickle protocol (RFC-008 — ProcessWorker spawn compatibility)
+# ==================
+
+    # Attributes excluded from pickle. Locks and Broker / Dispatcher /
+    # back-reference to Worker are runtime-only and either not
+    # picklable (RLock, paho Client, threading.Event) or meaningless
+    # in a child process context.
+    _RUNTIME_ONLY_FIELDS = frozenset({
+        '_handlers_lock',
+        '_dispatcher_init_lock',
+        '_dispatcher',
+        '_broker',
+        '_agent_worker',
+        '_message_broker',
+        '_children',
+        '_parents',
+    })
+
+    def __getstate__(self):
+        """RFC-008 §A: return a picklable, declarative-only snapshot
+        of the Agent. Runtime resources (locks, broker, dispatcher,
+        worker back-reference, children/parents runtime registry) are
+        excluded; they will be reinstated fresh by __setstate__ in
+        the unpickling process (typically a spawned child).
+
+        Fails fast (TypeError) if the config or any registered handler
+        cannot be pickled. The message names the offending topic(s)
+        so callers can move handler registration into on_activate().
+        """
+        state = self.__dict__.copy()
+        for field in Agent._RUNTIME_ONLY_FIELDS:
+            state.pop(field, None)
+
+        # Validate config is picklable so start-time failure surfaces
+        # here with a helpful message rather than a bare pickle error
+        # deep inside Process.start().
+        try:
+            pickle.dumps(state.get('config', {}))
+        except Exception as ex:
+            raise TypeError(
+                f"Agent.config contains non-picklable content and cannot "
+                f"be shipped to a spawned child process: {ex}. Move "
+                f"non-picklable configuration (closures, lambdas, live "
+                f"objects) into on_activate() so it is created inside "
+                f"the child."
+            ) from ex
+
+        # Validate every registered handler is picklable; fail fast
+        # naming the offending topic(s). Never silently omit handlers.
+        handlers_key = '_Agent__topic_handlers'
+        handlers = state.get(handlers_key, {}) or {}
+        offending_topics = []
+        for topic, record in handlers.items():
+            handler = record.handler if hasattr(record, 'handler') else record
+            try:
+                pickle.dumps(handler)
+            except Exception:
+                offending_topics.append(topic)
+        if offending_topics:
+            raise TypeError(
+                f"Agent.__topic_handlers contains non-picklable "
+                f"handlers for topic(s) "
+                f"{sorted(str(t) for t in offending_topics)!r}; cannot "
+                f"ship to a spawned child process. Register these "
+                f"handlers inside on_activate() (which runs in the "
+                f"child) rather than in the parent, so they are "
+                f"created locally in the child rather than pickled "
+                f"across the process boundary."
+            )
+        return state
+
+    def __setstate__(self, state):
+        """RFC-008 §A: restore declarative state and reinstate all
+        runtime-only fields with fresh instances. Called in the child
+        after unpickle. Preserves RFC-006/RFC-007 ownership shape:
+        _HandlerRecord entries carry their owner_type across the
+        pickle boundary; a fresh RLock guards the registry in the
+        child process."""
+        self.__dict__.update(state)
+        self._handlers_lock = threading.RLock()
+        self._dispatcher_init_lock = threading.RLock()
+        self._dispatcher = None
+        self._broker = None
+        self._agent_worker = None
+        self._message_broker = None
+        self._children = {}
+        self._parents = {}
+        if '_Agent__topic_handlers' not in self.__dict__:
+            self._Agent__topic_handlers = {}
+
+
+# ==================
 #  Agent Initializing
 # ==================
-        
+
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
