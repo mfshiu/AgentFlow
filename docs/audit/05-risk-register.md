@@ -465,15 +465,112 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 
 ## R-10 — `Worker.stop()` uses `join()` without timeout
 
+- **Status**: **RESOLVED** (2026-07-28) — ProcessWorker via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); ThreadWorker via [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md). Both worker strategies now have bounded shutdown paths. `Agent.terminate()` returns in bounded time regardless of handler / worker wedging. Two related residuals remain **Open**: broker-level wedged `stop()` (runtime-confirmed but out of RFC-009 scope) and non-daemon interpreter-exit blocking under `STOP_TIMEOUT` (documented architectural limitation).
 - **Severity**: High
 - **Category**: Fault Isolation / Resource
-- **File / Function / Line**:
-  - `src/agentflow/core/agent_worker.py:75` `ProcessWorker.stop`
-  - `src/agentflow/core/agent_worker.py:110` `ThreadWorker.stop`
-- **Trigger**: Any handler that blocks (deadlock, sleep, blocking I/O).
-- **Impact**: `Agent.terminate()` blocks the caller forever.
-- **Confidence**: High
-- **Recommended verification test**: Register an `on_message` handler that runs `while True: pass`; publish one message; call `agent.terminate()`; assert it returns within N seconds.
+- **File / Function / Line** (historical):
+  - `src/agentflow/core/agent_worker.py:75` `ProcessWorker.stop` (pre-RFC-008)
+  - `src/agentflow/core/agent_worker.py:110` `ThreadWorker.stop` (pre-RFC-009)
+- **Evidence** (historical):
+  - `ProcessWorker.stop`: `self.work_process.join()` with no timeout after `send_data('terminate')` — a wedged child blocked the caller forever.
+  - `ThreadWorker.stop`: `self.work_thread.join()` with no timeout after `send_data('terminate')` — a wedged worker thread blocked the caller forever. In particular, a wedged `broker.stop()` inside the worker thread's `__deactivating` never returned, and the `join()` waited indefinitely.
+- **Trigger** (historical): Any handler that blocks; any broker whose `stop()` blocks; any deployment that constructs a `ProcessWorker` or `ThreadWorker` without a cooperative-terminate path.
+- **Impact** (historical): `Agent.terminate()` blocks its caller forever — every deployment that treated `terminate()` as fire-and-forget cleanup could not shut down gracefully.
+- **Confidence at discovery**: High.
+- **Recommended verification test** (was): Register an `on_message` handler that runs `while True: pass`; publish one message; call `agent.terminate()`; assert it returns within N seconds. Both ProcessWorker (RFC-008) and ThreadWorker (RFC-009) test suites now cover the equivalent bounded-return assertion.
+
+### Sub-risk breakdown
+
+| ID | Sub-risk | Status |
+|---|---|---|
+| **R-10.1** | `ProcessWorker.stop` unbounded `Process.join()` — wedged child blocks caller forever | **RESOLVED** (RFC-008) — bounded escalation `send terminate → join(graceful) → terminate() → join → kill() → join`, total ≤ 8s at defaults |
+| **R-10.2** | `ThreadWorker.stop` unbounded `Thread.join()` — wedged worker thread blocks caller forever | **RESOLVED** (RFC-009) — bounded cooperative `join(graceful_timeout_s)`, `stop() -> bool`, wedged → `STOP_TIMEOUT` state, retriable |
+| **R-10.3** | `Agent.terminate()` unbounded wait chained through worker.stop | **RESOLVED** (RFC-008 + RFC-009) — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` (≈ 10s at defaults); logs WARNING on worker timeout; never raises |
+| **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **OPEN / Runtime Confirmed** — surrounded by bounded worker (RFC-009 §7.17) but broker itself is not bounded; future broker-lifecycle RFC required |
+| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption |
+
+### Resolution (R-10.1)
+
+- **Resolved on**: 2026-07-27 — see [RFC-008 ProcessWorker lifecycle](../rfc/RFC-008-process-worker-lifecycle.md) (Implemented 2026-07-28).
+- **Scope**: bounded shutdown escalation ladder with SIGTERM / SIGKILL fallback; `WorkerState` state machine; concurrent-stop coordination via `_stop_complete_event`; cached exitcode.
+- Detailed runtime evidence + observable behavioural changes are captured under [R-06](#r-06--process-mode-pickling-of-agent--processworker-lifecycle) above (R-06 and R-10.1 share the same RFC-008 fix).
+
+### Resolution (R-10.2 + R-10.3)
+
+- **Resolved on**: 2026-07-28 — see [RFC-009 ThreadWorker lifecycle](../rfc/RFC-009-thread-worker-lifecycle.md) (Implemented).
+
+**Final implementation** (RFC-009 first-phase scope):
+
+**WorkerState** (`src/agentflow/core/agent_worker.py`) — the RFC-008 enum extended with two ThreadWorker-only members:
+
+- `STOP_TIMEOUT` — cooperative stop deadline expired; thread still alive; retriable via a subsequent `stop()`.
+- `FAILED` — `_activate` raised an `Exception` (not `BaseException`); captured into `last_exception`; thread ended.
+
+`ProcessWorker` never enters either state (it has SIGKILL and exitcode).
+
+**ThreadWorker rewrite** (`src/agentflow/core/agent_worker.py`):
+
+- Full state machine `NEW → STARTING → RUNNING → STOPPING → STOPPED / STOP_TIMEOUT / FAILED / START_FAILED`, protected by `_state_lock: threading.RLock`.
+- `stop(graceful_timeout_s=5.0) -> bool` — cooperative send `'terminate'` → `join(graceful_timeout_s)` → under lock: alive → `STOP_TIMEOUT + False`; dead + `last_exception` → `FAILED + True`; dead → `STOPPED + True`. `finally` unconditionally sets `_stop_complete_event` so concurrent waiters never hang.
+- **Concurrent stop waiter is bounded**: waits `graceful_timeout_s + 0.1s` coordination margin; on event timeout, reads `Thread.is_alive()` and returns `not alive` with WARNING log. **No `Event.wait()` without timeout anywhere in `stop()`**.
+- **Thread reference retained on `STOP_TIMEOUT`** — `is_working()` continues to reflect real `Thread.is_alive()`; retry `stop()` re-joins the same thread with a fresh budget.
+- New read-only properties: `state: WorkerState`, `last_exception: Optional[BaseException]`.
+- `_run_target` wrapper catches **`Exception` only** (RFC-009 §7.11) — `BaseException` propagates and dies without state update (documented limitation, see R-10 residuals below).
+- `stop()` before `start()` is a no-op returning `True`, state stays `NEW` — subsequent `start()` is allowed.
+- Repeated `start()` from any non-`NEW` state raises `RuntimeError` (closes the pre-RFC-009 silent orphan-thread leak).
+- `agent.config['work_queue']` in-place mutation preserved (§7.15) — shared-instance model is thread mode's contract.
+
+**Agent.terminate** (`src/agentflow/core/agent.py`):
+
+- Public signature unchanged; never-raise contract preserved.
+- Calls `dispatcher.stop()` before `worker.stop()` (RFC-004 order preserved).
+- `dispatcher.stop()` wrapped in `try/except Exception` — broken dispatcher does not block worker cleanup.
+- `worker.stop()` wrapped in `try/except Exception` — misbehaving worker `.stop()` never propagates.
+- Observes `worker.stop()` return value: **`False` → WARNING** with `state`, `work_thread`, and the daemon interpreter-exit caveat; `True` / `None` (legacy `FakeWorker`) → silent.
+- Docstring explicitly states: bounded return of `terminate()` only guarantees this method returns; if worker ended at `STOP_TIMEOUT` and `daemon=False`, Python interpreter shutdown may still block on it.
+
+### Stop contract summary
+
+| Trigger | ProcessWorker (RFC-008) | ThreadWorker (RFC-009) |
+|---|---|---|
+| Cooperative | `send terminate` via mp Queue | `send terminate` via threading Queue |
+| Escalation | SIGTERM → SIGKILL (bounded per-step) | **None** — no safe forced-cancel (see R-10.4 / §5 Option E rejected) |
+| Timeout return | `Optional[int]` exitcode (cached) | `bool` — `False` on wedge |
+| Timeout state | `STOPPED` (always reachable via SIGKILL) | `STOP_TIMEOUT` (thread still alive; retriable) |
+| Restart | Not supported | Not supported |
+| Concurrent stop | `_stop_complete_event.wait()` — bounded by underlying escalation | `_stop_complete_event.wait(graceful_timeout_s + 0.1)` — bounded coordination margin |
+| Config-share | Copy (`child_config = dict(agent.config)`) | Share (in-place mutation of `agent.config`) |
+| Daemon | `daemon=False` | `daemon=False` |
+| Force-kill primitive | `Process.kill()` | **None** — Python threads cannot be safely cancelled |
+
+### Runtime verification (as of 2026-07-28)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- RFC-009 dedicated file `tests/unit/core/test_thread_worker_lifecycle.py` — **35 passed** in ~6 s.
+- RFC-008 file `tests/unit/core/test_process_worker_lifecycle.py` — **33 passed** unchanged.
+- Full combined regression: **324 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in ~34 s.
+- 2 xfails preserved from RFC-007 (correlation ID / multi-handler fan-out — deferred).
+- Zero regression across R-02 (27) / R-03 (48) / R-04 (33) / R-05 (21) / R-13 (46) / RFC-006 (21) / RFC-007 (19) / RFC-008 (33) — combined **248 tests pass unchanged**.
+
+### Observable behavioural changes
+
+Four narrow, all in the bounded-shutdown / safety direction:
+
+1. `ThreadWorker.stop()` now returns `bool` (was `None`). Return-type widening is source-compatible; no in-tree caller inspected the old return value.
+2. `ThreadWorker.stop()` before `start()` is now a no-op returning `True` (was `AttributeError`). Fixes an unintended bug.
+3. `ThreadWorker.start()` from any non-`NEW` state now raises `RuntimeError` (was silent rebind). Closes the orphan-thread leak.
+4. `Agent.terminate()` now logs a WARNING when `worker.stop()` returns `False`; it did not do so before because the old `stop()` returned `None`. Signature unchanged, never-raise contract unchanged.
+
+### Known residuals NOT resolved by RFC-009
+
+- **R-10.4 broker.stop() itself wedges** — RFC-009 bounds the worker but does not bound the broker. A wedged `broker.stop()` inside the worker thread now surfaces cleanly as `STOP_TIMEOUT`, but the underlying broker hang is not fixed. Deferred to a future broker-lifecycle RFC.
+- **R-10.5 non-daemon interpreter-exit blocking** — a `STOP_TIMEOUT` worker leaves a live non-daemon thread; Python interpreter shutdown will still block on it. RFC-009 §7.13 keeps `daemon=False` on purpose (daemonising would trade a visible hang for silent mid-`__deactivating` corruption). Documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path.
+- **`BaseException` observability** — `_run_target` catches `Exception` only (RFC-009 §7.11); a `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` from `_activate` leaves state unchanged and, after `stop()`, gets marked `STOPPED` — masking the crash. A signal-based cleanup layer or a separate tracker would be needed to observe this. Deferred.
+- **Heartbeat / watchdog / automatic restart** — RFC-009 Out-of-scope (parity with RFC-008).
+- **Config-key surface** for `graceful_timeout_s` — deferred; method-arg only in first-phase.
+- **Lifecycle metrics** on `ThreadWorker` — deferred; parity with RFC-008 §7.18.
+
+---
 
 ---
 
@@ -817,7 +914,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — `ProcessWorker.stop` bounded escalation; `ThreadWorker.stop` still uses unbounded `join()` | `Worker.stop()` join without timeout |
+| R-10 | High | High | **Resolved 2026-07-28 (RFC-008 + RFC-009)** — both workers bounded; `Agent.terminate` bounded return + WARNING on timeout. Residuals R-10.4 broker.stop wedge (Open) + R-10.5 non-daemon interpreter-exit (Open / Documented). | `Worker.stop()` join without timeout |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |

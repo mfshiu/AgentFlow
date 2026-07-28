@@ -403,7 +403,143 @@ sequenceDiagram
 
 ---
 
-## 2.10 Unknowns
+## 2.10 Thread-mode worker lifecycle (post-RFC-009, 2026-07-28)
+
+> **Update (2026-07-28)**: `ThreadWorker` now matches `ProcessWorker`'s lifecycle contract at the shape level: `WorkerState` state machine, bounded cooperative `stop()`, concurrent-stop coordination, exception observability. Contract differences that cannot be aligned (thread-mode shared-instance model, no forced cancellation) are explicitly documented. See [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md) and [`docs/audit/05-risk-register.md` R-10](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+
+### Shared-instance vs controller-stub
+
+The two worker strategies now have symmetric lifecycle machinery but preserve their **opposing state-sharing contracts** on purpose:
+
+| Aspect | ProcessWorker (RFC-008) | ThreadWorker (RFC-009) |
+|---|---|---|
+| Agent instance | Copy via pickle (child holds its own) | **Shared** (same Python object) |
+| Parent-side publish/subscribe | Not proxied (silent no-op; §2.9) | **Effective** — parent and worker share `_broker` / `_dispatcher` / `__topic_handlers` |
+| `agent.config['work_queue']` | Copy — `child_config = dict(agent.config)` | **In-place mutation** — same dict, same queue reference |
+| Runtime state (broker/dispatcher/handlers) | Populated in child only | **Populated in shared object** — visible to caller |
+| Cancellation primitive | `Process.terminate() / kill()` (SIGTERM/SIGKILL) | **None** — Python threads cannot be safely cancelled |
+
+The shared-instance contract is the reason parent-side `agent.publish()` / `subscribe()` / `publish_sync()` *work* in thread mode but not in process mode; RFC-009 §7.15 preserves this deliberately.
+
+### ThreadWorker state machine
+
+Reuses the RFC-008 `WorkerState` enum and adds two ThreadWorker-only terminal states:
+
+- `STOP_TIMEOUT` — cooperative stop deadline expired; thread still alive; retriable.
+- `FAILED` — `_activate` raised an `Exception` (not `BaseException`); captured into `last_exception`; thread ended.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> STARTING: start()
+    STARTING --> RUNNING: state set BEFORE thread.start()<br/>(closes _run_target self-exit race)
+    STARTING --> START_FAILED: thread.start() raised<br/>→ work_thread cleared
+    NEW --> NEW: stop() (no-op returns True — RFC-009 §7.6)
+    RUNNING --> STOPPING: stop() (first caller)
+    STOPPING --> STOPPED: join(graceful_timeout) OK<br/>_last_exception is None
+    STOPPING --> FAILED: join(graceful_timeout) OK<br/>_last_exception set (from _run_target)
+    STOPPING --> STOP_TIMEOUT: join(graceful_timeout) expired<br/>thread still alive; ref retained
+    RUNNING --> FAILED: _run_target caught Exception<br/>→ state=FAILED, last_exception set
+    RUNNING --> STOPPED: _activate self-exit<br/>→ RUNNING → STOPPED (only from RUNNING)
+    STOP_TIMEOUT --> STOPPING: stop() retry allowed<br/>fresh budget, best-effort re-send terminate
+    STOPPED --> STOPPED: idempotent replay (returns cached True)
+    FAILED --> FAILED: stop() returns True if thread not alive
+    START_FAILED --> START_FAILED: stop() no-op returning True
+    STARTING --> STARTING: stop() raises RuntimeError<br/>start() raises RuntimeError
+    STOPPING --> STOPPING: concurrent stop() bounded-wait<br/>on _stop_complete_event
+```
+
+Key implementation notes (RFC-009 §0 divergences from the RFC design):
+
+- **`start()` sets `RUNNING` BEFORE `thread.start()`** (not after) to close a race where `_run_target` may run immediately, self-exit, and try to transition to `STOPPED` — but observe `STARTING` and skip.
+- **`_run_target` catches `Exception` only** — RFC-009 §7.11; `BaseException` propagates and the thread dies without state update.
+- **Thread reference retained on `STOP_TIMEOUT`** — `is_working()` still reflects real liveness; retry `stop()` re-joins the same thread with a fresh budget.
+
+### Bounded stop contract
+
+`stop(graceful_timeout_s: float = 5.0) -> bool`:
+
+1. **Short state-lock section** (no I/O / join / send_data / logger inside — RFC-009 §F lock hygiene): dispatch on current state, transition first caller `RUNNING`/`STOP_TIMEOUT` → `STOPPING` and clear `_stop_complete_event`.
+2. **Lock-external**: best-effort `send_data('terminate')` (swallow exceptions).
+3. **Lock-external**: `work_thread.join(graceful_timeout_s)` (swallow exceptions).
+4. **Read** `work_thread.is_alive()`.
+5. **Under lock, atomic**:
+   - alive → `STOP_TIMEOUT`, `_last_stop_result = False`
+   - dead + `last_exception` → `FAILED`, `_last_stop_result = True`
+   - dead → `STOPPED`, `_last_stop_result = True`
+6. **`finally` (unconditional)**: `_stop_complete_event.set()` — concurrent waiters never hang even if the escalation body raised.
+7. Lock-external log (INFO on success; **WARNING on timeout** including the daemon interpreter-exit caveat).
+
+**Concurrent stop waiter (bounded)**: `_stop_complete_event.wait(graceful_timeout_s + 0.1)` — coordination margin 0.1s. On event completion → return cached `_last_stop_result`. On event timeout → read `Thread.is_alive()`, log WARNING, return `not alive`. **Never unbounded**.
+
+### Agent.terminate contract
+
+- **Signature unchanged**; never-raise contract preserved.
+- **Order preserved**: `dispatcher.stop()` (RFC-004 bounded) before `worker.stop()` (RFC-008 / RFC-009 bounded).
+- `dispatcher.stop()` wrapped in `try: … except Exception:` — a broken dispatcher does not block the worker cleanup path.
+- `worker.stop()` wrapped in `try: … except Exception:` — misbehaving worker `.stop()` never propagates to the caller.
+- Observes `worker.stop()` return value: **`False` → WARNING** with `state`, `work_thread`, and the daemon interpreter-exit caveat; `True` / `None` (legacy `FakeWorker`) → silent.
+- **Bounded total wall time** ≈ `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s ≈ 10s` at defaults.
+- **Bounded return only guarantees `terminate()` itself returns**. If worker ended at `STOP_TIMEOUT` and `daemon=False`, Python interpreter shutdown may still block on that thread. This is a documented architectural limitation (see below).
+
+### End-to-end sequence — thread-mode terminate under `broker.stop()` wedge
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Caller / test
+    participant A as Agent (thread mode)
+    participant TW as ThreadWorker
+    participant T as worker thread
+    participant B as (wedged) Broker
+    P->>A: terminate()
+    A->>A: dispatcher.stop()  (bounded — RFC-004)
+    A->>TW: worker.stop(graceful_timeout_s=5.0)
+    TW->>TW: state RUNNING → STOPPING (under _state_lock)<br/>_stop_complete_event.clear()
+    TW->>T: work_queue.put('terminate')  (lock-external, best-effort)
+    TW->>T: work_thread.join(5.0)         (lock-external, bounded)
+    T->>T: reads 'terminate' → _terminate() → sleep(1) → __terminate_event.set()
+    T->>T: work loop exits
+    T->>T: __deactivating() runs
+    T->>B: broker.stop()
+    Note over B: WEDGED — never returns
+    TW-->>TW: 5.0s elapsed<br/>work_thread.is_alive() == True
+    TW->>TW: state STOPPING → STOP_TIMEOUT<br/>_last_stop_result = False<br/>_stop_complete_event.set()
+    TW-->>A: return False
+    A->>A: logger.warning("worker did not stop within its deadline...")
+    A-->>P: terminate() returns (bounded)
+    Note over P,T: Worker thread is still alive.<br/>Because daemon=False,<br/>interpreter shutdown may still block.<br/>(RFC-009 §H / R-10.5)
+```
+
+Runtime evidence: `test_F1_agent_terminate_returns_bounded_when_broker_stop_wedges_and_logs_WARNING`, `test_F4_agent_terminate_never_raises_when_worker_stop_returns_False`, `test_C3_wedged_thread_returns_False_bounded_and_state_STOP_TIMEOUT`, `test_D1_STOP_TIMEOUT_retry_reaches_STOPPED_when_blocker_released`.
+
+### Exception observability
+
+- `_run_target` wrapper catches `Exception` only (RFC-009 §7.11 — deliberate; `BaseException` propagates).
+- On `Exception`: `self._last_exception = ex`, `logger.exception(...)`, state → `FAILED`.
+- New read-only properties on `ThreadWorker`: `state: WorkerState`, `last_exception: Optional[BaseException]`.
+- `is_working()` contract unchanged — reflects real `Thread.is_alive()`, not the abstract state.
+- **Limitation**: a `BaseException` (`KeyboardInterrupt` / `SystemExit` / `GeneratorExit`) crash in `_activate` leaves state unchanged and, after `stop()`, gets marked `STOPPED` — masking the crash. Signal-based cleanup or a separate tracker would be needed; deferred.
+
+### Daemon / interpreter-exit limitation
+
+- `work_thread.daemon = False` preserved (RFC-009 §7.13). Daemonising would trade a visible hang for silent mid-`__deactivating` corruption (broker teardown interrupted at interpreter exit).
+- **`stop()` returning bounded only guarantees `Agent.terminate()` itself returns.** A worker left in `STOP_TIMEOUT` is a live non-daemon thread; Python interpreter shutdown blocks on it.
+- **This risk is NOT resolved by RFC-009.** It is deliberately documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path. Tracked as [R-10.5](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+
+### R-10 sub-risk status
+
+| Sub-risk | Status |
+|---|---|
+| R-10.1 `ProcessWorker.stop` unbounded join | **Resolved** by RFC-008 escalation ladder (SIGTERM / SIGKILL) |
+| R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** by RFC-009 cooperative bounded stop |
+| R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` |
+| R-10.4 broker.stop() itself wedges | **Open / Runtime Confirmed** — surrounded by bounded worker; broker itself not bounded |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Open / Documented architectural limitation** — deliberate |
+
+---
+
+## 2.11 Unknowns
 
 - ~~**U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05~~ — **Resolved**: reproduced against a bounded self-echo FakeBroker in `tests/unit/core/test_agent_reply_behavior.py`, then fixed by RFC-003 (§2.7 update above).
 - **U-2.2**: Behaviour of MQTT topics containing `.` under paho v2 — assumed to be a normal character (only `+ # / $` are special), but not empirically tested against a broker.

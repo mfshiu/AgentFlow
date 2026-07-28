@@ -17,29 +17,33 @@ The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state
 - R.4 (publish_sync-vs-publish_sync collision) via [RFC-006](../rfc/RFC-006-publish-sync-topic-collision.md)
 - R-14 (partially — `__topic_handlers` slice) via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md), which also closed the R.6-1 / R.6-2 / R.6-3 residual risks from the RFC-006 cross-API characterisation
 - R-06 (partially — R-06.1 spawn pickle failure / R-06.2 unbounded `Process.join` / R-06.4 parent-child state divergence) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); R-06.3 heartbeat/watchdog and child-exception IPC remain Deferred / Open
+- R-10 (fully — R-10.1 ProcessWorker + R-10.2 ThreadWorker + R-10.3 Agent.terminate all bounded) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md) + [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md); R-10.4 broker.stop wedge and R-10.5 non-daemon interpreter-exit blocking remain Open (broker-lifecycle RFC required + documented architectural limitation)
 
 Current authoritative pytest command:
 
 ```bash
-PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/ -v
+PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
 ```
 
-Result as of 2026-07-28 (after RFC-008 implementation):
+Result as of 2026-07-28 (after RFC-009 implementation):
 
 ```
-289 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed  in ~26s combined
+324 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed  in ~34s
 ```
 
-Broken down:
-- Non-RFC-008 suite: **256 passed, 2 xfailed** in ~12 s
-- RFC-008 suite (`tests/unit/core/test_process_worker_lifecycle.py`): **33 passed** in ~14 s
+Broken down (single collected run):
+- RFC-009 suite (`tests/unit/core/test_thread_worker_lifecycle.py`): **35 passed** in ~6 s
+- RFC-008 suite (`tests/unit/core/test_process_worker_lifecycle.py`): **33 passed** in ~14 s (unchanged)
+- All other suites: **256 passed, 2 xfailed** in ~14 s (unchanged)
 
 The two remaining xfails (`test_both_callers_should_receive_own_response_with_shared_topic_wait`, `test_framework_should_support_multiple_handlers_per_topic`) are deferred to a future RFC on correlation ID / multi-handler fan-out.
 
 Historical intermediate results:
 - Pre-RFC-006/007: 216 passed / 0 xfailed.
 - Post-RFC-007 (2026-07-27): 256 passed / 2 xfailed.
-- Post-RFC-008 (2026-07-28): 289 passed / 2 xfailed (RFC-008 added 33 tests; no other suite changed).
+- Post-RFC-008 (2026-07-28): 289 passed / 2 xfailed (added 33 ProcessWorker tests).
+- Post-RFC-009 characterisation (2026-07-28): 312 passed / 2 xfailed (added 23 characterisation tests for the *broken* ThreadWorker).
+- Post-RFC-009 implementation (2026-07-28): **324 passed / 2 xfailed** (characterisation rewritten to the new contract; net +12 tests; ProcessWorker and other suites zero regression).
 
 Suite composition:
 
@@ -52,6 +56,7 @@ Suite composition:
 | `tests/unit/core/test_agent_publish_sync_concurrency.py` | R.4 (publish_sync-vs-publish_sync) characterization + fail-fast collision (RFC-006) + 2 aspirational xfails (correlation ID / multi-handler fan-out) | 21 + 2 xfail |
 | `tests/unit/core/test_agent_publish_sync_cross_api.py` | R.6-1 / R.6-2 / R.6-3 residual risks + handler registry ownership (RFC-007): fail-fast cross-API protection, HandlerRecord shape, atomic _on_message snapshot, lock hygiene | 19 |
 | `tests/unit/core/test_process_worker_lifecycle.py` | **R-06 (R-06.1 / R-06.2 / R-06.4) + Agent pickle protocol + ProcessWorker state machine / bounded escalation / concurrent-stop coordination / start-failure rollback / parent-child contract (RFC-008)** — 10 categories: A pickle × 8, B state-machine × 5, C real-spawn × 3, D restart guards × 2, E escalation × 3, F concurrent × 2, G start-failure × 3, H observability × 2, I parent-child × 1, J baseline × 4 | 33 |
+| `tests/unit/core/test_thread_worker_lifecycle.py` | **R-10 (R-10.1–R-10.3) + ThreadWorker WorkerState state machine (STOP_TIMEOUT + FAILED added) / bounded cooperative stop / STOP_TIMEOUT retry / concurrent-stop bounded coordination / start-failure rollback / `_run_target` Exception-only capture / `Agent.terminate` observes stop result and logs WARNING (RFC-009)** — 10 categories: A start × 4, B state machine + restart × 5, C bounded stop / STOP_TIMEOUT × 5, D retry × 3, E concurrent × 3, F Agent.terminate × 4, G self-exit × 1, H exception + FAILED × 6, I observability API × 2, J baseline × 2 | 35 |
 | `tests/unit/test_mqtt_broker_reconnect.py` | R-03 characterization + subscription registry + reconnect recovery + planned/unexpected disconnect classification + stop-vs-callback races (RFC-005) | 48 |
 | `tests/unit/test_mqtt_broker_start.py` | MqttBroker start + wait paths | 13 |
 | `tests/unit/test_mqtt_broker_auth.py` | username / password walrus edges | 6 |
@@ -80,6 +85,18 @@ Coverage changes since baseline:
   - **I. Parent-child contract (1 test)** — parent-side `Agent._broker` / `_dispatcher` / `__topic_handlers` / `_children` / `_parents` all stay uninitialised after child starts (RFC-008 §6.5 architectural constraint verified).
   - **J. Baseline preservation (4 tests)** — `Worker.__init__` still forces `spawn`; `ThreadWorker` still returns `threading.Event`; `ProcessWorker` still returns `mp.Event`; `_HandlerRecord` ownership survives pickle across the process boundary.
   - **R-06.3** (heartbeat / liveness / automatic restart) and **child exception forwarding** remain uncovered — Deferred / Open per RFC-008 scope.
+- **R-10 (R-10.2 + R-10.3 slices, ThreadWorker side)** — was uncovered by any bounded-lifecycle test until this phase; now covered by `tests/unit/core/test_thread_worker_lifecycle.py` (RFC-009):
+  - **A. Startup / thread properties (4 tests)** — `start()` creates a non-daemon `threading.Thread` and transitions state to `RUNNING`; original agent instance is used by identity; `agent.config['work_queue']` is mutated in place (shared-instance model preserved); broker / dispatcher / handler registry are shared by reference between caller and worker thread.
+  - **B. State machine + restart guards (5 tests)** — `stop()` before `start()` is a no-op returning `True`, state stays `NEW`, subsequent `start()` allowed; `start()` twice while `RUNNING` raises `RuntimeError`; `start()` after `STOPPED` raises `RuntimeError`; `start()` after `START_FAILED` (Thread.start OSError) raises `RuntimeError`; `START_FAILED` transition observed on `Thread.start()` failure.
+  - **C. Bounded stop / STOP_TIMEOUT (5 tests)** — source inspection: `stop` uses `join(graceful_timeout_s)` (no unbounded `.join()`); cooperative stop returns `True` fast; wedged `_activate` → `stop()` returns `False` within `~graceful_timeout_s`, state becomes `STOP_TIMEOUT`; thread reference retained on `STOP_TIMEOUT`; `is_working()` returns `True` during `STOP_TIMEOUT` (reflects real `Thread.is_alive()`).
+  - **D. STOP_TIMEOUT retry (3 tests)** — retry after blocker released → `STOPPED`; retry while still wedged → stays `STOP_TIMEOUT`; repeated `stop()` after `STOPPED` returns `True` idempotently with no extra 'terminate' sentinel enqueued (queue size preserved).
+  - **E. Concurrent stop semantics (3 tests)** — 5 concurrent callers through a `threading.Barrier` all observe the same cached `bool`, and **exactly 1** `'terminate'` sentinel reaches the queue (state-lock linearisation); source inspection: waiter uses `_stop_complete_event.wait(<timeout>)` — never bare `.wait()`; behavioural: waiter returns bounded within `graceful_timeout_s + 0.1s` coordination margin even when the completion event never fires (bypass first-caller flow via direct state manipulation).
+  - **F. Agent.terminate (4 tests)** — wedged `broker.stop` → `terminate()` returns bounded (`worker.stop` timeout ~0.3s) and logs a WARNING containing `stop_timeout` / `did not stop`; wedged handler alone does NOT hang `terminate` (dispatcher.stop is bounded, worker thread cooperates); source-inspection: `dispatcher.stop()` still precedes `worker.stop()`; `terminate()` **never raises** when `worker.stop()` returns `False`.
+  - **G. Self-exit (1 test)** — `_activate` returns without receiving `'terminate'` → `_run_target` marks `RUNNING → STOPPED`; subsequent `stop()` reaches the `STOPPED` shortcut in `< 50ms`.
+  - **H. Exception observability + FAILED state (6 tests)** — `Thread.start()` failure → `START_FAILED`, `work_thread` cleared, original exception re-raised; `_activate` raises `Exception` → captured into `last_exception`, state → `FAILED`, `logger.exception` fired; source inspection: `_run_target` uses `except Exception` (not `except BaseException`, not bare `except:`); `stop()` from `FAILED` returns `True` without another join; `last_exception` is `None` after a clean run; `STOP_TIMEOUT` is NOT `STOPPED` when thread is still alive (guards against silently marking clean-exit).
+  - **I. Observability API surface (2 tests)** — `ThreadWorker` exposes `state` and `last_exception` properties (parity with `ProcessWorker.state` / `.exitcode`); `daemon=False` baseline preserved (R-10.5 open residual documentation).
+  - **J. Baseline preservation (2 tests)** — `Worker.__init__` still forces `spawn` (unchanged by RFC-009); `ThreadWorker.create_event()` returns `threading.Event`.
+  - **R-10.4** (broker.stop wedge — root cause) and **R-10.5** (non-daemon interpreter-exit blocking under STOP_TIMEOUT) remain **Open**. R-10.4 requires a broker-lifecycle RFC; R-10.5 is a deliberate architectural trade-off documented in `ThreadWorker` / `stop()` / `Agent.terminate` docstrings and every WARNING log emitted by the timeout path.
 
 Legacy trees (`unit_test/`, `exe_test/`) remain excluded from pytest collection via `pyproject.toml` `norecursedirs`. No change to §6.1–6.7 inventory.
 
@@ -193,7 +210,7 @@ Cross-referenced with `05-risk-register.md`.
 | R-07 handler BaseException | ✓ |
 | R-08 parent-side publish silent failure | ✓ |
 | R-09 topic sanitisation | ✓ |
-| R-10 `join()` without timeout on stuck handler | ✓ |
+| R-10 `join()` without timeout on stuck handler | **Resolved 2026-07-28 (RFC-008 + RFC-009); covered by `tests/unit/core/test_process_worker_lifecycle.py` (33 tests) + `tests/unit/core/test_thread_worker_lifecycle.py` (35 tests across 10 categories A–J).** R-10.1 ProcessWorker bounded escalation (RFC-008). R-10.2 ThreadWorker bounded cooperative stop with STOP_TIMEOUT retry (RFC-009): `stop(graceful_timeout_s=5.0) -> bool`, wedged → `STOP_TIMEOUT`, retriable; thread reference retained; `is_working()` reflects true `Thread.is_alive()`. R-10.3 `Agent.terminate` bounded: `try/except` around `dispatcher.stop()` and `worker.stop()`, WARNING on `False` return, never raises, bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s`. Concurrent stop waiters use bounded `_stop_complete_event.wait(<timeout>)`. `_run_target` catches Exception only (not BaseException) — captured to `last_exception`, state → `FAILED`. **R-10.4** broker.stop() itself wedges and **R-10.5** non-daemon interpreter-exit blocking under STOP_TIMEOUT both remain **Open** — the RFC deliberately bounds the worker without daemonising or force-cancelling; documented in three docstrings and every WARNING log emitted by the timeout path. |
 | R-13 publish-result observability | **Resolved 2026-07-26 (RFC-002); covered by `tests/unit/core/test_agent_publish_errors.py`.** Note: broker-side paho `MessageInfo` (rc/mid) is still discarded — that residual observability gap is deferred to a future RFC. |
 | R-14 dict concurrency | **Partially Resolved 2026-07-27 (RFC-007); `__topic_handlers` slice covered by `tests/unit/core/test_agent_publish_sync_cross_api.py`.** All registry mutations and reads under `_handlers_lock`; `_HandlerRecord` ownership tagging; cross-API fail-fast on PUBLISH_SYNC-reserved topics; NORMAL rebind preserved; `_on_message` single-snapshot lookup. `_children` and `_parents` slice remains Open — deferred to a future RFC. |
 | R-18 no unregister / heartbeat | ✓ |
