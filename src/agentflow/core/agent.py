@@ -249,18 +249,64 @@ class Agent(BrokerNotifier):
 
 
     def terminate(self):
+        """Fire-and-forget termination — never raises.
+
+        Order (unchanged, RFC-004 / RFC-009 §7.16):
+          1. dispatcher.stop() — bounded per RFC-004
+          2. worker.stop()     — bounded per RFC-008 (ProcessWorker)
+                                 or RFC-009 (ThreadWorker)
+
+        RFC-009 §E: this method inspects the worker.stop() return
+        value. Post-RFC-009 ThreadWorker returns bool (True=stopped,
+        False=STOP_TIMEOUT). When False, we log a WARNING with the
+        worker state; we do NOT raise. Legacy workers that return
+        None (e.g. FakeWorker in tests) are treated as success.
+
+        Bounded return of terminate() ONLY guarantees this method
+        itself returns. If the worker ended at STOP_TIMEOUT and the
+        thread is non-daemon (RFC-009 §7.13), Python interpreter
+        shutdown may still block on that thread. This is a
+        documented limitation, not a bug — see RFC-009 §H.
+        """
         logger.info(self.M(f"self.__agent_worker: {self._agent_worker}"))
 
         # RFC-004: stop the dispatcher first so consumer threads can
         # drain their queue while the broker is still up. Idempotent —
         # safe to call from both terminate() and __deactivating().
         if self._dispatcher is not None:
-            self._dispatcher.stop()
+            try:
+                self._dispatcher.stop()
+            except Exception as ex:
+                # Preserve fire-and-forget contract: dispatcher.stop
+                # is already bounded and idempotent (RFC-004); log
+                # any exception and continue to worker.stop().
+                logger.exception(self.M(
+                    f"terminate: dispatcher.stop() raised: {ex!r}"
+                ))
 
-        if self._agent_worker:
-            self._agent_worker.stop()
-        else:
+        if not self._agent_worker:
             logger.warning(self.M(f"The agent might not have started yet."))
+            return
+
+        # RFC-009 §E: bounded worker.stop() with observed return value.
+        try:
+            stop_result = self._agent_worker.stop()
+        except Exception as ex:
+            logger.exception(self.M(
+                f"terminate: worker.stop() raised: {ex!r}"
+            ))
+            return
+
+        if stop_result is False:
+            state = getattr(self._agent_worker, 'state', 'unknown')
+            thread = getattr(self._agent_worker, 'work_thread', None)
+            logger.warning(self.M(
+                f"terminate: worker did not stop within its deadline; "
+                f"state={state}, thread={thread!r}. terminate() has "
+                f"returned but the worker thread may still be alive; "
+                f"because daemon=False, Python interpreter shutdown "
+                f"may still block on this thread (see RFC-009 §H)."
+            ))
 
 
 
