@@ -539,7 +539,140 @@ Runtime evidence: `test_F1_agent_terminate_returns_bounded_when_broker_stop_wedg
 
 ---
 
-## 2.11 Unknowns
+## 2.11 MqttBroker bounded-shutdown lifecycle (post-RFC-010, 2026-07-28)
+
+> **Update (2026-07-28)**: `MqttBroker.stop()` now has a bounded, deterministic contract that mirrors the RFC-008 / RFC-009 worker-layer shape. The R-10.4 "wedged broker.stop hangs everything" scenario is closed. Only R-10.5 (non-daemon worker thread blocking interpreter exit) remains open — RFC-010 explicitly does NOT resolve it. See [RFC-010](../rfc/RFC-010-broker-bounded-shutdown.md) and [`docs/audit/05-risk-register.md` R-10](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+
+### Broker-side state machine
+
+Reuses the RFC-008 / RFC-009 `WorkerState` enum with one MqttBroker-only addition:
+
+- `STOP_TIMEOUT` (existing) — helper thread survived the deadline; retriable.
+- `STOP_FAILED` (new in RFC-010) — helper thread exited abnormally without setting `_stop_helper_completed_normally=True` (e.g. `BaseException` propagated). Terminal; cached `False`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> STARTING: start()
+    STARTING --> RUNNING: _on_connect(rc=0)<br/>(same lock section sets _connected=True)
+    STARTING --> START_FAILED: start() raised (TimeoutError / ConnectionError)<br/>→ start's inline cleanup runs
+    NEW --> NEW: stop() (pure no-op returns True — RFC-010 §7.5)
+    STARTING --> STARTING: stop() raises RuntimeError<br/>(RFC-010 modification 3)
+    RUNNING --> STOPPING: stop() (first caller)<br/>same lock section:<br/>_stopping=True<br/>_connected=False<br/>_connect_ok=False<br/>_connected_evt.clear()<br/>_stop_complete_event.clear()
+    STOPPING --> STOPPED: helper join OK + completed_normally=True<br/>(with or without captured paho Exception)
+    STOPPING --> STOP_FAILED: helper join OK + completed_normally=False<br/>(BaseException propagated)
+    STOPPING --> STOP_TIMEOUT: helper join(graceful_timeout_s) expired<br/>helper still alive; retained
+    STOP_TIMEOUT --> STOPPING: stop() retry — SAME helper re-joined<br/>(RFC-010 modification 1)<br/>no new spawn; no new paho calls
+    STOPPED --> STOPPED: idempotent replay (returns cached True)
+    STOP_FAILED --> STOP_FAILED: idempotent replay (returns cached False)
+    START_FAILED --> START_FAILED: stop() no-op returning True<br/>(fences _stopping for late callbacks)
+    STOPPING --> STOPPING: concurrent stop() bounded-wait on _stop_complete_event
+```
+
+**Single-helper invariant (RFC-010 modification 1)**: same MqttBroker lifecycle → at most ONE helper thread → at most ONE (`disconnect` + `loop_stop`) pair reaches paho. Verified by `test_C23_STOP_TIMEOUT_retry_reuses_same_helper_no_new_disconnect_loop_stop`.
+
+### Bounded stop contract
+
+`stop(graceful_timeout_s: float = 5.0) -> bool`:
+
+1. **Short state-lock section** (no I/O / join / logger — lock hygiene). Dispatch on current state; at RUNNING → STOPPING transition, fence **all** active-connection flags in the SAME lock section (§G modification 4).
+2. **Lock-external** first-caller path: spawn `daemon=True` helper (or re-join existing helper on `STOP_TIMEOUT` retry).
+3. **Bounded** `helper.join(graceful_timeout_s)`.
+4. **Under lock**, atomic outcome:
+   - alive → `STOP_TIMEOUT`, `_last_stop_result=False`
+   - dead + `completed_normally=True` → `STOPPED`, `True`
+   - dead + `completed_normally=False` → `STOP_FAILED`, `False`
+5. **`finally` (unconditional)**: `_stop_complete_event.set()` — waiters never hang.
+6. Lock-external log (INFO / WARNING with daemon caveat / ERROR on STOP_FAILED).
+
+**Concurrent stop waiter (bounded)**: `_stop_complete_event.wait(graceful_timeout_s + 0.1)`. On event timeout → read `helper.is_alive()`, log WARNING, return `not alive`. Never unbounded.
+
+### Callback-after-stop fencing
+
+Three paths fixed (RFC-010 §F modification 4):
+
+- **`_on_message`** — silent drop under `_stopping` check; notifier NOT invoked (fixes pre-RFC-010 leak).
+- **`_on_connect(rc=0)`** — entire callback body gated by initial `_stopping` check. Set → skip: no `_connect_ok=True`, no `_connected=True`, no state transition, no recovery, no notifier call, no `_connected_evt.set()`.
+- **`_on_connect(rc!=0)`** — also gated: skip → no writes.
+
+**`_on_disconnect`** — unchanged (RFC-005 semantics preserved). Diagnostic-only:
+- Updates `_connected=False` (allowed)
+- Updates `_last_disconnect_was_planned` (allowed)
+- Does NOT touch `_stopping`
+- Does NOT trigger recovery
+
+### End-to-end sequence — wedged paho disconnect
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Caller (worker thread or test)
+    participant B as MqttBroker
+    participant H as helper thread (daemon=True)
+    participant C as paho Client
+    P->>B: stop(graceful_timeout_s=5.0)
+    B->>B: _state_lock: state RUNNING → STOPPING<br/>_stopping=True<br/>_connected=False, _connect_ok=False<br/>_connected_evt.clear()<br/>_stop_complete_event.clear()
+    B->>H: threading.Thread(daemon=True).start()
+    H->>C: client.disconnect()
+    Note over C: WEDGED — never returns
+    B->>B: helper.join(5.0)  (bounded)
+    B-->>B: 5.0s elapsed; helper still alive
+    B->>B: _state_lock: state → STOP_TIMEOUT<br/>_last_stop_result=False<br/>_stop_complete_event.set()
+    B-->>P: return False
+    Note over P: caller returned bounded.<br/>Agent.__deactivating observes False,<br/>logs WARNING with state + last_stop_exception.<br/>Helper thread stays alive (daemon — won't block exit).<br/>Worker thread (daemon=False) STILL alive → R-10.5 residual.
+```
+
+Retry semantics (RFC-010 modification 1):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Caller
+    participant B as MqttBroker (STOP_TIMEOUT)
+    participant H as SAME helper thread
+    P->>B: stop(graceful_timeout_s=5.0)  (retry)
+    B->>B: _state_lock: STOP_TIMEOUT → STOPPING<br/>_stop_complete_event.clear()<br/>is_retry=True
+    Note over B: NO new helper spawn.<br/>NO new disconnect / loop_stop call.
+    B->>H: helper.join(5.0)  (re-join same helper)
+    alt paho unwedged, helper completed normally
+        H-->>B: exit
+        B->>B: state → STOPPED, True
+    else paho still wedged
+        B->>B: state → STOP_TIMEOUT, False
+    else helper died abnormally (BaseException)
+        B->>B: state → STOP_FAILED, False
+    end
+    B-->>P: return bool
+```
+
+Runtime evidence: `test_C21` / `test_C22` (bounded timeout for disconnect/loop_stop wedges), `test_C23` (single-helper retry — verified via `fake_client.disconnect.call_count == 1` across timeout + retry + cleanup), `test_C24` (retry reaches STOPPED after release), `test_D33_BaseException_in_helper_marks_STOP_FAILED_not_STOPPED`.
+
+### Agent.__deactivating integration
+
+`Agent.terminate` signature and behaviour **unchanged**; never-raise contract preserved.
+
+`Agent.__deactivating` (private) observes `broker.stop()`'s new `bool` return:
+
+- `False` → log WARNING with `state`, `last_stop_exception`, and daemon interpreter-exit caveat.
+- `True` → silent.
+- `None` (legacy `EmptyBroker` / third-party brokers) → treated as success via `stopped is False` guard.
+- Any exception from `broker.stop()` → `logger.exception` + swallow (never-raise preserved).
+
+**Bounded return of `__deactivating()` only guarantees this method returns.** If the broker ended at `STOP_TIMEOUT` and a worker thread with `daemon=False` is waiting on it, Python interpreter shutdown may still block on the worker thread. RFC-010 explicitly does NOT resolve this (R-10.5 residual).
+
+### R-10 sub-risk status (post-RFC-010)
+
+| Sub-risk | Status |
+|---|---|
+| R-10.1 `ProcessWorker.stop` unbounded join | **Resolved** (RFC-008) |
+| R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** (RFC-009) |
+| R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** (RFC-008 + RFC-009) |
+| R-10.4 broker.stop() itself wedges | **Resolved 2026-07-28** (RFC-010 — daemon helper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED`, single-helper retry, callback fencing) |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Open / Documented architectural limitation** — RFC-010 helper is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on broker still does |
+
+---
+
+## 2.12 Unknowns
 
 - ~~**U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05~~ — **Resolved**: reproduced against a bounded self-echo FakeBroker in `tests/unit/core/test_agent_reply_behavior.py`, then fixed by RFC-003 (§2.7 update above).
 - **U-2.2**: Behaviour of MQTT topics containing `.` under paho v2 — assumed to be a normal character (only `+ # / $` are special), but not empirically tested against a broker.

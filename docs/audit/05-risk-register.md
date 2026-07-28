@@ -486,8 +486,8 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 | **R-10.1** | `ProcessWorker.stop` unbounded `Process.join()` — wedged child blocks caller forever | **RESOLVED** (RFC-008) — bounded escalation `send terminate → join(graceful) → terminate() → join → kill() → join`, total ≤ 8s at defaults |
 | **R-10.2** | `ThreadWorker.stop` unbounded `Thread.join()` — wedged worker thread blocks caller forever | **RESOLVED** (RFC-009) — bounded cooperative `join(graceful_timeout_s)`, `stop() -> bool`, wedged → `STOP_TIMEOUT` state, retriable |
 | **R-10.3** | `Agent.terminate()` unbounded wait chained through worker.stop | **RESOLVED** (RFC-008 + RFC-009) — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` (≈ 10s at defaults); logs WARNING on worker timeout; never raises |
-| **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **OPEN / Runtime Confirmed** — surrounded by bounded worker (RFC-009 §7.17) but broker itself is not bounded; future broker-lifecycle RFC required |
-| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption |
+| **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **RESOLVED** (RFC-010) — daemon helper-thread wrapper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED` states, single-helper retry, callback fencing |
+| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 confirms the helper thread is `daemon=True` (so helper alone does not block exit) but explicitly notes the worker thread waiting on `broker.stop()` still does |
 
 ### Resolution (R-10.1)
 
@@ -563,12 +563,96 @@ Four narrow, all in the bounded-shutdown / safety direction:
 
 ### Known residuals NOT resolved by RFC-009
 
-- **R-10.4 broker.stop() itself wedges** — RFC-009 bounds the worker but does not bound the broker. A wedged `broker.stop()` inside the worker thread now surfaces cleanly as `STOP_TIMEOUT`, but the underlying broker hang is not fixed. Deferred to a future broker-lifecycle RFC.
-- **R-10.5 non-daemon interpreter-exit blocking** — a `STOP_TIMEOUT` worker leaves a live non-daemon thread; Python interpreter shutdown will still block on it. RFC-009 §7.13 keeps `daemon=False` on purpose (daemonising would trade a visible hang for silent mid-`__deactivating` corruption). Documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path.
-- **`BaseException` observability** — `_run_target` catches `Exception` only (RFC-009 §7.11); a `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` from `_activate` leaves state unchanged and, after `stop()`, gets marked `STOPPED` — masking the crash. A signal-based cleanup layer or a separate tracker would be needed to observe this. Deferred.
+- ~~**R-10.4 broker.stop() itself wedges**~~ — **RESOLVED 2026-07-28 (RFC-010)**. See "Resolution (R-10.4)" below.
+- **R-10.5 non-daemon interpreter-exit blocking** — a `STOP_TIMEOUT` worker leaves a live non-daemon thread; Python interpreter shutdown will still block on it. RFC-009 §7.13 keeps `daemon=False` on purpose (daemonising would trade a visible hang for silent mid-`__deactivating` corruption). Documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path. **RFC-010 does NOT resolve this** — the broker helper thread is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on `broker.stop()` still does.
+- **`BaseException` observability** — `_run_target` catches `Exception` only (RFC-009 §7.11); a `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` from `_activate` leaves state unchanged and, after `stop()`, gets marked `STOPPED` — masking the crash. A signal-based cleanup layer or a separate tracker would be needed to observe this. Deferred. (RFC-010 fixed the equivalent broker-side variant via `STOP_FAILED` — worker-side parity is future work.)
 - **Heartbeat / watchdog / automatic restart** — RFC-009 Out-of-scope (parity with RFC-008).
 - **Config-key surface** for `graceful_timeout_s` — deferred; method-arg only in first-phase.
 - **Lifecycle metrics** on `ThreadWorker` — deferred; parity with RFC-008 §7.18.
+
+### Resolution (R-10.4)
+
+- **Resolved on**: 2026-07-28 — see [RFC-010 Broker bounded shutdown](../rfc/RFC-010-broker-bounded-shutdown.md) (Implemented).
+
+**Final implementation** (RFC-010 first-phase scope):
+
+**WorkerState extension** (`src/agentflow/core/agent_worker.py`) — one new member added to the RFC-008 / RFC-009 enum:
+
+- `STOP_FAILED` — MqttBroker-only. Helper thread exited abnormally without setting the completed-normally marker (e.g. `BaseException` propagated out of paho). Terminal; retry via `stop()` replays cached `False`.
+
+**MqttBroker rewrite** (`src/agentflow/broker/mqtt_broker.py`):
+
+- Full state machine `NEW → STARTING → RUNNING → STOPPING → STOPPED / STOP_TIMEOUT / STOP_FAILED / START_FAILED`, protected by the existing `_state_lock`.
+- New read-only properties: `state`, `last_stop_exception`.
+- `stop(graceful_timeout_s=5.0) -> bool` — cooperative bounded shutdown via a `daemon=True` helper thread that runs `disconnect + loop_stop` with per-call `except Exception` isolation. `join(graceful_timeout_s)` in the caller; under lock: alive → `STOP_TIMEOUT + False`; dead + `_stop_helper_completed_normally=True` → `STOPPED + True`; dead + not-normally-completed → `STOP_FAILED + False`. `finally` unconditionally sets `_stop_complete_event` so waiters never hang.
+- **Single-helper retry (RFC-010 modification 1)**: same MqttBroker lifecycle → at most ONE helper thread → at most ONE (`disconnect + loop_stop`) pair to paho. `STOP_TIMEOUT` retry re-joins the SAME helper; does not spawn a new one; does not re-issue paho calls.
+- **Concurrent stop coordination**: `_stop_complete_event.wait(graceful_timeout_s + 0.1s)` — coordination margin bounded; on event timeout, reads `helper.is_alive()` and returns `not alive` with WARNING log. No bare `.wait()` anywhere.
+- **`STARTING.stop()` raises `RuntimeError`** (first-phase) — avoids disconnect/loop_stop on a half-initialised client.
+- **State cleanup at stop linearization** — flipping `_stopping=True` at the RUNNING → STOPPING transition is accompanied by immediate `_connected=False`, `_connect_ok=False`, `_connected_evt.clear()` in the same lock section (RFC-010 §G modification 4).
+- **Full callback fencing** (RFC-010 §F modification 4):
+  - `_on_message` — silent drop when `_stopping`; notifier NOT invoked.
+  - `_on_connect(rc=0)` — entire body gated; skip → no `_connect_ok` write, no `_connected=True`, no state transition, no recovery, no notifier call, no `_connected_evt.set()`.
+  - `_on_connect(rc!=0)` — also gated: skip → no writes.
+  - `_on_disconnect` — unchanged (RFC-005): still updates `_connected=False` + `_last_disconnect_was_planned` diagnostics; does NOT touch `_stopping`; does NOT trigger recovery.
+- **Exception isolation** (RFC-010 §7.8-§7.9):
+  - `disconnect` `Exception` does NOT prevent `loop_stop` (resource-leak fix vs the pre-RFC-010 behaviour).
+  - First captured `Exception` retained in `_last_stop_exception` (earlier is more diagnostic).
+  - `BaseException` propagates; helper dies with `completed_normally=False`; state → `STOP_FAILED` (not `STOPPED`).
+
+**Agent.__deactivating** (`src/agentflow/core/agent.py`):
+
+- `Agent.terminate` signature and behaviour **unchanged**; never-raise contract preserved.
+- `__deactivating` observes `broker.stop()`'s new `bool` return:
+  - `False` → log WARNING with `state`, `last_stop_exception`, and daemon interpreter-exit caveat.
+  - `True` → silent.
+  - `None` (legacy brokers) → treated as success via `stopped is False` guard.
+- Wraps `broker.stop()` in `try/except Exception` — misbehaving broker `.stop()` never propagates.
+
+### Stop contract summary (updated for RFC-010)
+
+| Trigger | ProcessWorker (RFC-008) | ThreadWorker (RFC-009) | MqttBroker (RFC-010) |
+|---|---|---|---|
+| Cooperative | mp Queue `terminate` | threading Queue `terminate` | paho `disconnect` + `loop_stop` on daemon helper |
+| Escalation | SIGTERM → SIGKILL | none (Python threads not cancellable) | none (helper is contained; caller returns bounded) |
+| Timeout return | `Optional[int]` exitcode | `bool` | `bool` |
+| Timeout state | `STOPPED` (SIGKILL) | `STOP_TIMEOUT` (retriable) | `STOP_TIMEOUT` (retriable — same helper re-joined) |
+| Abnormal exit | (n/a — process exit code covers) | `FAILED` (Exception captured) | `STOP_FAILED` (BaseException / abnormal helper exit) |
+| Restart | Not supported | Not supported | Not supported |
+| Concurrent stop | `_stop_complete_event.wait()` | `_stop_complete_event.wait(t + 0.1)` | `_stop_complete_event.wait(t + 0.1)` |
+| Daemon | `daemon=False` | `daemon=False` | helper `daemon=True` |
+| Force-kill primitive | `Process.kill()` | none | none |
+| Interpreter-exit blocking risk | none (SIGKILL) | **YES** (R-10.5) | helper OK; worker still R-10.5 |
+
+### Runtime verification (as of 2026-07-28)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- RFC-010 dedicated file `tests/unit/test_mqtt_broker_shutdown.py` — **53 passed** in ~2 s.
+- `tests/unit/test_mqtt_broker_reconnect.py` — **48 passed** unchanged (2 tests refactored to prime broker to RUNNING before stop; RFC-005 semantics preserved).
+- `tests/unit/core/test_thread_worker_lifecycle.py` — **35 passed** unchanged (RFC-009 preserved).
+- `tests/unit/core/test_process_worker_lifecycle.py` — **33 passed** unchanged (RFC-008 preserved).
+- Full combined regression: **377 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in ~34 s.
+- 2 xfails preserved from RFC-007 (correlation ID / multi-handler fan-out — deferred).
+- Zero regression across R-02 (27) / R-03 (48) / R-04 (33) / R-05 (21) / R-13 (46) / RFC-006 (21) / RFC-007 (19) / RFC-008 (33) / RFC-009 (35) — combined **283 tests pass unchanged**.
+
+### Observable behavioural changes
+
+Four narrow, all in the bounded-shutdown / safety direction:
+
+1. `MqttBroker.stop()` now returns `bool` (was `None`). Return-type widening is source-compatible; no in-tree caller (except `Agent.__deactivating`, which was updated) inspected the old return value.
+2. `MqttBroker._on_message` after `stop()` is now a silent drop (was: still forwarded to notifier). Bug fix — no in-tree caller depends on late delivery.
+3. `MqttBroker._on_connect(rc=0)` after `stop()` no longer writes `_connect_ok=True` and no longer sets `_connected_evt`. Bug fix — no in-tree caller reads either post-stop.
+4. `Agent.__deactivating` now logs a WARNING when `broker.stop()` returns `False`. Signature unchanged, never-raise contract unchanged.
+
+### Known residuals NOT resolved by RFC-010
+
+- **R-10.5 non-daemon interpreter-exit blocking** (see above) — remains OPEN / Documented.
+- **`MqttBroker.start()` / `client.connect()` bounded lifecycle** — `wait=True` `timeout` bounds the wait but not the connect syscall itself. Deferred to a future broker-start-lifecycle RFC.
+- **`MessageBroker` ABC timeout contract** — RFC-010 §7.16 explicitly keeps the ABC as `stop(self)`; unifying across `EmptyBroker` / third-party subclasses requires a separate RFC.
+- **`STARTING.stop()` coordination** — first-phase raises `RuntimeError`; deferred.
+- **Other broker implementations** (`RedisBroker`, `RosBroker`, `DdsBroker`) — R-22 flagged as unregistered / broken; not in RFC-010 blast radius.
+- **Reconnect policy / offline publish queue / broker clustering / failover** — RFC-005 owns reconnect; rest are deferred.
+- **Publish result observability** — paho `MessageInfo (rc/mid)` still discarded (RFC-002 residual).
+- **Paho helper resource completion guarantee** — a wedged paho socket may keep the helper alive even after `stop()` returns; helper is daemonised so it does not block interpreter exit, but the socket / file descriptor is not force-closed.
 
 ---
 
@@ -914,7 +998,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | **Resolved 2026-07-28 (RFC-008 + RFC-009)** — both workers bounded; `Agent.terminate` bounded return + WARNING on timeout. Residuals R-10.4 broker.stop wedge (Open) + R-10.5 non-daemon interpreter-exit (Open / Documented). | `Worker.stop()` join without timeout |
+| R-10 | High | High | **Resolved 2026-07-28 (RFC-008 + RFC-009 + RFC-010)** — worker layer bounded (RFC-008/009); broker layer bounded (RFC-010); `Agent.terminate` bounded return + WARNING on timeout. Only residual R-10.5 non-daemon interpreter-exit blocking remains **Open / Documented**. | `Worker.stop()` join without timeout |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
