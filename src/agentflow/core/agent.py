@@ -462,12 +462,45 @@ class Agent(BrokerNotifier):
         threading.Thread(target=stop).start()          
 
 
-    def __deactivating(self):        
+    def __deactivating(self):
+        """Fire-and-forget deactivation — never raises.
+
+        RFC-010 §H integration: observes `broker.stop()`'s bool
+        return. On False (STOP_TIMEOUT or STOP_FAILED per RFC-010),
+        logs a WARNING with the broker's state and last_stop_exception.
+        Legacy brokers whose `stop()` returns None are treated as
+        success. Any exception from `broker.stop()` is logged and
+        swallowed (parity with the Agent.terminate never-raise
+        contract).
+
+        Bounded return of __deactivating() only guarantees this
+        method returns; it does NOT guarantee the paho network
+        thread was reclaimed. See RFC-010 Appendix A / RFC-009 §H.
+        """
         self.on_terminating()
-            
+
         if self._broker:
-            self._broker.stop()
-        
+            try:
+                stopped = self._broker.stop()
+            except Exception as ex:
+                logger.exception(self.M(
+                    f"__deactivating: broker.stop() raised: {ex!r}"
+                ))
+            else:
+                if stopped is False:
+                    state = getattr(self._broker, 'state', 'unknown')
+                    last_exc = getattr(
+                        self._broker, 'last_stop_exception', None,
+                    )
+                    logger.warning(self.M(
+                        f"broker.stop() did not complete within its "
+                        f"deadline; state={state}, "
+                        f"last_stop_exception={last_exc!r}. "
+                        f"__deactivating has returned but the paho "
+                        f"network thread may still be alive. See "
+                        f"RFC-010 Appendix A / RFC-009 §H."
+                    ))
+
         self.on_terminated()
         
 

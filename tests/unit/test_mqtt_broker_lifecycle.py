@@ -19,11 +19,14 @@ def _prime_connected(broker, fake_client):
 
 
 # --------------------------------------------------------------------------
-# stop()
+# stop() — post-RFC-010: bounded helper-thread wrapper; NEW.stop() is a
+# no-op returning True. Tests that need paho calls now prime the broker
+# into RUNNING via `_prime_connected` first.
 # --------------------------------------------------------------------------
 
 def test_stop_calls_disconnect_and_loop_stop(broker, fake_client):
-    broker.stop()
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    assert broker.stop(graceful_timeout_s=2.0) is True
     fake_client.disconnect.assert_called_once_with()
     fake_client.loop_stop.assert_called_once_with()
 
@@ -32,14 +35,17 @@ def test_stop_calls_disconnect_before_loop_stop(broker, fake_client):
     call_order = []
     fake_client.disconnect.side_effect = lambda *a, **kw: call_order.append("disconnect")
     fake_client.loop_stop.side_effect = lambda *a, **kw: call_order.append("loop_stop")
-    broker.stop()
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    assert broker.stop(graceful_timeout_s=2.0) is True
     assert call_order == ["disconnect", "loop_stop"]
 
 
-def test_stop_can_be_called_without_prior_start(broker, fake_client):
-    # stop() reads only self._client, which exists after __init__.
-    broker.stop()  # must not raise
-    fake_client.disconnect.assert_called_once_with()
+def test_stop_before_start_is_noop_returning_True_no_paho_calls(broker, fake_client):
+    # Post-RFC-010: NEW.stop() is a pure no-op. Callbacks are not yet
+    # registered on paho, and there is no state to fence.
+    assert broker.stop() is True
+    fake_client.disconnect.assert_not_called()
+    fake_client.loop_stop.assert_not_called()
 
 
 # --------------------------------------------------------------------------

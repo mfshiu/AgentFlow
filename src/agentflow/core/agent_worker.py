@@ -33,6 +33,12 @@ class WorkerState(Enum):
     FAILED        — (RFC-009, ThreadWorker only) _activate raised an
                     Exception (not BaseException) that was captured
                     into `last_exception`; the thread ended.
+    STOP_FAILED   — (RFC-010, MqttBroker only) stop() helper thread
+                    exited abnormally without completing normally
+                    (e.g. BaseException propagated out of the helper).
+                    Terminal — retry via stop() replays the cached
+                    False result; construct a fresh broker to try
+                    a real shutdown.
     """
     NEW = 'new'
     STARTING = 'starting'
@@ -42,6 +48,7 @@ class WorkerState(Enum):
     START_FAILED = 'start_failed'
     STOP_TIMEOUT = 'stop_timeout'
     FAILED = 'failed'
+    STOP_FAILED = 'stop_failed'
 
 
 

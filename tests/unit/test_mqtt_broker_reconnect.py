@@ -351,21 +351,36 @@ def test_stop_sets_stopping_flag_before_client_disconnect(
     broker, fake_client,
 ):
     """The _stopping flag MUST be set before client.disconnect() so
-    any callback fired inline observes the flag."""
+    any callback fired inline observes the flag.
+
+    Post-RFC-010: NEW.stop() is a pure no-op that does NOT reach paho.
+    Prime the broker to RUNNING first so the helper thread actually
+    dispatches to paho.
+    """
+    _fire_connect(broker, fake_client)   # NEW → RUNNING
+    fake_client.disconnect.reset_mock()
+
     observed_stopping = []
 
     def observe_disconnect(*_a, **_kw):
         observed_stopping.append(broker.recovery_metrics()['stopping'])
 
     fake_client.disconnect.side_effect = observe_disconnect
-    broker.stop()
+    assert broker.stop(graceful_timeout_s=2.0) is True
     assert observed_stopping == [True]
 
 
 def test_on_connect_after_stop_does_not_notify_notifier(
     broker, fake_client, notifier,
 ):
-    broker.stop()
+    """Post-RFC-010: NEW.stop() is a no-op that does NOT set _stopping,
+    so a subsequent _on_connect would still notify. Prime the broker
+    to RUNNING (so stop() flips _stopping via linearization) before
+    firing the delayed _on_connect."""
+    _fire_connect(broker, fake_client)   # NEW → RUNNING
+    notifier._on_connect.reset_mock()
+
+    assert broker.stop(graceful_timeout_s=2.0) is True
     notifier._on_connect.reset_mock()
     _fire_connect(broker, fake_client)
     notifier._on_connect.assert_not_called()
