@@ -296,20 +296,25 @@ def test_B14_stop_before_start_is_noop_returning_True_state_stays_NEW(
 def test_B15_stop_after_start_failure_returns_True_no_paho_double_call(
     fake_client, notifier, monkeypatch,
 ):
-    """start(wait=True) failure path already calls loop_stop +
-    disconnect once. Subsequent stop() from START_FAILED is a no-op
-    returning True (does not fire paho a second time)."""
+    """RFC-011: start(wait=True) callback timeout path transitions to
+    `START_TIMEOUT` (not START_FAILED — which is reserved for paho
+    Exception / rc!=0 failures). Because the callback timeout runs
+    the bounded rollback primitive (helper thread), paho is called
+    exactly once. Subsequent stop() from START_TIMEOUT returns True
+    from the cached `_last_start_cleanup_result` without re-calling
+    paho."""
     monkeypatch.setattr(
         'agentflow.broker.mqtt_broker.Client', lambda *a, **kw: fake_client,
     )
     b = MqttBroker(notifier=notifier, wait=True, timeout=0.1)
     with pytest.raises(TimeoutError):
         b.start({})
-    assert b.state is WorkerState.START_FAILED
+    # RFC-011 §7.2: callback wait timeout → START_TIMEOUT.
+    assert b.state is WorkerState.START_TIMEOUT
     # start()'s failure cleanup already invoked paho once each.
     assert fake_client.disconnect.call_count == 1
     assert fake_client.loop_stop.call_count == 1
-    # stop() from START_FAILED is a no-op.
+    # stop() from START_TIMEOUT (helper already finished + cleanup ran) → True.
     assert b.stop() is True
     assert fake_client.disconnect.call_count == 1
     assert fake_client.loop_stop.call_count == 1

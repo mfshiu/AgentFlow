@@ -39,6 +39,13 @@ class WorkerState(Enum):
                     Terminal — retry via stop() replays the cached
                     False result; construct a fresh broker to try
                     a real shutdown.
+    START_TIMEOUT — (RFC-011, MqttBroker only) startup helper or
+                    _connected_evt callback wait exceeded the
+                    startup_timeout_s budget. Terminal for start()
+                    (same-instance retry not supported in first-phase);
+                    stop() from START_TIMEOUT bounded-waits for the
+                    startup helper, then runs the rollback primitive
+                    at most once (RFC-011 modification 1+2).
     """
     NEW = 'new'
     STARTING = 'starting'
@@ -49,6 +56,7 @@ class WorkerState(Enum):
     STOP_TIMEOUT = 'stop_timeout'
     FAILED = 'failed'
     STOP_FAILED = 'stop_failed'
+    START_TIMEOUT = 'start_timeout'
 
 
 

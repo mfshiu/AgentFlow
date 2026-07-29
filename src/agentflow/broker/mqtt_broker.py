@@ -1,6 +1,6 @@
 from paho.mqtt.client import Client
 from paho.mqtt.enums import CallbackAPIVersion
-import logging, os, threading
+import logging, os, threading, time
 from typing import Any, Dict, Optional
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
@@ -93,6 +93,28 @@ class MqttBroker(MessageBroker):
         # (RFC-010 modification 2).
         self._stop_helper_completed_normally: bool = False
 
+        # RFC-011 bounded-startup coordination + observability.
+        self._start_complete_event = threading.Event()
+        self._start_helper_thread: Optional[threading.Thread] = None
+        # Set True by the startup helper only if BOTH paho calls returned
+        # (with or without captured Exception). Distinguishes a
+        # BaseException-killed helper from a normal helper exit
+        # (RFC-011 modification 2 / §7.7).
+        self._start_helper_completed_normally: bool = False
+        self._last_start_result: bool = False
+        self._last_start_exception: Optional[BaseException] = None
+        # RFC-011 modification 1: separate cleanup result for START_TIMEOUT
+        # → stop() coordination. None until the rollback primitive is
+        # actually run; True/False = last run outcome.
+        self._last_start_cleanup_result: Optional[bool] = None
+        # Diagnostic-only counter (RFC-011 §7.22 / Appendix C). NOT used
+        # for callback filtering — see Appendix C for why generation
+        # integers cannot solve cross-attempt callback contamination.
+        self._start_generation: int = 0
+        # Serialises the START_TIMEOUT recovery path so concurrent
+        # stop() callers do not double-run the rollback primitive.
+        self._start_timeout_recovery_lock = threading.Lock()
+
         logger.info(f"MQTT broker initialized with notifier: {notifier}, wait={wait}, timeout={timeout}")
         super().__init__(notifier=notifier)
 
@@ -112,6 +134,21 @@ class MqttBroker(MessageBroker):
         loop_stop). None if stop succeeded cleanly or was never
         invoked. Never cleared — diagnostic-only."""
         return self._last_stop_exception
+
+    @property
+    def last_start_exception(self) -> Optional[BaseException]:
+        """RFC-011 §7.22: first exception captured by the startup path
+        (helper or caller). None if start succeeded cleanly or was never
+        invoked. Never cleared — diagnostic-only."""
+        return self._last_start_exception
+
+    @property
+    def start_generation(self) -> int:
+        """RFC-011 §7.22 / Appendix C: monotonically incrementing
+        counter of start() attempts on this instance. Diagnostic-only;
+        NOT used for callback filtering (see Appendix C for why the
+        naive form does not work)."""
+        return self._start_generation
 
 
     # ------------------------------------------------------------------
@@ -251,64 +288,451 @@ class MqttBroker(MessageBroker):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self, options: dict):
-        logger.info("MQTT broker is starting...")
+    def start(self, options: dict, *,
+              startup_timeout_s: Optional[float] = None) -> bool:
+        """RFC-011 bounded cooperative startup.
 
-        # RFC-010: state transition NEW → STARTING. Non-NEW start is
-        # logged but not gated (first-phase; matches pre-RFC-010
-        # behaviour of not raising).
+        Runs `client.connect()` + `client.loop_start()` on a daemon
+        helper thread; joins with `startup_timeout_s`; on wait=True,
+        additionally awaits `_on_connect` callback within the SAME
+        deadline (single monotonic budget). On any failure path
+        (helper wedge, connect raise, loop_start raise, callback wait
+        timeout, callback rc!=0), invokes a private bounded
+        client-shutdown primitive with its own 5.0s budget.
+
+        Returns True on success. Raises TimeoutError on START_TIMEOUT,
+        ConnectionError on rc!=0, the original paho Exception on
+        START_FAILED, RuntimeError on non-NEW start attempt.
+
+        RFC-011 modification 4 — wait=False contract: True ONLY means
+        connect + loop_start were initiated (helper completed both
+        paho calls bounded). It does NOT mean the broker is connected;
+        state stays STARTING until `_on_connect(rc=0)` fires later.
+
+        RFC-011 modification 5 — same-instance retry NOT supported.
+        START_TIMEOUT / START_FAILED / STOPPED / any non-NEW state
+        raises RuntimeError WITHOUT modifying any lifecycle flag.
+        Construct a fresh MqttBroker to try again.
+        """
+        # `startup_timeout_s` defaults to the broker-instance timeout
+        # (constructor arg, default 10.0). Preserves backward compat
+        # with `MqttBroker(wait=True, timeout=0.1).start({})`.
+        if startup_timeout_s is None:
+            startup_timeout_s = float(self._timeout)
+
+        is_waiter = False
+
+        # -- Phase 0: linearization under _state_lock.
+        # RFC-011 modification 5: check state BEFORE modifying flags.
+        # Only reset lifecycle flags in the NEW branch.
         with self._state_lock:
-            if self._state != WorkerState.NEW:
-                logger.warning(
-                    f"MqttBroker.start called from state={self._state.value}; "
-                    f"first-phase does not gate repeated start"
+            current = self._state
+            if current == WorkerState.NEW:
+                self._state = WorkerState.STARTING
+                # Reset per-attempt flags ATOMICALLY with state.
+                self._stopping = False
+                self._connected = False
+                self._connect_ok = False
+                self._connect_err = None
+                self._connected_evt.clear()
+                self._start_complete_event.clear()
+                self._start_generation += 1
+                self._last_start_result = False
+                self._last_start_exception = None
+                self._last_start_cleanup_result = None
+                self._start_helper_completed_normally = False
+            elif current == WorkerState.STARTING:
+                is_waiter = True
+            else:
+                # RFC-011 §7.5: failed instance is terminal.
+                # Do NOT modify any flags.
+                raise RuntimeError(
+                    f"MqttBroker.start called from state={current.value}; "
+                    f"same-instance retry is not supported in first-phase "
+                    f"RFC-011 — construct a fresh MqttBroker instance"
                 )
-            self._state = WorkerState.STARTING
 
+        # -- Concurrent waiter path (bounded, RFC-011 §E / mod 3).
+        if is_waiter:
+            coord_margin_s = 0.1
+            completed = self._start_complete_event.wait(
+                startup_timeout_s + coord_margin_s
+            )
+            if completed:
+                with self._state_lock:
+                    success = self._last_start_result
+                    exc = self._last_start_exception
+                if success:
+                    return True
+                # RFC-011 modification 3: waiter raises a NEW RuntimeError
+                # chained to the original — never re-raises the same
+                # exception instance across threads (avoids traceback /
+                # __context__ mutation hazards).
+                if exc is not None:
+                    raise RuntimeError(
+                        "MqttBroker.start failed in another caller"
+                    ) from exc
+                raise RuntimeError(
+                    "MqttBroker.start failed in another caller"
+                )
+            # Coordination event did not fire in time — bounded fallback.
+            alive = (self._start_helper_thread is not None
+                     and self._start_helper_thread.is_alive())
+            try:
+                logger.warning(
+                    f"MqttBroker.start coordination wait timed out "
+                    f"({startup_timeout_s + coord_margin_s:.1f}s); "
+                    f"helper alive={alive}"
+                )
+            except Exception:
+                pass
+            raise TimeoutError(
+                f"MqttBroker.start concurrent waiter timeout after "
+                f"{startup_timeout_s + coord_margin_s:.1f}s"
+            )
+
+        # -- First-caller path.
+        # Callback binding (lock-external, no paho I/O yet).
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
-
         self.host = options.get("host", "localhost")
         self.port = int(options.get("port", 1883))
         self.keepalive = int(options.get("keepalive", 60))
-
         if username := options.get("username"):
             self._client.username_pw_set(username, options.get("password"))
 
-        # 初始化事件
-        self._connected_evt.clear()
-        self._connect_ok = False
-        self._connect_err = None
+        # Spawn daemon startup helper.
+        helper = threading.Thread(
+            target=self._run_startup_helper,
+            name=f'MqttBrokerStart-{id(self)}',
+            daemon=True,
+        )
+        self._start_helper_thread = helper
+        deadline = time.monotonic() + startup_timeout_s
+        helper.start()
 
-        self._client.connect(self.host, self.port, self.keepalive)
-        self._client.loop_start()
+        try:
+            # -- Phase 1: bounded join for connect + loop_start.
+            remaining = max(0.0, deadline - time.monotonic())
+            helper.join(remaining)
 
-        if not self._wait:
-            # State remains STARTING until _on_connect fires (or
-            # transitions elsewhere via a subsequent stop() from the
-            # STARTING state — which RFC-010 first-phase rejects with
-            # RuntimeError, see stop()).
+            if helper.is_alive():
+                # RFC-011 modification 2: helper still wedged past
+                # deadline. DO NOT spawn rollback helper — startup
+                # helper is still touching the paho client. Only
+                # fence state; stop() will later coordinate.
+                exc = TimeoutError(
+                    f"MqttBroker.start timeout after "
+                    f"{startup_timeout_s:.1f}s waiting for "
+                    f"connect / loop_start (helper still alive; "
+                    f"rollback deferred to stop())"
+                )
+                self._transition_to_start_failure(
+                    WorkerState.START_TIMEOUT, exc,
+                )
+                raise exc
+
+            # Helper finished. Check outcome.
+            if not self._start_helper_completed_normally:
+                # BaseException killed helper OR completed_normally
+                # never set. Helper is dead → safe to run rollback.
+                cap_exc = self._last_start_exception
+                if cap_exc is None:
+                    cap_exc = RuntimeError(
+                        "MqttBroker startup helper died abnormally "
+                        "without completing (likely BaseException from "
+                        "paho); construct a fresh broker to retry"
+                    )
+                    with self._state_lock:
+                        self._last_start_exception = cap_exc
+                self._transition_to_start_failure(
+                    WorkerState.START_FAILED, cap_exc,
+                )
+                self._run_client_shutdown_primitive_and_cache()
+                raise cap_exc
+
+            if self._last_start_exception is not None:
+                # Helper captured Exception (connect or loop_start).
+                # Helper is dead → safe to run rollback.
+                cap_exc = self._last_start_exception
+                self._transition_to_start_failure(
+                    WorkerState.START_FAILED, cap_exc,
+                )
+                self._run_client_shutdown_primitive_and_cache()
+                raise cap_exc
+
+            # -- Phase 2: connect + loop_start succeeded.
+            if not self._wait:
+                # RFC-011 modification 4: wait=False True ONLY means
+                # connect + loop_start were initiated. State stays
+                # STARTING until _on_connect(rc=0) fires.
+                with self._state_lock:
+                    self._last_start_result = True
+                try:
+                    logger.info(
+                        f"MQTT broker startup initiated (wait=False): "
+                        f"host={self.host}, port={self.port}"
+                    )
+                except Exception:
+                    pass
+                return True
+
+            # wait=True: await callback within the SAME remaining budget.
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._connected_evt.wait(remaining):
+                # Callback wait timeout. Startup helper has finished;
+                # safe to run rollback.
+                exc = TimeoutError(
+                    f"MqttBroker.start timeout after "
+                    f"{startup_timeout_s:.1f}s waiting for _on_connect "
+                    f"callback ({self.host}:{self.port})"
+                )
+                self._transition_to_start_failure(
+                    WorkerState.START_TIMEOUT, exc,
+                )
+                self._run_client_shutdown_primitive_and_cache()
+                raise exc
+
+            if not self._connect_ok:
+                exc = ConnectionError(
+                    f"MQTT connect failed: {self._connect_err}"
+                )
+                self._transition_to_start_failure(
+                    WorkerState.START_FAILED, exc,
+                )
+                self._run_client_shutdown_primitive_and_cache()
+                raise exc
+
+            # Success — `_on_connect` already transitioned state to RUNNING.
+            with self._state_lock:
+                self._last_start_result = True
+            try:
+                logger.info(
+                    f"MQTT broker startup succeeded: "
+                    f"host={self.host}, port={self.port}"
+                )
+            except Exception:
+                pass
             return True
+        finally:
+            # ALWAYS release concurrent waiters, even if we raised.
+            self._start_complete_event.set()
 
-        if not self._connected_evt.wait(self._timeout):
-            logger.error(f"MQTT connect timeout after {self._timeout}s")
+
+    def _transition_to_start_failure(self, new_state: WorkerState,
+                                     exception: BaseException):
+        """RFC-011 §H: atomic transition into a startup failure state.
+        Sets _stopping=True in the SAME lock section so callback
+        fencing is immediate (parity with RFC-010 §G). Only actually
+        transitions if the current state is STARTING; avoids
+        clobbering a concurrent failure reason."""
+        with self._state_lock:
+            if self._state == WorkerState.STARTING:
+                self._state = new_state
+                self._stopping = True
+                self._connected = False
+                self._connect_ok = False
+                self._connected_evt.clear()
+                if self._last_start_exception is None:
+                    self._last_start_exception = exception
+                self._last_start_result = False
+
+
+    def _run_startup_helper(self):
+        """RFC-011 §C startup-helper body. Runs `connect + loop_start`
+        with per-call `except Exception` isolation. Sets
+        `_start_helper_completed_normally = True` only if BOTH calls
+        returned (with or without captured Exception). BaseException
+        propagates and kills the helper (matches RFC-009 §7.11 /
+        RFC-010 §7.15)."""
+        try:
+            self._client.connect(self.host, self.port, self.keepalive)
+        except Exception as ex:
+            if self._last_start_exception is None:
+                self._last_start_exception = ex
+            try:
+                logger.exception(
+                    f"MqttBroker.start: client.connect() raised: {ex!r}"
+                )
+            except Exception:
+                pass
+            # Do NOT proceed to loop_start when connect raised — the
+            # rollback primitive will handle the (nonexistent) socket.
+            self._start_helper_completed_normally = True
+            return
+        try:
+            self._client.loop_start()
+        except Exception as ex:
+            if self._last_start_exception is None:
+                self._last_start_exception = ex
+            try:
+                logger.exception(
+                    f"MqttBroker.start: client.loop_start() raised: {ex!r}"
+                )
+            except Exception:
+                pass
+        # Reached iff no BaseException propagated.
+        self._start_helper_completed_normally = True
+
+
+    def _run_client_shutdown_primitive(self, *,
+                                       rollback_timeout_s: float = 5.0
+                                       ) -> bool:
+        """RFC-011 §6.4 / §E: state-agnostic, coordination-free
+        bounded client-shutdown primitive. Spawns a daemon helper
+        that runs `disconnect + loop_stop` with per-call Exception
+        isolation; caller bounded-joins.
+
+        Returns True if the helper completed within budget; False
+        otherwise (helper still alive after `rollback_timeout_s`).
+
+        Does NOT touch `_state`, `_stop_complete_event`, or
+        `_start_complete_event` — the caller owns those. Also does
+        NOT overwrite failure state to STOPPED (§E requirement).
+
+        Must NOT be called while the startup helper is still alive
+        (RFC-011 modification 2 — would race on the same paho client).
+        """
+        completed = threading.Event()
+
+        def body():
+            try:
+                try:
+                    self._client.disconnect()
+                except Exception as ex:
+                    try:
+                        logger.exception(
+                            f"client-shutdown primitive: disconnect() "
+                            f"raised: {ex!r}"
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._client.loop_stop()
+                except Exception as ex:
+                    try:
+                        logger.exception(
+                            f"client-shutdown primitive: loop_stop() "
+                            f"raised: {ex!r}"
+                        )
+                    except Exception:
+                        pass
+            finally:
+                completed.set()
+
+        helper = threading.Thread(
+            target=body,
+            name=f'MqttBrokerCleanup-{id(self)}',
+            daemon=True,
+        )
+        helper.start()
+        result = completed.wait(rollback_timeout_s)
+        if not result:
+            try:
+                logger.warning(
+                    f"client-shutdown primitive: timeout after "
+                    f"{rollback_timeout_s:.1f}s; helper still running "
+                    f"(paho wedged inside cleanup)"
+                )
+            except Exception:
+                pass
+        return result
+
+
+    def _run_client_shutdown_primitive_and_cache(self, *,
+                                                 rollback_timeout_s: float = 5.0
+                                                 ) -> bool:
+        """Wraps `_run_client_shutdown_primitive` and caches the result
+        into `_last_start_cleanup_result` so subsequent `stop()` from
+        START_TIMEOUT / START_FAILED can inspect it without re-running
+        the primitive."""
+        result = self._run_client_shutdown_primitive(
+            rollback_timeout_s=rollback_timeout_s,
+        )
+        with self._state_lock:
+            self._last_start_cleanup_result = result
+        return result
+
+
+    def _start_timeout_recovery(self, graceful_timeout_s: float) -> bool:
+        """RFC-011 §F / modification 1+2: dedicated recovery path when
+        stop() is called on a broker in START_TIMEOUT state.
+
+          - If the startup helper is still alive: bounded-join it
+            first (avoids two helpers concurrently touching the same
+            paho client). If it's still alive after the join → return
+            False (cannot proceed with cleanup safely).
+          - If the startup helper has finished and cleanup was already
+            run: return the cached `_last_start_cleanup_result`.
+          - Otherwise: run the client-shutdown primitive AT MOST ONCE
+            (serialised by `_start_timeout_recovery_lock`), cache the
+            result, and return it.
+
+        Bounded — never waits without a timeout.
+        """
+        # Fast path: cleanup already ran (concurrent caller finished).
+        with self._state_lock:
+            cached = self._last_start_cleanup_result
+        if cached is not None:
+            return cached
+
+        # Serialise so concurrent callers do not double-run the primitive.
+        # Bounded acquire — return False if we cannot acquire in time.
+        acquired = self._start_timeout_recovery_lock.acquire(
+            timeout=graceful_timeout_s + 0.1
+        )
+        if not acquired:
+            try:
+                logger.warning(
+                    f"MqttBroker.stop from START_TIMEOUT: could not "
+                    f"acquire recovery lock within "
+                    f"{graceful_timeout_s + 0.1:.1f}s; another caller "
+                    f"is running cleanup"
+                )
+            except Exception:
+                pass
+            # Return whatever the other caller has cached so far.
             with self._state_lock:
-                self._state = WorkerState.START_FAILED
-            self._client.loop_stop()
-            self._client.disconnect()
-            raise TimeoutError(f"MQTT connect timeout ({self.host}:{self.port})")
+                return (self._last_start_cleanup_result
+                        if self._last_start_cleanup_result is not None
+                        else False)
 
-        if not self._connect_ok:
+        try:
+            # Re-check after acquiring lock (another caller may have
+            # finished cleanup between the fast path and here).
             with self._state_lock:
-                self._state = WorkerState.START_FAILED
-            self._client.loop_stop()
-            self._client.disconnect()
-            raise ConnectionError(f"MQTT connect failed: {self._connect_err}")
+                cached = self._last_start_cleanup_result
+            if cached is not None:
+                return cached
 
-        # On success, _on_connect has already transitioned state to
-        # RUNNING under the lock.
-        return True
+            # Bounded-wait for startup helper to finish. RFC-011
+            # modification 2: MUST NOT run the primitive while startup
+            # helper is still alive (would race on same paho client).
+            startup_helper = self._start_helper_thread
+            if startup_helper is not None and startup_helper.is_alive():
+                startup_helper.join(graceful_timeout_s)
+                if startup_helper.is_alive():
+                    try:
+                        logger.warning(
+                            f"MqttBroker.stop from START_TIMEOUT: "
+                            f"startup helper still alive after "
+                            f"{graceful_timeout_s:.1f}s bounded wait; "
+                            f"deferring cleanup (would race on paho client)"
+                        )
+                    except Exception:
+                        pass
+                    # Do NOT cache False permanently — a later stop()
+                    # retry can try again once the helper finishes.
+                    return False
+
+            # Startup helper has finished. Safe to run cleanup once.
+            result = self._run_client_shutdown_primitive_and_cache(
+                rollback_timeout_s=graceful_timeout_s,
+            )
+            return result
+        finally:
+            self._start_timeout_recovery_lock.release()
 
 
     def stop(self, graceful_timeout_s: float = 5.0) -> bool:
@@ -335,6 +759,8 @@ class MqttBroker(MessageBroker):
         is_waiter = False
         is_retry = False
 
+        is_start_timeout_recovery = False
+
         with self._state_lock:
             current = self._state
             if current == WorkerState.NEW:
@@ -342,9 +768,12 @@ class MqttBroker(MessageBroker):
                 # on the paho client, no state to fence.
                 return True
             if current == WorkerState.START_FAILED:
-                # start() already cleaned paho (loop_stop + disconnect)
-                # on the failure path. Fence any late callback.
+                # RFC-011 §7.19: start()'s failure path already ran the
+                # cleanup primitive; reflect its actual result rather
+                # than blindly returning True.
                 self._stopping = True
+                if self._last_start_cleanup_result is False:
+                    return False
                 return True
             if current == WorkerState.STOPPED:
                 return True
@@ -358,9 +787,15 @@ class MqttBroker(MessageBroker):
                     "MqttBroker.stop called while state=STARTING; "
                     "start-stop coordination is not supported in "
                     "first-phase RFC-010 — wait for start() to reach "
-                    "RUNNING (or START_FAILED) before calling stop()"
+                    "RUNNING (or START_FAILED / START_TIMEOUT) before "
+                    "calling stop()"
                 )
-            if current == WorkerState.STOPPING:
+            if current == WorkerState.START_TIMEOUT:
+                # RFC-011 modification 1: dedicated recovery path
+                # (bounded-wait for startup helper, then run cleanup
+                # primitive at most once).
+                is_start_timeout_recovery = True
+            elif current == WorkerState.STOPPING:
                 is_waiter = True
             elif current == WorkerState.RUNNING:
                 # First caller — full linearization (RFC-010 §G):
@@ -381,6 +816,10 @@ class MqttBroker(MessageBroker):
                 self._stop_complete_event.clear()
             else:  # pragma: no cover — defensive
                 return True
+
+        # -- RFC-011 START_TIMEOUT recovery path (bounded, mod 1+2).
+        if is_start_timeout_recovery:
+            return self._start_timeout_recovery(graceful_timeout_s)
 
         # -- Concurrent waiter path (bounded, RFC-010 §E).
         if is_waiter:
