@@ -672,7 +672,155 @@ Runtime evidence: `test_C21` / `test_C22` (bounded timeout for disconnect/loop_s
 
 ---
 
-## 2.12 Unknowns
+## 2.12 MqttBroker bounded-startup lifecycle (post-RFC-011, 2026-07-29)
+
+> **Update (2026-07-29)**: `MqttBroker.start()` now has a bounded, deterministic contract that mirrors the RFC-010 stop-side shape. The R-10.6 "`connect` / `loop_start` wedge blocks `start()` forever" scenario is closed. See [RFC-011](../rfc/RFC-011-mqtt-broker-bounded-startup.md) and [`docs/audit/05-risk-register.md` R-10](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+
+### Broker-side startup state machine
+
+Extends the RFC-008/009/010 `WorkerState` enum with `START_TIMEOUT` (MqttBroker-only):
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> STARTING: start()<br/>same lock section:<br/>_stopping=False<br/>_connected_evt.clear<br/>_start_complete_event.clear<br/>_start_generation += 1
+    STARTING --> RUNNING: helper OK + wait=True _on_connect(rc=0) within budget
+    STARTING --> STARTING: wait=False + helper OK → return True (state stays STARTING)
+    STARTING --> START_TIMEOUT: helper.join(deadline) alive<br/>(RFC-011 mod 2: no rollback spawned)<br/>OR _connected_evt.wait deadline (rollback runs)
+    STARTING --> START_FAILED: helper Exception<br/>OR _on_connect(rc!=0)<br/>→ bounded rollback via primitive
+    START_TIMEOUT --> START_TIMEOUT: start() raises RuntimeError (§7.5 terminal)
+    START_FAILED --> START_FAILED: start() raises RuntimeError
+    RUNNING --> RUNNING: start() raises RuntimeError
+    STOPPED --> STOPPED: start() raises RuntimeError
+    STOPPING --> STARTING: n/a (STOPPING blocks stop() only)
+    STARTING --> STARTING: concurrent start() → bounded waiter on _start_complete_event
+```
+
+**Failed instance is TERMINAL** (RFC-011 §7.5). Any non-NEW `start()` raises `RuntimeError` WITHOUT modifying lifecycle flags. Structurally closes the E.50 cross-round callback contamination hazard: no "second round" can occur on the same instance. `Agent.__activating` retries via `BrokerMaker.create_broker()` (fresh instance per attempt) — fully compatible.
+
+### Bounded startup contract
+
+`start(options, *, startup_timeout_s: Optional[float] = None) -> bool`:
+
+- `startup_timeout_s=None` falls back to `self._timeout` (constructor arg default 10.0) for backward compat with `MqttBroker(wait=True, timeout=0.1)`.
+- Runs `connect + loop_start` on a `daemon=True` helper thread; caller bounded-joins with the shared deadline.
+- **Single monotonic deadline** covers BOTH phases: helper join AND (wait=True) subsequent `_connected_evt.wait` — no way to blow past `startup_timeout_s`.
+- **wait=False contract clarified** (RFC-011 §4): True ONLY means connect + loop_start were initiated. State stays STARTING until `_on_connect(rc=0)` fires.
+- **wait=True success** requires `_on_connect(rc=0)` within the budget → state transitions to RUNNING.
+
+### Failed-start rollback (bounded primitive)
+
+`_run_client_shutdown_primitive(rollback_timeout_s=5.0) -> bool` (RFC-011 §6.4):
+
+- State-agnostic, coordination-free daemon-helper wrapper around `disconnect + loop_stop`.
+- Per-call `try/except Exception` isolation.
+- Bounded-join with `rollback_timeout_s`; returns True if primitive helper completed.
+- Does NOT touch `_state`, `_stop_complete_event`, or `_start_complete_event`.
+- Does NOT overwrite failure state to STOPPED (§E requirement).
+- Called by `START_FAILED`, callback-timeout, `rc!=0` paths (where startup helper is finished).
+- **NOT called** for `START_TIMEOUT` when startup helper is still alive (RFC-011 modification 2 — avoids two helpers concurrently touching the same paho client). Deferred to a later `stop()` call.
+
+**Rollback trigger matrix (post-RFC-011)**:
+
+| Failure path | Startup helper state | Rollback timing |
+|---|---|---|
+| `connect` raise | Finished (helper set `completed_normally=True` and returned early) | Immediate — primitive runs |
+| `loop_start` raise | Finished (`connect` succeeded first) | Immediate — primitive runs (fixes pre-RFC-011 TCP leak) |
+| Callback wait timeout (wait=True) | Finished (both paho calls succeeded) | Immediate — primitive runs |
+| `_on_connect(rc!=0)` | Finished | Immediate — primitive runs |
+| Helper wedge (helper still alive past `startup_timeout_s`) | **Still alive** | **DEFERRED** — `_stopping=True` fence set; `stop()` runs primitive later after bounded-joining the helper |
+| BaseException in helper | Dead (uncaught) | Immediate — primitive runs |
+
+### Callback fencing after failed startup
+
+`_transition_to_start_failure(new_state, exception)` sets `_stopping=True` in the SAME `_state_lock` section as the state transition. RFC-010 fencing kicks in immediately for late callbacks:
+
+- `_on_connect(rc=0)` — skip (no `_connect_ok` write, no `_connected=True`, no state transition, no recovery, no notifier call, no `_connected_evt.set()`)
+- `_on_connect(rc!=0)` — skip
+- `_on_message` — silent drop
+- `_on_disconnect` — still updates diagnostics (RFC-005 semantics preserved)
+
+### END-to-end sequence — wedged connect + subsequent stop
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Caller (Agent.__activating, test)
+    participant B as MqttBroker
+    participant H as startup helper (daemon)
+    participant C as paho Client
+    P->>B: start({}, startup_timeout_s=10.0)
+    B->>B: _state_lock: NEW → STARTING<br/>_stopping=False, event.clear, gen+1
+    B->>H: threading.Thread(daemon=True).start()
+    H->>C: client.connect(...)
+    Note over C: WEDGED — never returns
+    B->>B: helper.join(10.0)  (bounded)
+    B-->>B: 10.0s elapsed; helper still alive
+    B->>B: _transition_to_start_failure(START_TIMEOUT, exc)<br/>_stopping=True<br/>_connected_evt.clear<br/>_last_start_exception=exc
+    Note over B: NO rollback spawned<br/>(RFC-011 mod 2: helper still touching client)
+    B->>B: _start_complete_event.set() (finally)
+    B-->>P: raise TimeoutError
+
+    P->>B: stop(graceful_timeout_s=5.0)
+    B->>B: state = START_TIMEOUT → _start_timeout_recovery()
+    B->>H: helper.join(5.0)  (bounded)
+    alt helper still alive after wait
+        B-->>P: return False (cleanup deferred)
+    else helper finished (paho unwedged)
+        B->>B: acquire _start_timeout_recovery_lock (bounded)
+        B->>B: _run_client_shutdown_primitive_and_cache()
+        Note over B: primitive helper (daemon)<br/>runs disconnect + loop_stop bounded
+        B-->>P: return True (cleanup completed)
+    end
+```
+
+### Concurrent start coordination
+
+Same shape as RFC-010 `stop()`:
+
+- First caller (NEW → STARTING) spawns helper.
+- Concurrent callers observe STARTING → waiter path: `_start_complete_event.wait(startup_timeout_s + 0.1)` — bounded margin.
+- Event completed → success returns cached `True`; failure **raises new `RuntimeError from _last_start_exception`** (RFC-011 modification 3 — never shares exception instance across threads).
+- Event timeout → read `helper.is_alive()`, log WARNING, raise `TimeoutError`.
+- **Invariant**: N callers → 1 helper → 1 `(connect + loop_start)` pair to paho. Runtime-verified in `test_D36` / `test_D37`.
+
+### START_TIMEOUT.stop() recovery (RFC-011 §F)
+
+Dedicated `stop()` path when state is `START_TIMEOUT`:
+
+1. Fast path: check `_last_start_cleanup_result` cache — return cached if already computed.
+2. Acquire `_start_timeout_recovery_lock` (bounded) — serialise concurrent stop callers.
+3. Re-check cache after acquiring.
+4. **Bounded-wait startup helper** (`helper.join(graceful_timeout_s)`) — MUST NOT run primitive while helper is alive (RFC-011 modification 2).
+5. If helper still alive → return `False` (do not cache — later retry can try again).
+6. Otherwise → run `_run_client_shutdown_primitive_and_cache(rollback_timeout_s=graceful_timeout_s)` — at most once → cache result → return.
+
+**Modification 1**: `START_TIMEOUT.stop()` MUST NOT shortcut True. Return value reflects `_last_start_cleanup_result` accurately (`test_G62`).
+
+### Agent.__activating integration
+
+**Agent.__activating is UNCHANGED** (RFC-011 §7.21). The existing retry loop (`agent.py:353-356`, `max_retries=3`) works unmodified:
+
+- `TimeoutError` (bounded RFC-011 result) → retry loop → **new** `BrokerMaker().create_broker()` iteration → fresh MqttBroker instance (RFC-011 §7.5 no-same-instance-retry is compatible).
+- `ConnectionError` (rc!=0 path) → same retry loop.
+- Any other paho `Exception` (unwrapped from START_FAILED) → existing `except Exception` handler.
+
+`ThreadWorker`'s `_activate → __activating → broker.start` is now bounded → work_thread reaches the `while queue.get(...)` loop → `ThreadWorker.stop`'s `send terminate` has a consumer → clean STOPPED path (no more STOP_TIMEOUT via wedged broker startup).
+
+### R-10 sub-risk status (post-RFC-011)
+
+| Sub-risk | Status |
+|---|---|
+| R-10.1 `ProcessWorker.stop` unbounded join | **Resolved** (RFC-008) |
+| R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** (RFC-009) |
+| R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** (RFC-008 + RFC-009) |
+| R-10.4 broker.stop() itself wedges | **Resolved** (RFC-010) |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT / START_TIMEOUT | **Open / Documented architectural limitation** — RFC-010 stop helper `daemon=True`; RFC-011 startup helper `daemon=True`; but the worker thread waiting on broker is `daemon=False` (RFC-009 §7.13) |
+| R-10.6 `MqttBroker.start()` unbounded on connect/loop_start | **Resolved 2026-07-29** (RFC-011 — daemon startup helper, single-deadline, terminal-instance contract, bounded rollback primitive, callback fencing) |
+
+---
+
+## 2.13 Unknowns
 
 - ~~**U-2.1**: Actual behaviour of the suspected reply loop in Risk R-05~~ — **Resolved**: reproduced against a bounded self-echo FakeBroker in `tests/unit/core/test_agent_reply_behavior.py`, then fixed by RFC-003 (§2.7 update above).
 - **U-2.2**: Behaviour of MQTT topics containing `.` under paho v2 — assumed to be a normal character (only `+ # / $` are special), but not empirically tested against a broker.

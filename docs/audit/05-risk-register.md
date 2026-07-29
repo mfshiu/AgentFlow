@@ -487,7 +487,8 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 | **R-10.2** | `ThreadWorker.stop` unbounded `Thread.join()` — wedged worker thread blocks caller forever | **RESOLVED** (RFC-009) — bounded cooperative `join(graceful_timeout_s)`, `stop() -> bool`, wedged → `STOP_TIMEOUT` state, retriable |
 | **R-10.3** | `Agent.terminate()` unbounded wait chained through worker.stop | **RESOLVED** (RFC-008 + RFC-009) — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` (≈ 10s at defaults); logs WARNING on worker timeout; never raises |
 | **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **RESOLVED** (RFC-010) — daemon helper-thread wrapper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED` states, single-helper retry, callback fencing |
-| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 confirms the helper thread is `daemon=True` (so helper alone does not block exit) but explicitly notes the worker thread waiting on `broker.stop()` still does |
+| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 confirms the helper thread is `daemon=True` (so helper alone does not block exit) but explicitly notes the worker thread waiting on `broker.stop()` still does. RFC-011 §0 confirms the startup helper is also `daemon=True` and does not itself block exit; the residual is worker-side |
+| **R-10.6** | `MqttBroker.start()` unbounded on `client.connect` / `client.loop_start` (paho lifecycle synchronous with no timeout wrapper); wait=True timeout only bounds `_connected_evt.wait`; failed-start rollback leaks; late callback after failure pollutes state; concurrent start callers each call paho; cross-round callback contamination via same-instance retry | **RESOLVED** (RFC-011) — daemon startup helper, single monotonic deadline covers helper + callback wait, `START_TIMEOUT` state, terminal-instance contract (no same-instance retry), bounded rollback via `_run_client_shutdown_primitive`, `_transition_to_start_failure` sets `_stopping=True` for immediate RFC-010 fencing, concurrent-start coordination via `_start_complete_event` |
 
 ### Resolution (R-10.1)
 
@@ -646,13 +647,90 @@ Four narrow, all in the bounded-shutdown / safety direction:
 ### Known residuals NOT resolved by RFC-010
 
 - **R-10.5 non-daemon interpreter-exit blocking** (see above) — remains OPEN / Documented.
-- **`MqttBroker.start()` / `client.connect()` bounded lifecycle** — `wait=True` `timeout` bounds the wait but not the connect syscall itself. Deferred to a future broker-start-lifecycle RFC.
-- **`MessageBroker` ABC timeout contract** — RFC-010 §7.16 explicitly keeps the ABC as `stop(self)`; unifying across `EmptyBroker` / third-party subclasses requires a separate RFC.
-- **`STARTING.stop()` coordination** — first-phase raises `RuntimeError`; deferred.
-- **Other broker implementations** (`RedisBroker`, `RosBroker`, `DdsBroker`) — R-22 flagged as unregistered / broken; not in RFC-010 blast radius.
+- ~~**`MqttBroker.start()` / `client.connect()` bounded lifecycle**~~ — **RESOLVED 2026-07-29 (RFC-011)** as R-10.6. See "Resolution (R-10.6)" below.
+- **`MessageBroker` ABC timeout contract** — RFC-010 §7.16 / RFC-011 §7.16 explicitly keep the ABC as `stop(self, options)` / `start(self, options)`; unifying across `EmptyBroker` / third-party subclasses requires a separate RFC.
+- **`STARTING.stop()` coordination** — first-phase raises `RuntimeError`; deferred (both RFC-010 mod 3 and RFC-011 §7.19).
+- **Other broker implementations** (`RedisBroker`, `RosBroker`, `DdsBroker`) — R-22 flagged as unregistered / broken; not in RFC-010 / RFC-011 blast radius.
 - **Reconnect policy / offline publish queue / broker clustering / failover** — RFC-005 owns reconnect; rest are deferred.
 - **Publish result observability** — paho `MessageInfo (rc/mid)` still discarded (RFC-002 residual).
 - **Paho helper resource completion guarantee** — a wedged paho socket may keep the helper alive even after `stop()` returns; helper is daemonised so it does not block interpreter exit, but the socket / file descriptor is not force-closed.
+
+### Resolution (R-10.6)
+
+- **Resolved on**: 2026-07-29 — see [RFC-011 MqttBroker bounded startup](../rfc/RFC-011-mqtt-broker-bounded-startup.md) (Implemented).
+
+**Final implementation** (RFC-011 first-phase scope):
+
+**WorkerState extension** (`src/agentflow/core/agent_worker.py`) — one new member:
+
+- `START_TIMEOUT` — MqttBroker-only. Startup helper join OR `_connected_evt` callback wait exceeded `startup_timeout_s`. Terminal for `start()`; `stop()` from START_TIMEOUT runs the dedicated recovery path (bounded-waits startup helper, then runs the primitive at most once).
+
+**MqttBroker rewrite** (`src/agentflow/broker/mqtt_broker.py`):
+
+- Full startup state machine `NEW → STARTING → RUNNING / START_TIMEOUT / START_FAILED` (adds to RFC-010's stop-side machine).
+- New read-only properties: `last_start_exception`, `start_generation` (diagnostic-only; naive integer cannot solve cross-attempt callback contamination — see RFC-011 Appendix C).
+- `start(options, *, startup_timeout_s=None) -> bool` — cooperative bounded startup via a `daemon=True` helper thread that runs `connect + loop_start` with per-call `except Exception` isolation. `startup_timeout_s=None` falls back to `self._timeout` (constructor default 10.0) for backward compat. Single monotonic deadline covers helper join AND (wait=True) subsequent `_connected_evt.wait`.
+- **Terminal failed-instance contract** (§7.5): any non-NEW `start()` raises `RuntimeError` WITHOUT modifying lifecycle flags. Closes the E.50 cross-round callback contamination hazard structurally (same-instance retry impossible → no "later round" callback pollution). Agent's `__activating` retry loop constructs a fresh broker via `BrokerMaker` on each iteration — fully compatible.
+- **Modification 2 — no parallel helper**: startup helper timeout does NOT spawn a rollback helper. `START_TIMEOUT` transition sets `_stopping=True` (fencing), leaves helper alive, defers cleanup to a later `stop()` call. Prevents two helpers from concurrently touching the same paho client.
+- **Modification 3 — concurrent waiter safety**: waiter that observes failure raises a NEW `RuntimeError from _last_start_exception` — never re-raises the exact exception instance across threads (avoids traceback / `__context__` mutation hazards).
+- **Modification 4 — wait=False contract**: True ONLY means connect + loop_start were initiated (helper completed bounded); state stays STARTING until `_on_connect(rc=0)` fires.
+- **Modification 5 — flag reset scope**: `_stopping=False` reset ONLY inside the NEW→STARTING lock section; non-NEW start touches no flags.
+- **`_transition_to_start_failure`**: atomic transition to START_TIMEOUT / START_FAILED under `_state_lock`; sets `_stopping=True` in the SAME lock section for immediate RFC-010 fencing. Only transitions if current state is STARTING (guards against concurrent failure reason clobbering).
+- **`_run_client_shutdown_primitive(rollback_timeout_s=5.0) -> bool`**: state-agnostic, coordination-free bounded client-shutdown primitive. Daemon helper runs `disconnect + loop_stop` with per-call Exception isolation; caller bounded-joins. Called by START_FAILED / callback-timeout / rc!=0 rollback (where helper is finished). Does NOT touch state or coordination events. Also does NOT overwrite failure state to STOPPED.
+- **`_start_timeout_recovery(graceful_timeout_s) -> bool`**: dedicated `stop()` path when state is START_TIMEOUT. Serialised via `_start_timeout_recovery_lock` (bounded acquire) so concurrent stop callers do NOT double-run the primitive. Fast-path if `_last_start_cleanup_result` cached; otherwise bounded-join startup helper, then run primitive at most once and cache result.
+- **`START_FAILED.stop()` update** (§7.19 modification 1): now reflects `_last_start_cleanup_result` — returns `False` if cleanup timed out; True otherwise. No longer blindly shortcuts True.
+
+### Startup contract summary
+
+| Property | Value |
+|---|---|
+| Signature | `start(options, *, startup_timeout_s=None) -> bool` |
+| Default timeout | `self._timeout` (constructor default 10.0s) |
+| Helper daemon | `daemon=True` |
+| Total wall-time budget | `startup_timeout_s` (covers helper + callback wait) |
+| Rollback budget | `rollback_timeout_s=5.0` (worst-case total: 15s) |
+| Only NEW can start | Any other state → `RuntimeError` |
+| wait=True success | Requires `_on_connect(rc=0)` within budget |
+| wait=False success | connect + loop_start initiated; state stays STARTING |
+| Failed instance retry | **Not supported** — construct fresh MqttBroker |
+| N concurrent callers | 1 helper, 1 connect, 1 loop_start (via `_start_complete_event`) |
+| Waiter exception | New `RuntimeError from _last_start_exception` — never shared instance |
+
+### Runtime verification (as of 2026-07-29)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- RFC-011 dedicated file `tests/unit/test_mqtt_broker_startup_bounded.py` — **74 passed** in ~15 s.
+- `tests/unit/test_mqtt_broker_start.py` — **13 passed** unchanged (backward compat via `startup_timeout_s=None` fallback to `self._timeout`).
+- `tests/unit/test_mqtt_broker_shutdown.py` — **53 passed** (1 test refactored — `test_B15` state assertion updated from START_FAILED to START_TIMEOUT).
+- `tests/unit/test_mqtt_broker_reconnect.py` — **48 passed** unchanged.
+- `tests/unit/core/test_thread_worker_lifecycle.py` — **35 passed** unchanged.
+- `tests/unit/core/test_process_worker_lifecycle.py` — **33 passed** unchanged.
+- Full combined regression: **451 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in ~49 s.
+- Zero regression across RFC-001–010.
+
+### Observable behavioural changes
+
+Five narrow, all in the bounded-startup / correctness direction:
+
+1. `MqttBroker.start()` now returns `bool` and accepts keyword-only `startup_timeout_s` (default None → falls back to `self._timeout`). Positional call `broker.start(opts)` still works — no in-tree breakage.
+2. Non-NEW `start()` raises `RuntimeError` (was: silent re-enter paho). Closes A.7 restart-after-stop bug and D34/D35 concurrent-double-call bugs. Agent's retry constructs fresh brokers.
+3. `loop_start` raise now runs the rollback primitive → `disconnect` gets called (was: TCP leak).
+4. Late `_on_connect` after START_TIMEOUT / START_FAILED does NOT write `_connect_ok`, does NOT set `_connected_evt`, does NOT notify notifier. Bug fix — no in-tree caller depends on late-callback pollution.
+5. `START_FAILED.stop()` now returns cached `_last_start_cleanup_result` (was: blind True). More honest; no in-tree caller relied on the blind True.
+
+### Known residuals NOT resolved by RFC-011
+
+- **R-10.5 non-daemon interpreter-exit blocking** — still Open. RFC-011 helper is `daemon=True` (helper alone does not block exit); but if a `ThreadWorker` work thread (`daemon=False`) is waiting on `broker.start()` and the helper wedges, the work thread stays alive and interpreter shutdown blocks. Documented in RFC-009 §H / RFC-010 §7.13 / RFC-011 §0.
+- **Same-instance retry** (Option D / E) — deferred. Fresh MqttBroker per attempt is the retry story; Agent's `__activating` already does this.
+- **`STARTING.stop()` mid-flight cancellation** — first-phase raises RuntimeError; deferred.
+- **`MessageBroker` ABC timeout signature** — kept as `start(self, options)` (§7.16); RFC-011's tighter signature satisfies it. Unification deferred.
+- **Shared shutdown primitive refactor** — RFC-010's `_run_stop_helper` still has its own inline body. RFC-011's primitive is standalone. Behaviour-preserving refactor deferred to avoid RFC-010 regression risk.
+- **Fresh paho `Client` per attempt** — deferred (RFC-011 §7.5 terminal-instance contract closes the E.50 hazard structurally without needing this).
+- **Startup generation callback filtering** — `_start_generation` is diagnostic-only (Appendix C); naive integer cannot filter callbacks. Deferred.
+- **Config-key surface** for `startup_timeout_s` — deferred (parity with RFC-008/009/010).
+- **Metrics / counters** on start lifecycle — deferred.
+- **Broker publish observability** (paho `MessageInfo`) — RFC-002 residual.
+- **Other broker implementations** (Redis / ROS / DDS) — R-22 unregistered.
 
 ---
 
@@ -998,7 +1076,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | **Resolved 2026-07-28 (RFC-008 + RFC-009 + RFC-010)** — worker layer bounded (RFC-008/009); broker layer bounded (RFC-010); `Agent.terminate` bounded return + WARNING on timeout. Only residual R-10.5 non-daemon interpreter-exit blocking remains **Open / Documented**. | `Worker.stop()` join without timeout |
+| R-10 | High | High | **Resolved 2026-07-29 (RFC-008 + RFC-009 + RFC-010 + RFC-011)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); `Agent.terminate` / `Agent.__activating` bounded + WARNING / retry via fresh broker. Only residual R-10.5 non-daemon interpreter-exit blocking remains **Open / Documented**. | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` unbounded lifecycle |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
