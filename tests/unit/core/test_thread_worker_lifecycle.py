@@ -624,7 +624,13 @@ def test_F1_agent_terminate_returns_bounded_when_broker_stop_wedges_and_logs_WAR
         with caplog.at_level(py_logging.WARNING):
             probe = _TerminateProbe(agent)
             probe.start()
-            assert broker.stop_started.wait(2.0), (
+            # Worker path: `_terminate` schedules a `sleep(1) →
+            # set(terminate_event)` helper; then `queue.get(timeout=1)`
+            # may need one full timeout after the event fires to
+            # observe it, giving a ~2s minimum before __deactivating
+            # runs and calls broker.stop. Allow 4s headroom for slower
+            # Python 3.9 sleep scheduling.
+            assert broker.stop_started.wait(4.0), (
                 "broker.stop was never invoked from the worker thread"
             )
             # Agent.terminate must return within: dispatcher.stop
