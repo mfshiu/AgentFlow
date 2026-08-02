@@ -489,6 +489,7 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 | **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **RESOLVED** (RFC-010) — daemon helper-thread wrapper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED` states, single-helper retry, callback fencing |
 | **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 confirms the helper thread is `daemon=True` (so helper alone does not block exit) but explicitly notes the worker thread waiting on `broker.stop()` still does. RFC-011 §0 confirms the startup helper is also `daemon=True` and does not itself block exit; the residual is worker-side |
 | **R-10.6** | `MqttBroker.start()` unbounded on `client.connect` / `client.loop_start` (paho lifecycle synchronous with no timeout wrapper); wait=True timeout only bounds `_connected_evt.wait`; failed-start rollback leaks; late callback after failure pollutes state; concurrent start callers each call paho; cross-round callback contamination via same-instance retry | **RESOLVED** (RFC-011) — daemon startup helper, single monotonic deadline covers helper + callback wait, `START_TIMEOUT` state, terminal-instance contract (no same-instance retry), bounded rollback via `_run_client_shutdown_primitive`, `_transition_to_start_failure` sets `_stopping=True` for immediate RFC-010 fencing, concurrent-start coordination via `_start_complete_event` |
+| **R-10.7** | `MqttBroker.publish()` bare passthrough of `client.publish` — never inspects `MessageInfo.rc`, never validates result shape, never gates on lifecycle state. `rc=NO_CONN` / `QUEUE_SIZE` / `PROTOCOL` / unknown-nonzero silently swallowed; `None` / arbitrary result passed through; publish reaches paho from NEW / STARTING / STOPPED / all terminal states; `_publish_or_raise` breaks RFC-002 fast-fail contract for rc failures; `publish_sync` waits full timeout for a response that never arrives (verified elapsed ≥ 0.19s vs 0.2s bound) | **RESOLVED** (RFC-012) — `MqttPublishReason` enum + `MqttPublishError(RuntimeError)` with 7 structured fields; pre-call state gate (stopping > state > connected priority); `_normalise_publish_result` for v1 tuple / v2 MessageInfo / rc-mid coercion; `rc != MQTT_ERR_SUCCESS` fast-fail; unsupported shape raises with `__cause__` preservation; `Agent.publish` unchanged (fire-and-forget catches via `except Exception`); `publish_sync` restored to RFC-002 fast-fail (< 50 ms elapsed on rc failure). Publish-vs-stop full linearisation deferred to a future "operation barrier" RFC (documented residual race). |
 
 ### Resolution (R-10.1)
 
@@ -729,8 +730,131 @@ Five narrow, all in the bounded-startup / correctness direction:
 - **Startup generation callback filtering** — `_start_generation` is diagnostic-only (Appendix C); naive integer cannot filter callbacks. Deferred.
 - **Config-key surface** for `startup_timeout_s` — deferred (parity with RFC-008/009/010).
 - **Metrics / counters** on start lifecycle — deferred.
-- **Broker publish observability** (paho `MessageInfo`) — RFC-002 residual.
+- ~~**Broker publish observability** (paho `MessageInfo`)~~ — **RESOLVED 2026-08-02 (RFC-012)** as R-10.7. See "Resolution (R-10.7)" below.
 - **Other broker implementations** (Redis / ROS / DDS) — R-22 unregistered.
+
+### Resolution (R-10.7)
+
+- **Resolved on**: 2026-08-02 — see [RFC-012 MQTT publish result contract](../rfc/RFC-012-mqtt-publish-result-contract.md) (Implemented).
+
+**Final implementation** (RFC-012 first-phase scope):
+
+**New public symbols** in `agentflow.broker` (re-exported from `mqtt_broker.py`):
+
+- `MqttPublishReason(Enum)` — stable short-code enum: `BROKER_NOT_RUNNING`, `BROKER_STOPPING`, `BROKER_DISCONNECTED`, `PAHO_REJECTED`, `UNSUPPORTED_RESULT`. Values are frozen for log-mining stability (RFC-012 Appendix D).
+- `MqttPublishError(RuntimeError)` — dedicated exception with 7 queryable fields: `topic`, `reason` (enum), `rc`, `mid`, `state`, `result_type`, `detail`. Subclass of RuntimeError so `Agent.publish`'s existing `except Exception` catches it (RFC-002 fire-and-forget preserved).
+
+**MqttBroker.publish rewrite** (`src/agentflow/broker/mqtt_broker.py`):
+
+- **Pre-call state snapshot** in `_state_lock` — reads `_state`, `_stopping`, `_connected` atomically. Lock released BEFORE `client.publish()` runs (statically verified — parity with RFC-005/010/011 lock hygiene).
+- **Gate priority** (RFC-012 §B modification 2):
+  1. `_stopping=True` → `MqttPublishError(BROKER_STOPPING)` — HIGHEST priority (fresh stop() request wins even if state happens to still be RUNNING)
+  2. `state != RUNNING` → `MqttPublishError(BROKER_NOT_RUNNING, state=<state>)`
+  3. `not _connected` → `MqttPublishError(BROKER_DISCONNECTED)`
+  4. else → invoke paho
+- **Explicit docstring** documents that the gate is a best-effort pre-call snapshot; NOT a full linearisation barrier with stop. Concurrent stop() may flip `_stopping=True` after the snapshot but before `client.publish` runs. The paho immediate rc is the second, authoritative layer.
+- After paho call: `_normalise_publish_result(topic, result)` parses:
+  - v2 `MQTTMessageInfo` (any object with `.rc`): `int(result.rc)`, `int(getattr(result, 'mid', None))` if non-None
+  - v1 tuple with `len >= 1`: `int(result[0])`, `int(result[1])` if available
+  - Anything else: raise `MqttPublishError(UNSUPPORTED_RESULT, result_type=<type>)`
+  - rc/mid coercion failures: raise `MqttPublishError(UNSUPPORTED_RESULT, detail='invalid rc'|'invalid mid')` with the original TypeError/ValueError preserved as `__cause__` via `raise ... from ex`
+- `rc != MQTT_ERR_SUCCESS` → `MqttPublishError(PAHO_REJECTED, rc, mid)`.
+- Success → return paho's original result unchanged (backward-compat for callers that inspect `.mid`).
+
+**Agent side — code unchanged; behaviour restored** (RFC-012 §E):
+
+- `Agent.publish` unchanged: `try: … except Exception:` catches `MqttPublishError` via RuntimeError → Exception; logs; returns None. RFC-002 fire-and-forget preserved byte-for-byte.
+- `Agent._publish_or_raise` unchanged code: `MqttPublishError` naturally propagates from broker (no explicit re-raise needed).
+- `Agent.publish_sync` unchanged code: `_publish_or_raise` raises BEFORE `event.wait(timeout)` runs → **RFC-002 fast-fail contract RESTORED** for rc failures (verified elapsed < 0.5 s vs 5 s timeout). Waiter cleanup in `finally` still runs (RFC-006/007 preserved).
+
+### Publish state gate
+
+| Condition | Raise | Rationale |
+|---|---|---|
+| `_stopping=True` (any state) | `BROKER_STOPPING` (priority 1) | Fresh stop() request wins — no publish accepted after stop() has begun |
+| `state == NEW` | `BROKER_NOT_RUNNING` (state=new) | Broker never started; paho client has no callbacks bound |
+| `state == STARTING` | `BROKER_NOT_RUNNING` (state=starting) | Connection not established; paho would return NO_CONN anyway |
+| `state ∈ {STOPPED, STOP_TIMEOUT, STOP_FAILED}` | `BROKER_NOT_RUNNING` (state=stopped/etc) | Terminal state; publish is a caller error |
+| `state ∈ {START_FAILED, START_TIMEOUT}` | `BROKER_STOPPING` (because `_stopping=True` was set by RFC-011 failure transitions) | Terminal state after failed start |
+| `state == RUNNING` + `_connected=False` | `BROKER_DISCONNECTED` | Genuine transient state (post-`_on_disconnect`, pre-reconnect) |
+| `state == RUNNING` + `_connected=True` + `_stopping=False` | Allowed → paho called | Only combination that reaches paho |
+
+### Result normalization
+
+- **v2 `MQTTMessageInfo` (any object with `.rc`)** — read `.rc` and `.mid`; success returns original object unchanged.
+- **v1 tuple `(rc, mid)`** — read positional; success returns original tuple unchanged.
+- **rc/mid coercion failure** — `MqttPublishError(UNSUPPORTED_RESULT, detail='invalid rc'|'invalid mid')` with `__cause__` preserved via `raise ... from`.
+- **`None` / arbitrary object** — `MqttPublishError(UNSUPPORTED_RESULT, result_type=<type-name>)`.
+- **Success (rc = MQTT_ERR_SUCCESS)** — returns paho's original result unchanged (backward-compat).
+
+### MqttPublishError
+
+**Fields** (all queryable):
+- `topic: str` (required)
+- `reason: MqttPublishReason` (required — enum member for identity dispatch)
+- `rc: Optional[int]` (paho code; None when gate rejected before paho)
+- `mid: Optional[int]` (paho message id; None when unavailable)
+- `state: Optional[WorkerState]` (populated for gate-time raises)
+- `result_type: Optional[str]` (populated for UNSUPPORTED_RESULT)
+- `detail: Optional[str]` (populated for rc/mid coercion failure — 'invalid rc' / 'invalid mid')
+
+**Reason short codes are stable machine-readable values** (frozen per RFC-012 Appendix D):
+- `broker_not_running`, `broker_stopping`, `broker_disconnected`, `paho_rejected`, `unsupported_result`
+
+**Message format**:
+- Base fields always included: `topic=<repr>, rc=<int|None>, mid=<int|None>, reason=<code>`
+- Optional context fields appended only when present, in order: `state=<state.value>`, `result_type=<type>`, `detail=<repr>`
+
+Example:
+```
+MQTT publish failed: topic='sensor/data', rc=4, mid=17, reason=paho_rejected
+MQTT publish failed: topic='t', rc=None, mid=None, reason=broker_not_running, state=new
+MQTT publish failed: topic='t', rc=None, mid=None, reason=unsupported_result, result_type=NoneType
+```
+
+**No shared `last_publish_error` field** (RFC-012 §Appendix A / §H rejects). Each publish call gets its own exception instance; no cross-thread state hazard.
+
+### Agent behavior
+
+- `Agent.publish` — **unchanged** code; catches `MqttPublishError` via `except Exception`; logs; returns None. RFC-002 fire-and-forget preserved byte-for-byte.
+- `Agent._publish_or_raise` — **unchanged** code; `MqttPublishError` naturally propagates (no explicit re-raise).
+- `Agent.publish_sync` — **unchanged** code; `_publish_or_raise` raises BEFORE `event.wait(timeout)` → RFC-002 fast-fail restored for rc failures. Finally cleanup (RFC-006/007) still runs.
+- Auto-reply (RFC-003) — errors contained; RC failure at `self.publish(reply_topic, ...)` swallowed by fire-and-forget; dispatcher worker thread continues.
+- Dispatcher (RFC-004) — worker-loop two-layer exception isolation preserved; MqttPublishError from a handler task increments `error_count`; next task runs.
+
+### Runtime verification (as of 2026-08-02)
+
+- Command: `PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit`
+- RFC-012 dedicated file `tests/unit/test_mqtt_broker_publish_result.py` — **74 passed** in ~0.15 s (9 categories: A basic lifecycle × 10, B rc validation × 13, C state gate × 11, D QoS unchanged × 4, E Agent integration × 10, F auto-reply/dispatcher × 3, G exception contract × 13, H payload × 4, I concurrency × 6).
+- `tests/unit/test_mqtt_broker_lifecycle.py` — **11 passed** (3 tests refactored to prime broker to RUNNING; RFC-005 semantics preserved).
+- `tests/unit/test_mqtt_broker_shutdown.py` — **53 passed** unchanged.
+- `tests/unit/test_mqtt_broker_startup_bounded.py` — **74 passed** unchanged.
+- `tests/unit/test_mqtt_broker_reconnect.py` — **48 passed** unchanged.
+- `tests/unit/core/test_agent_publish_errors.py` — **46 passed** unchanged (uses FakeBroker).
+- `tests/unit/core/test_agent_publish_sync.py` — **27 passed** unchanged.
+- Full combined regression: **525 passed, 0 failed, 0 xfailed(strict-pass), 2 xfailed** in ~49 s.
+- Zero regression across RFC-001–011.
+
+### Observable behavioural changes
+
+Five narrow, all in the correctness / fast-fail direction:
+
+1. `MqttBroker.publish` on rc failure now raises `MqttPublishError` (was: silently returned failing MessageInfo). Bug fix — no in-tree caller depended on the silent-swallow behaviour.
+2. `MqttBroker.publish` from NEW / STARTING / STOPPED / any non-RUNNING state now raises `MqttPublishError(BROKER_NOT_RUNNING/STOPPING)` (was: reached paho with predictable NO_CONN). Bug fix — no in-tree caller published from those states.
+3. `MqttBroker.publish` with `None` / unknown paho return raises `MqttPublishError(UNSUPPORTED_RESULT)` (was: returned the None/unknown to the caller). Bug fix.
+4. `Agent._publish_or_raise` now raises on paho rc failure (was: silently returned None). RFC-002 fast-fail contract RESTORED for rc failures.
+5. `Agent.publish_sync` on rc failure now fast-fails in < 50 ms (was: waited full response timeout). RFC-002 contract restored; verified elapsed < 0.5 s vs 5 s timeout in `test_E43`.
+
+### Known residuals NOT resolved by RFC-012
+
+- **Publish-vs-stop full linearization barrier** — RFC-012 §B modification 2 explicitly acknowledges the residual race: after the gate's pre-call snapshot but before `client.publish` runs, a concurrent stop() may set `_stopping=True`. paho's immediate rc validation catches this as `PAHO_REJECTED`, but there is no guarantee that publish "definitely did not reach paho" post-stop. **Open / Documented** — future "publish/stop operation barrier" RFC.
+- **QoS 1/2 delivery acknowledgment** — `wait_for_publish` bounded pattern not implemented; deferred to a future "MQTT delivery confirmation" RFC.
+- **`qos` / `retain` public kwargs** — not implemented; paired with QoS RFC.
+- **`MessageBroker` ABC result contract** — kept as `publish(self, topic, payload)` per RFC-010 §7.16 / RFC-011 §7.16 discipline; third-party subclasses unaffected.
+- **Publish metrics / counters** — deferred (parity with RFC-008/009/010/011).
+- **Offline publish queue / retry / backoff / batching / rate limiting** — separate RFCs.
+- **Other broker implementations** (Redis / ROS / DDS) — R-22 unregistered.
+- **R-10.5 non-daemon interpreter-exit blocking** — unchanged; documented across RFC-009/010/011.
 
 ---
 
@@ -1076,7 +1200,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | **Resolved 2026-07-29 (RFC-008 + RFC-009 + RFC-010 + RFC-011)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); `Agent.terminate` / `Agent.__activating` bounded + WARNING / retry via fresh broker. Only residual R-10.5 non-daemon interpreter-exit blocking remains **Open / Documented**. | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` unbounded lifecycle |
+| R-10 | High | High | **Resolved 2026-08-02 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored. Residuals: R-10.5 non-daemon interpreter-exit (**Open / Documented**) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
