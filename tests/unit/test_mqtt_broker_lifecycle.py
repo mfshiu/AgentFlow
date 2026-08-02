@@ -49,10 +49,21 @@ def test_stop_before_start_is_noop_returning_True_no_paho_calls(broker, fake_cli
 
 
 # --------------------------------------------------------------------------
-# publish()
+# publish() — post-RFC-012 requires broker to be in RUNNING + connected
+# state before publish reaches paho. Tests prime the broker to RUNNING
+# via `_prime_connected` first, and provide a valid MessageInfo return
+# so the RFC-012 rc-validation layer sees success (rc=0).
 # --------------------------------------------------------------------------
 
+class _RFC012SuccessInfo:
+    """Duck-typed MQTTMessageInfo with rc=0 (success)."""
+    rc = 0
+    mid = 1
+
+
 def test_publish_delegates_topic_and_payload_by_keyword(broker, fake_client):
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    fake_client.publish.return_value = _RFC012SuccessInfo()
     broker.publish("some/topic", b"payload-bytes")
     fake_client.publish.assert_called_once_with(
         topic="some/topic", payload=b"payload-bytes"
@@ -60,14 +71,18 @@ def test_publish_delegates_topic_and_payload_by_keyword(broker, fake_client):
 
 
 def test_publish_returns_underlying_client_result(broker, fake_client):
-    sentinel = object()
-    fake_client.publish.return_value = sentinel
+    _prime_connected(broker, fake_client)
+    info = _RFC012SuccessInfo()
+    fake_client.publish.return_value = info
     result = broker.publish("t", b"p")
-    assert result is sentinel
+    # RFC-012 §7.10: success returns paho's original result unchanged.
+    assert result is info
 
 
 def test_publish_forwards_non_bytes_payload_unchanged(broker, fake_client):
     # MqttBroker.publish does not serialise; that is the caller's job.
+    _prime_connected(broker, fake_client)
+    fake_client.publish.return_value = _RFC012SuccessInfo()
     payload_obj = {"a": 1}
     broker.publish("t", payload_obj)
     fake_client.publish.assert_called_once_with(topic="t", payload=payload_obj)

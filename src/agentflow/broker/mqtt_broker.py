@@ -1,12 +1,104 @@
 from paho.mqtt.client import Client
 from paho.mqtt.enums import CallbackAPIVersion
 import logging, os, threading, time
+from enum import Enum
 from typing import Any, Dict, Optional
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from agentflow.core.agent_worker import WorkerState
 from .message_broker import MessageBroker
 from .notifier import BrokerNotifier
+
+
+# ---------------------------------------------------------------------------
+# RFC-012: publish result contract
+# ---------------------------------------------------------------------------
+
+# Pinned locally rather than imported from paho.mqtt.enums so this
+# module is insulated from paho version restructuring. paho's own
+# MQTT_ERR_SUCCESS has always been 0 (v1 and v2).
+MQTT_ERR_SUCCESS = 0
+
+
+class MqttPublishReason(Enum):
+    """RFC-012 §7.4-§7.5 stable short codes carried on
+    MqttPublishError.reason.
+
+    Stability guarantee: enum VALUES (the strings) are frozen for
+    log-mining. Adding new members is allowed; renaming existing
+    members / values is a breaking log-schema change and requires
+    its own RFC (see RFC-012 Appendix D).
+    """
+    BROKER_NOT_RUNNING = 'broker_not_running'
+    BROKER_STOPPING = 'broker_stopping'
+    BROKER_DISCONNECTED = 'broker_disconnected'
+    PAHO_REJECTED = 'paho_rejected'
+    UNSUPPORTED_RESULT = 'unsupported_result'
+
+
+class MqttPublishError(RuntimeError):
+    """RFC-012: raised by MqttBroker.publish when the publish request
+    was rejected — either by the RFC-012 state gate (pre-call
+    snapshot) or by paho's immediate publish result.
+
+    Subclass of RuntimeError so that RFC-002's fire-and-forget
+    contract on Agent.publish continues to catch it via
+    `except Exception`.
+
+    Attributes:
+      topic       — the MQTT topic passed to publish() (str)
+      rc          — paho MQTTErrorCode int, or None when the gate
+                    rejected before paho was called
+      mid         — paho message id (int), or None when unavailable
+      reason      — MqttPublishReason enum member (stable short code)
+      state       — WorkerState at pre-call snapshot time, or None
+                    when not relevant to the failure classification
+      result_type — str name of the paho return type, or None
+                    (populated for UNSUPPORTED_RESULT diagnostics)
+      detail      — short human-readable extra context, or None
+                    (populated for UNSUPPORTED_RESULT rc/mid coercion
+                    failures)
+
+    Message format (frozen — RFC-012 Appendix D):
+        MQTT publish failed: topic=<repr>, rc=<int|None>,
+        mid=<int|None>, reason=<code>[, state=<state.value>]
+        [, result_type=<type>][, detail=<repr>]
+    """
+
+    def __init__(
+        self,
+        topic: str,
+        reason: MqttPublishReason,
+        *,
+        rc: Optional[int] = None,
+        mid: Optional[int] = None,
+        state: Optional[WorkerState] = None,
+        result_type: Optional[str] = None,
+        detail: Optional[str] = None,
+    ):
+        self.topic = topic
+        self.rc = rc
+        self.mid = mid
+        self.reason = reason
+        self.state = state
+        self.result_type = result_type
+        self.detail = detail
+
+        # Build the human-readable message. Field order and separator
+        # are stable for log-mining (RFC-012 Appendix D).
+        parts = [
+            f"topic={topic!r}",
+            f"rc={rc}",
+            f"mid={mid}",
+            f"reason={reason.value}",
+        ]
+        if state is not None:
+            parts.append(f"state={state.value}")
+        if result_type is not None:
+            parts.append(f"result_type={result_type}")
+        if detail is not None:
+            parts.append(f"detail={detail!r}")
+        super().__init__("MQTT publish failed: " + ", ".join(parts))
 
 
 class MqttBroker(MessageBroker):
@@ -960,7 +1052,158 @@ class MqttBroker(MessageBroker):
 
 
     def publish(self, topic: str, payload):
-        return self._client.publish(topic=topic, payload=payload)
+        """RFC-012 publish with state gate + immediate-result validation.
+
+        Raises MqttPublishError when:
+          - the pre-call state gate rejects (state != RUNNING, or
+            _stopping=True, or _connected=False);
+          - paho returned an unsupported result shape;
+          - paho's immediate result rc != MQTT_ERR_SUCCESS.
+
+        Returns paho's original result unchanged on success.
+
+        State gate — IMPORTANT (RFC-012 modification 2):
+
+          The gate is a PRE-CALL best-effort snapshot; it is NOT a
+          full linearization barrier with stop(). Concurrent stop()
+          on another thread may flip `_stopping=True` AFTER our
+          snapshot but BEFORE `client.publish()` runs, in which
+          case this publish will still reach paho. paho's immediate
+          rc (checked below the gate) is the second, authoritative
+          layer of validation; a truly rejected publish will surface
+          as MqttPublishError(PAHO_REJECTED). A full stop-linearized
+          barrier is out of scope for this RFC (see Appendix E) and
+          is deferred to a future "publish/stop operation barrier"
+          RFC.
+
+        Lock hygiene:
+          `_state_lock` is held only across the short snapshot; it
+          is released BEFORE `client.publish()` is called (parity
+          with RFC-005 / RFC-010 / RFC-011 lock hygiene).
+        """
+        # -- Pre-call state snapshot (best-effort — NOT linearized
+        # with stop; see docstring).
+        with self._state_lock:
+            state = self._state
+            stopping = self._stopping
+            connected = self._connected
+
+        # -- Gate priority order (RFC-012 §B modification 2):
+        #    1. stopping wins over state (fresh stop request)
+        #    2. state != RUNNING
+        #    3. state == RUNNING but not currently connected
+        if stopping:
+            raise MqttPublishError(
+                topic=topic,
+                reason=MqttPublishReason.BROKER_STOPPING,
+                state=state,
+            )
+        if state is not WorkerState.RUNNING:
+            raise MqttPublishError(
+                topic=topic,
+                reason=MqttPublishReason.BROKER_NOT_RUNNING,
+                state=state,
+            )
+        if not connected:
+            raise MqttPublishError(
+                topic=topic,
+                reason=MqttPublishReason.BROKER_DISCONNECTED,
+                state=state,
+            )
+
+        # -- paho call OUTSIDE the state lock.
+        # A raise from paho itself propagates unchanged (RFC-002
+        # convention preserved for Exception paths).
+        result = self._client.publish(topic=topic, payload=payload)
+
+        # -- Result normalisation + rc validation (authoritative
+        # layer; catches races where stop() started after our
+        # snapshot).
+        rc, mid = self._normalise_publish_result(topic, result)
+        if rc != MQTT_ERR_SUCCESS:
+            raise MqttPublishError(
+                topic=topic,
+                reason=MqttPublishReason.PAHO_REJECTED,
+                rc=rc,
+                mid=mid,
+            )
+        return result
+
+
+    def _normalise_publish_result(self, topic: str, result):
+        """RFC-012 §C: parse the paho publish() return into (rc, mid).
+
+        Supported shapes:
+          - paho v2: MQTTMessageInfo (or any object with .rc)
+          - paho v1: tuple (rc, mid[, ...])
+          - test fakes: any of the above
+
+        Unsupported shapes (raise MqttPublishError UNSUPPORTED_RESULT):
+          - None
+          - arbitrary objects without .rc or [0] index access
+
+        Coercion failures (int(rc) / int(mid) raise): re-raised as
+        MqttPublishError UNSUPPORTED_RESULT with the original
+        exception as __cause__ (via `raise ... from`).
+        """
+        # Case 1: paho v2 or duck-typed object with .rc attribute.
+        if hasattr(result, 'rc'):
+            raw_rc = result.rc
+            raw_mid = getattr(result, 'mid', None)
+            try:
+                rc = int(raw_rc)
+            except (TypeError, ValueError) as ex:
+                raise MqttPublishError(
+                    topic=topic,
+                    reason=MqttPublishReason.UNSUPPORTED_RESULT,
+                    result_type=type(result).__name__,
+                    detail="invalid rc",
+                ) from ex
+            mid: Optional[int] = None
+            if raw_mid is not None:
+                try:
+                    mid = int(raw_mid)
+                except (TypeError, ValueError) as ex:
+                    raise MqttPublishError(
+                        topic=topic,
+                        reason=MqttPublishReason.UNSUPPORTED_RESULT,
+                        rc=rc,
+                        result_type=type(result).__name__,
+                        detail="invalid mid",
+                    ) from ex
+            return rc, mid
+
+        # Case 2: paho v1 (rc, mid) tuple (or longer).
+        if isinstance(result, tuple) and len(result) >= 1:
+            try:
+                rc = int(result[0])
+            except (TypeError, ValueError) as ex:
+                raise MqttPublishError(
+                    topic=topic,
+                    reason=MqttPublishReason.UNSUPPORTED_RESULT,
+                    result_type=type(result).__name__,
+                    detail="invalid rc",
+                ) from ex
+            mid = None
+            if len(result) >= 2 and result[1] is not None:
+                try:
+                    mid = int(result[1])
+                except (TypeError, ValueError) as ex:
+                    raise MqttPublishError(
+                        topic=topic,
+                        reason=MqttPublishReason.UNSUPPORTED_RESULT,
+                        rc=rc,
+                        result_type=type(result).__name__,
+                        detail="invalid mid",
+                    ) from ex
+            return rc, mid
+
+        # Case 3: unsupported shape (None, arbitrary object).
+        raise MqttPublishError(
+            topic=topic,
+            reason=MqttPublishReason.UNSUPPORTED_RESULT,
+            result_type=type(result).__name__,
+        )
 
     def subscribe(self, topic: str, data_type):
         # RFC-005 §7.3: desired-state first; only forward when currently
