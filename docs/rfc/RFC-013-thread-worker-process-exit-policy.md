@@ -854,15 +854,22 @@ The 2 pre-existing strict xfails (RFC-006 multi-caller `topic_wait`;
 multi-handler-per-topic fan-out) are **retained unchanged**, per §10
 criterion 1.
 
-> **Pre-existing flaky test — not addressed by RFC-013.**
+> **Pre-existing flaky test — outside RFC-013's scope, fixed separately.**
 > `tests/unit/core/test_agent_publish_sync_concurrency.py::test_atomic_ownership_under_concurrent_race_stress`
-> was observed failing intermittently during this work (a randomised
-> race-stress trial; failed on one full-suite run, passed on the next).
-> It was reproduced **failing at clean `HEAD` in a separate worktree
-> with none of the RFC-013 changes applied**, confirming it is
-> pre-existing and unrelated to this RFC. RFC-013 **does not claim to
-> fix it**; it is tracked separately under the R-14 / RFC-006 publish_sync
-> concurrency area.
+> was observed failing intermittently during this work (~7% per run,
+> `completed == 2`). It was reproduced **failing at clean `HEAD` in a
+> separate worktree with none of the RFC-013 changes applied**,
+> confirming it is pre-existing and unrelated to this RFC. **RFC-013
+> makes no claim to fix it, and no RFC-013 change touched it.**
+>
+> It was subsequently root-caused and fixed as a standalone
+> **R-14 / RFC-006 test-quality** change on 2026-08-03: the test's
+> barrier synchronised only *entry* to `publish_sync`, so a
+> late-scheduled caller could acquire ownership after the owner's
+> `finally` released it — sequential ownership transfer, which is
+> correct behaviour, not a defect in RFC-006's guard. The test now
+> enforces the overlap it intends to observe. **No production code
+> changed.** See `docs/audit/06-test-coverage.md` for the full analysis.
 
 ### 12.7 Acceptance criteria (§10) outcome
 

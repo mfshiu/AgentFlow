@@ -44,16 +44,35 @@ Broken down (single collected run):
 
 The two remaining xfails (`test_both_callers_should_receive_own_response_with_shared_topic_wait`, `test_framework_should_support_multiple_handlers_per_topic`) are deferred to a future RFC on correlation ID / multi-handler fan-out. **Both retained unchanged under RFC-013.**
 
-> **Known pre-existing flaky test — not addressed by RFC-013.**
+> **Resolved test-quality defect (2026-08-03) — R-14 / RFC-006 area, NOT part of RFC-013.**
 > `tests/unit/core/test_agent_publish_sync_concurrency.py::test_atomic_ownership_under_concurrent_race_stress`
-> is a randomised race-stress test that fails intermittently (observed
-> failing on one full-suite run during RFC-013 work, passing on the
-> next; the clean 598-passed result above is a run in which it passed).
-> It was reproduced **failing at clean `HEAD` in a separate worktree with
-> none of the RFC-013 changes applied**, confirming it is pre-existing
-> and unrelated. **RFC-013 does not claim to fix it.** Tracked separately
-> under the R-14 / RFC-006 publish_sync concurrency area; a future fix
-> should either make the trial deterministic or bound the assertion.
+> was flaking at roughly **7% per run** with `completed == 2`. It was first
+> reproduced **failing at clean `HEAD` in a separate worktree with none of the
+> RFC-013 changes applied**, confirming it was pre-existing and unrelated to
+> RFC-013.
+>
+> **Root cause — a test defect, not a product defect.** `barrier.wait()` only
+> synchronised *entry* to `publish_sync`; nothing kept the 8 callers
+> overlapping. The owner's full round-trip (register → subscribe → publish →
+> `FakeBroker`'s synchronous inline auto-response → return → pop at
+> `agent.py:705-710`) measured ~250 µs, the same order as post-barrier thread
+> wake-up jitter (~265 µs observed). A straggler scheduled after the owner's
+> `finally` released the topic then legitimately acquired ownership as the
+> *next* owner. Event-timeline instrumentation confirmed this directly:
+> `collisions == 6` for the genuinely-overlapping callers, no orphan handler,
+> and zero unexpected errors in every failing trial — i.e. **sequential
+> ownership transfer**, the behaviour
+> `test_check_and_pop_atomicity_prevents_torn_state` asserts as correct.
+> **RFC-006's ownership guard was never at fault**; the atomic check+register
+> (`agent.py:669-685`) and identity-check+pop (`705-710`) both held throughout.
+>
+> **Fix** — the test now *enforces* the overlap it was written to observe: a
+> second barrier (`overlap_gate`) holds the owner inside `broker.publish`,
+> after it has registered ownership and before it can receive its response
+> and release it, until all 7 other callers have passed their ownership
+> check. `completed == 1` / `collisions == 7` are now deterministic. No
+> production code changed. Verified 40/40 sequential runs plus 4 concurrent
+> runs under CPU contention, against the ~7% pre-fix rate.
 
 Historical intermediate results:
 - Pre-RFC-006/007: 216 passed / 0 xfailed.
