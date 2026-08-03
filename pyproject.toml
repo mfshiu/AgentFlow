@@ -2,3 +2,29 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+markers = [
+    "quarantine: legacy test kept for reference; not run in default suite",
+    "integration: requires live external services (e.g. MQTT broker)",
+    "security: security-relevant test; may include known-failing forcing functions",
+    "manual: manual demonstration script; not an automated test",
+]
+norecursedirs = [
+    "unit_test",
+    "exe_test",
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "docs",
+    "_bak",
+    "_log",
+]

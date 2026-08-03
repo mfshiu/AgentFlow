@@ -1,12 +1,16 @@
 import inspect
 import logging
+import pickle
 import queue
 import random
 import string
 import threading
-import time 
+import time
+import warnings
+from dataclasses import dataclass
+from enum import Enum
 from tkinter import N
-from typing import final, Optional
+from typing import Callable, final, Optional
 import uuid
 
 from agentflow.core.parcel import Parcel
@@ -16,10 +20,47 @@ from agentflow.broker.broker_maker import BrokerMaker
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
+from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 
 
 import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
+
+
+
+class TopicWaitCollisionError(RuntimeError):
+    """Raised when a topic is already reserved by an active
+    publish_sync waiter and another operation would trample it
+    (RFC-006, RFC-007).
+
+    Contexts that raise this exception:
+      - publish_sync-vs-publish_sync collision (RFC-006)
+      - publish_sync on a topic already held by a normal subscribe
+        handler (RFC-007)
+      - Agent.subscribe on a topic reserved by an active publish_sync
+        waiter (RFC-007)
+      - Agent.unsubscribe on a topic reserved by an active
+        publish_sync waiter (RFC-007)
+    The exception message distinguishes the context."""
+
+
+class _HandlerOwnerType(Enum):
+    """Internal (RFC-007): owner tag for an Agent handler registry
+    entry. NORMAL is registered via Agent.subscribe; PUBLISH_SYNC is
+    the transient closure registered by Agent.publish_sync while it
+    waits for a response."""
+    NORMAL = "normal"
+    PUBLISH_SYNC = "publish_sync"
+
+
+@dataclass(frozen=True)
+class _HandlerRecord:
+    """Internal (RFC-007): value type for Agent.__topic_handlers.
+    Bundles the caller-provided handler with an owner tag so that
+    Agent.subscribe / Agent.unsubscribe can refuse to trample an
+    active publish_sync waiter."""
+    owner_type: _HandlerOwnerType
+    handler: Callable
 
 
 
@@ -43,15 +84,128 @@ class Agent(BrokerNotifier):
         
         self._message_broker = None
         self.__topic_handlers: dict[str, function] = {}
-        
+        # RFC-006: guards atomic collision-check-and-register and
+        # atomic identity-check-and-pop for publish_sync. Uses RLock
+        # for future-proofing (RFC-006 Appendix B).
+        self._handlers_lock = threading.RLock()
+
         self._broker = None
         self._connected_once = False
-        
+
+        # RFC-004: bounded message dispatch. Dispatcher is created
+        # lazily on first _on_message so that tests / lifecycles that
+        # never receive a message do not pay for consumer threads.
+        # DeprecationWarning for the legacy escape hatch fires eagerly
+        # so users see it at Agent construction time even before any
+        # message flows.
+        self._dispatcher = None
+        self._dispatcher_init_lock = threading.Lock()
+        if self.config.get('dispatch', {}).get('mode') == 'per_message_thread':
+            warnings.warn(
+                "Agent dispatch mode 'per_message_thread' is deprecated "
+                "(RFC-004). This escape hatch will be removed in a future "
+                "release; migrate to the bounded dispatcher (the default).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+
+# ==================
+#  Agent Pickle protocol (RFC-008 — ProcessWorker spawn compatibility)
+# ==================
+
+    # Attributes excluded from pickle. Locks and Broker / Dispatcher /
+    # back-reference to Worker are runtime-only and either not
+    # picklable (RLock, paho Client, threading.Event) or meaningless
+    # in a child process context.
+    _RUNTIME_ONLY_FIELDS = frozenset({
+        '_handlers_lock',
+        '_dispatcher_init_lock',
+        '_dispatcher',
+        '_broker',
+        '_agent_worker',
+        '_message_broker',
+        '_children',
+        '_parents',
+    })
+
+    def __getstate__(self):
+        """RFC-008 §A: return a picklable, declarative-only snapshot
+        of the Agent. Runtime resources (locks, broker, dispatcher,
+        worker back-reference, children/parents runtime registry) are
+        excluded; they will be reinstated fresh by __setstate__ in
+        the unpickling process (typically a spawned child).
+
+        Fails fast (TypeError) if the config or any registered handler
+        cannot be pickled. The message names the offending topic(s)
+        so callers can move handler registration into on_activate().
+        """
+        state = self.__dict__.copy()
+        for field in Agent._RUNTIME_ONLY_FIELDS:
+            state.pop(field, None)
+
+        # Validate config is picklable so start-time failure surfaces
+        # here with a helpful message rather than a bare pickle error
+        # deep inside Process.start().
+        try:
+            pickle.dumps(state.get('config', {}))
+        except Exception as ex:
+            raise TypeError(
+                f"Agent.config contains non-picklable content and cannot "
+                f"be shipped to a spawned child process: {ex}. Move "
+                f"non-picklable configuration (closures, lambdas, live "
+                f"objects) into on_activate() so it is created inside "
+                f"the child."
+            ) from ex
+
+        # Validate every registered handler is picklable; fail fast
+        # naming the offending topic(s). Never silently omit handlers.
+        handlers_key = '_Agent__topic_handlers'
+        handlers = state.get(handlers_key, {}) or {}
+        offending_topics = []
+        for topic, record in handlers.items():
+            handler = record.handler if hasattr(record, 'handler') else record
+            try:
+                pickle.dumps(handler)
+            except Exception:
+                offending_topics.append(topic)
+        if offending_topics:
+            raise TypeError(
+                f"Agent.__topic_handlers contains non-picklable "
+                f"handlers for topic(s) "
+                f"{sorted(str(t) for t in offending_topics)!r}; cannot "
+                f"ship to a spawned child process. Register these "
+                f"handlers inside on_activate() (which runs in the "
+                f"child) rather than in the parent, so they are "
+                f"created locally in the child rather than pickled "
+                f"across the process boundary."
+            )
+        return state
+
+    def __setstate__(self, state):
+        """RFC-008 §A: restore declarative state and reinstate all
+        runtime-only fields with fresh instances. Called in the child
+        after unpickle. Preserves RFC-006/RFC-007 ownership shape:
+        _HandlerRecord entries carry their owner_type across the
+        pickle boundary; a fresh RLock guards the registry in the
+        child process."""
+        self.__dict__.update(state)
+        self._handlers_lock = threading.RLock()
+        self._dispatcher_init_lock = threading.RLock()
+        self._dispatcher = None
+        self._broker = None
+        self._agent_worker = None
+        self._message_broker = None
+        self._children = {}
+        self._parents = {}
+        if '_Agent__topic_handlers' not in self.__dict__:
+            self._Agent__topic_handlers = {}
+
 
 # ==================
 #  Agent Initializing
 # ==================
-        
+
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
@@ -95,12 +249,129 @@ class Agent(BrokerNotifier):
 
 
     def terminate(self):
+        """Fire-and-forget termination — never raises.
+
+        Order (unchanged, RFC-004 / RFC-009 §7.16):
+          1. dispatcher.stop() — bounded per RFC-004
+          2. worker.stop()     — bounded per RFC-008 (ProcessWorker)
+                                 or RFC-009 (ThreadWorker)
+
+        RFC-009 §E: this method inspects the worker.stop() return
+        value. Post-RFC-009 ThreadWorker returns bool (True=stopped,
+        False=STOP_TIMEOUT). When False, we log a WARNING with the
+        worker state; we do NOT raise. Legacy workers that return
+        None (e.g. FakeWorker in tests) are treated as success.
+
+        Bounded return of terminate() ONLY guarantees this method
+        itself returns. If the worker ended at STOP_TIMEOUT and the
+        thread is non-daemon (RFC-009 §7.13), Python interpreter
+        shutdown may still block on that thread. This is a
+        documented limitation, not a bug — see RFC-009 §H.
+        """
         logger.info(self.M(f"self.__agent_worker: {self._agent_worker}"))
-        
-        if self._agent_worker:
-            self._agent_worker.stop()
-        else:
+
+        # RFC-004: stop the dispatcher first so consumer threads can
+        # drain their queue while the broker is still up. Idempotent —
+        # safe to call from both terminate() and __deactivating().
+        if self._dispatcher is not None:
+            try:
+                self._dispatcher.stop()
+            except Exception as ex:
+                # Preserve fire-and-forget contract: dispatcher.stop
+                # is already bounded and idempotent (RFC-004); log
+                # any exception and continue to worker.stop().
+                logger.exception(self.M(
+                    f"terminate: dispatcher.stop() raised: {ex!r}"
+                ))
+
+        if not self._agent_worker:
             logger.warning(self.M(f"The agent might not have started yet."))
+            return
+
+        # RFC-009 §E: bounded worker.stop() with observed return value.
+        try:
+            stop_result = self._agent_worker.stop()
+        except Exception as ex:
+            logger.exception(self.M(
+                f"terminate: worker.stop() raised: {ex!r}"
+            ))
+            return
+
+        if stop_result is False:
+            # RFC-013 diagnostics: capability-based reads so this path
+            # works for any Worker subclass (ThreadWorker exposes the
+            # new properties; ProcessWorker / FakeWorker do not — for
+            # those, `getattr(..., default)` gracefully falls back and
+            # `requires_process_restart` becomes False → the existing
+            # WARNING path is taken).
+            #
+            # The diagnostics block itself is guarded so a misbehaving
+            # property (e.g. a subclass that raises from `.state`)
+            # cannot break Agent.terminate's never-raise contract.
+            needs_restart = False
+            state = 'unknown'
+            worker_type = type(self._agent_worker).__name__
+            thread = None
+            alive = None
+            daemon = None
+            ident = None
+            try:
+                state = getattr(self._agent_worker, 'state', 'unknown')
+                thread = getattr(self._agent_worker, 'work_thread', None)
+                needs_restart = bool(getattr(
+                    self._agent_worker, 'requires_process_restart', False,
+                ))
+                alive = getattr(self._agent_worker, 'thread_alive', None)
+                daemon = getattr(self._agent_worker, 'thread_daemon', None)
+                ident = getattr(
+                    self._agent_worker, 'worker_thread_ident', None,
+                )
+            except Exception as diag_ex:
+                # A property getter raised — do not let that break
+                # terminate's never-raise contract. Fall through to
+                # the WARNING path with what we already gathered.
+                try:
+                    logger.exception(self.M(
+                        f"terminate: diagnostics property raised "
+                        f"(continuing with best-effort values): "
+                        f"{diag_ex!r}"
+                    ))
+                except Exception:
+                    pass
+                needs_restart = False
+
+            if needs_restart:
+                # RFC-013 §7.7: ERROR-level signal — operator /
+                # supervisor intervention required. At most one ERROR
+                # per Agent.terminate invocation (this branch runs at
+                # most once).
+                try:
+                    logger.error(self.M(
+                        f"terminate: PROCESS RESTART REQUIRED — "
+                        f"worker_type={worker_type}, state={state}, "
+                        f"thread_ident={ident}, thread_alive={alive}, "
+                        f"daemon={daemon}. terminate() has returned "
+                        f"but the worker thread is a non-daemon thread "
+                        f"in STOP_TIMEOUT — external process restart "
+                        f"or supervisor containment required. Python "
+                        f"interpreter will NOT exit until an external "
+                        f"supervisor terminates this process. See "
+                        f"RFC-013."
+                    ))
+                except Exception:
+                    pass
+            else:
+                # Existing WARNING path preserved (recoverable
+                # STOP_TIMEOUT: worker thread may still be alive but
+                # is not the R-10.5 blocker — e.g. thread died on its
+                # own, or worker doesn't expose the RFC-013 property).
+                logger.warning(self.M(
+                    f"terminate: worker did not stop within its deadline; "
+                    f"state={state}, thread={thread!r}. terminate() has "
+                    f"returned but the worker thread may still be alive; "
+                    f"because daemon=False, Python interpreter shutdown "
+                    f"may still block on this thread (see RFC-009 §H)."
+                ))
 
 
 
@@ -256,12 +527,45 @@ class Agent(BrokerNotifier):
         threading.Thread(target=stop).start()          
 
 
-    def __deactivating(self):        
+    def __deactivating(self):
+        """Fire-and-forget deactivation — never raises.
+
+        RFC-010 §H integration: observes `broker.stop()`'s bool
+        return. On False (STOP_TIMEOUT or STOP_FAILED per RFC-010),
+        logs a WARNING with the broker's state and last_stop_exception.
+        Legacy brokers whose `stop()` returns None are treated as
+        success. Any exception from `broker.stop()` is logged and
+        swallowed (parity with the Agent.terminate never-raise
+        contract).
+
+        Bounded return of __deactivating() only guarantees this
+        method returns; it does NOT guarantee the paho network
+        thread was reclaimed. See RFC-010 Appendix A / RFC-009 §H.
+        """
         self.on_terminating()
-            
+
         if self._broker:
-            self._broker.stop()
-        
+            try:
+                stopped = self._broker.stop()
+            except Exception as ex:
+                logger.exception(self.M(
+                    f"__deactivating: broker.stop() raised: {ex!r}"
+                ))
+            else:
+                if stopped is False:
+                    state = getattr(self._broker, 'state', 'unknown')
+                    last_exc = getattr(
+                        self._broker, 'last_stop_exception', None,
+                    )
+                    logger.warning(self.M(
+                        f"broker.stop() did not complete within its "
+                        f"deadline; state={state}, "
+                        f"last_stop_exception={last_exc!r}. "
+                        f"__deactivating has returned but the paho "
+                        f"network thread may still be alive. See "
+                        f"RFC-010 Appendix A / RFC-009 §H."
+                    ))
+
         self.on_terminated()
         
 
@@ -303,14 +607,28 @@ class Agent(BrokerNotifier):
 
     @final
     def publish(self, topic, data=None):
-        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)      
+        # Fire-and-forget contract: catch every Exception so callers who
+        # ignore the return value never see a broker-side failure. To
+        # get the raise-on-failure variant, use publish_sync (which
+        # goes through _publish_or_raise) or call _publish_or_raise
+        # directly.
         try:
-            if self._broker:
-                self._broker.publish(topic, pcl.payload())
-            else:
-                logger.error("Cannot publish: _broker is None.")
+            self._publish_or_raise(topic, data)
         except Exception as ex:
             logger.exception(ex)
+
+
+    def _publish_or_raise(self, topic, data=None) -> None:
+        """Internal strict publish. Wraps `data` as a Parcel and forwards
+        it to the broker. Unlike Agent.publish, propagates every broker
+        exception to the caller and raises RuntimeError when no broker
+        is attached. Used by publish_sync to enable fast-fail semantics.
+        Marked with a single leading underscore to signal that this is
+        internal-use only; API stability is not guaranteed."""
+        pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)
+        if self._broker is None:
+            raise RuntimeError("Cannot publish: no broker attached")
+        self._broker.publish(topic, pcl.payload())
 
         
     def __generate_return_topic(self, topic):
@@ -336,32 +654,124 @@ class Agent(BrokerNotifier):
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
-            # logger.verbose(self.M(f"topic_resp: {topic_resp}, data_resp: {str(pcl_resp)[:400]}.."))
+            # Duplicate arriving before cleanup: keep the first response.
+            if data_event.event.is_set():
+                return
             data_event.data = pcl_resp
             data_event.event.set()
 
-        self.subscribe(pcl.topic_return, topic_handler=handle_response)
-        self.publish(topic, pcl)
+        # RFC-006 + RFC-007: atomic collision check + register under
+        # _handlers_lock. Any pre-existing record (NORMAL or
+        # PUBLISH_SYNC) is a collision; distinguish in the exception
+        # message. Register as PUBLISH_SYNC owner so subscribe/unsubscribe
+        # from other callers can refuse to trample the waiter (RFC-007
+        # §7.3, §7.4).
+        with self._handlers_lock:
+            existing = self.__topic_handlers.get(pcl.topic_return)
+            if existing is not None:
+                if existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                    raise TopicWaitCollisionError(
+                        f"topic_wait {pcl.topic_return!r} is already awaited "
+                        f"by another publish_sync on this Agent"
+                    )
+                # NORMAL owner: publish_sync must not trample it.
+                raise TopicWaitCollisionError(
+                    f"topic_wait {pcl.topic_return!r} is already registered "
+                    f"by a normal subscribe handler; publish_sync would "
+                    f"trample it and is refused"
+                )
+            self.__topic_handlers[pcl.topic_return] = _HandlerRecord(
+                _HandlerOwnerType.PUBLISH_SYNC, handle_response,
+            )
 
-        if data_event.event.wait(timeout):
-            return data_event.data
-        else:
+        try:
+            # broker.subscribe outside the collision lock (RFC-005
+            # principle: never hold a framework lock across broker I/O).
+            if self._broker:
+                self._broker.subscribe(pcl.topic_return, "str")
+            # _publish_or_raise propagates broker exceptions so that the
+            # caller fails fast on publish errors instead of waiting for
+            # the full response timeout (RFC-002).
+            self._publish_or_raise(topic, pcl)
+            if data_event.event.wait(timeout):
+                return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
+        finally:
+            # RFC-006 §7.5 + RFC-007 §7.8: triple check under lock —
+            # record exists, owner is PUBLISH_SYNC, handler identity
+            # matches. Only then pop and unsubscribe. broker.unsubscribe
+            # outside the lock so we never hold a framework lock across
+            # broker I/O.
+            with self._handlers_lock:
+                record = self.__topic_handlers.get(pcl.topic_return)
+                if (record is not None
+                        and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+                        and record.handler is handle_response):
+                    self.__topic_handlers.pop(pcl.topic_return, None)
+                    need_broker_unsubscribe = True
+                else:
+                    need_broker_unsubscribe = False
+            if need_broker_unsubscribe:
+                try:
+                    if self._broker:
+                        self._broker.unsubscribe(pcl.topic_return)
+                except Exception as cleanup_ex:
+                    logger.exception(cleanup_ex)
 
 
     @final
     def subscribe(self, topic, data_type:str="str", topic_handler=None):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
-        
+
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
-        
-        if topic_handler:
-            if topic in self.__topic_handlers:
-                logger.warning(self.M(f"Exist the handler for topic: {topic}"))
-            self.__topic_handlers[topic] = topic_handler
 
+        if topic_handler:
+            # RFC-007 §7.3: refuse to trample an active publish_sync
+            # waiter; preserve warn+overwrite for normal rebind
+            # (RFC-006 §7.11 preserved).
+            with self._handlers_lock:
+                existing = self.__topic_handlers.get(topic)
+                if existing is not None and existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                    raise TopicWaitCollisionError(
+                        f"topic {topic!r} is currently reserved by an "
+                        f"active publish_sync waiter; direct subscribe "
+                        f"is refused"
+                    )
+                if existing is not None:
+                    logger.warning(self.M(f"Exist the handler for topic: {topic}"))
+                self.__topic_handlers[topic] = _HandlerRecord(
+                    _HandlerOwnerType.NORMAL, topic_handler,
+                )
+
+        # broker.subscribe outside the lock (RFC-005/006 lock hygiene).
         return self._broker.subscribe(topic, data_type) if self._broker else None
+
+
+    @final
+    def unsubscribe(self, topic: str) -> None:
+        """Reverse a prior subscribe(topic, topic_handler=...) call.
+        Removes the handler entry from __topic_handlers if present and
+        asks the broker to unsubscribe. Idempotent: calling twice or on
+        an unknown topic does not raise. Safe to call when the broker
+        has not been created yet (_broker is None).
+
+        RFC-007 §7.4: refuses to remove a publish_sync-owned entry;
+        raises TopicWaitCollisionError instead.
+        """
+        # RFC-007: lock + owner check + pop under lock.
+        with self._handlers_lock:
+            existing = self.__topic_handlers.get(topic)
+            if existing is not None and existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
+                raise TopicWaitCollisionError(
+                    f"topic {topic!r} is currently reserved by an "
+                    f"active publish_sync waiter; direct unsubscribe "
+                    f"is refused"
+                )
+            self.__topic_handlers.pop(topic, None)
+        # broker.unsubscribe outside the lock.
+        if self._broker:
+            self._broker.unsubscribe(topic)
     
     
     def __register_child(self, child_id:str, child_info:dict):
@@ -535,31 +945,90 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
-        # logger.debug(self.M(f"topic: {topic}, data: {data}"))        
+        # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         pcl = Parcel.from_payload(data)
 
-        topic_handler = self.__topic_handlers.get(topic, self.on_message)
-        
-        def handle_message(topic_handler, topic, p:Parcel):
-            if p.topic_return:
+        # RFC-007 §7.7: atomic single-snapshot read of the handler
+        # registry under _handlers_lock. is_specific_handler and
+        # topic_handler are decided from ONE snapshot to eliminate the
+        # pre-RFC-007 TOCTOU between the 'in' check and the '.get()'
+        # call. Dispatch happens outside the lock via the RFC-004
+        # dispatcher.
+        with self._handlers_lock:
+            record = self.__topic_handlers.get(topic)
+            if record is not None:
+                is_specific_handler = True
+                topic_handler = record.handler
+            else:
+                is_specific_handler = False
+                topic_handler = self.on_message
+        # RFC-003 R-fallback-silent: only topics with a specifically
+        # registered handler in __topic_handlers may trigger an
+        # auto-reply.
+        should_auto_reply = bool(pcl.topic_return) and is_specific_handler
+
+        def handle_message():
+            if should_auto_reply:
                 try:
-                    logger.debug(f"topic: {topic}, topic_return: {p.topic_return}")
-                    data_resp = topic_handler(topic, p)
+                    logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
+                    data_resp = topic_handler(topic, pcl)
                 except Exception as ex:
                     logger.exception(ex)
-                    p.error = str(ex)
-                    p.content = None
-                    data_resp = p
+                    # RFC-003 R-exception-fresh: build a new parcel for
+                    # the error echo; do NOT mutate or reuse pcl.
+                    err_pcl = Parcel.from_content(None)
+                    err_pcl.error = str(ex)
+                    data_resp = err_pcl
                     logger.debug(data_resp)
-                finally:
-                    self.publish(pcl.topic_return, data_resp)
+                # RFC-003 R-strip-topic_return: the auto-reply must
+                # never carry topic_return. If the handler returned a
+                # Parcel whose topic_return is truthy, reconstruct
+                # instead of mutating the caller's object.
+                if isinstance(data_resp, Parcel) and data_resp.topic_return:
+                    stripped = type(data_resp)(data_resp.content)
+                    stripped.error = data_resp.error
+                    data_resp = stripped
+                self.publish(pcl.topic_return, data_resp)
             else:
                 try:
-                    topic_handler(topic, p)
+                    topic_handler(topic, pcl)
                 except Exception as ex:
                     logger.exception(ex)
 
-        threading.Thread(target=handle_message, args=(topic_handler, topic, pcl)).start()
+        # RFC-004: dispatch via the bounded message dispatcher instead
+        # of spawning one Thread per message. enqueue() never raises
+        # (broker-callback safety invariant, §7.3).
+        self._get_dispatcher().enqueue(handle_message, topic=topic)
+
+
+    def __create_dispatcher(self):
+        """RFC-004: build the dispatcher configured for this Agent.
+        Default is the bounded MessageDispatcher; the legacy
+        per-message-thread mode is available as a deprecated escape
+        hatch."""
+        dispatch_cfg = self.config.get('dispatch', {}) or {}
+        mode = dispatch_cfg.get('mode', 'bounded')
+        if mode == 'per_message_thread':
+            return LegacyPerMessageDispatcher()
+        workers = int(dispatch_cfg.get('workers', 8))
+        queue_capacity = int(dispatch_cfg.get('queue_capacity', 1024))
+        shutdown_timeout_s = float(dispatch_cfg.get('shutdown_timeout_s', 5.0))
+        return MessageDispatcher(
+            workers=workers,
+            queue_capacity=queue_capacity,
+            shutdown_timeout_s=shutdown_timeout_s,
+            name=f'MessageDispatcher-{self.tag}',
+        )
+
+
+    def _get_dispatcher(self):
+        """Lazy, thread-safe dispatcher accessor. First call creates
+        the dispatcher (and its consumer threads)."""
+        if self._dispatcher is None:
+            with self._dispatcher_init_lock:
+                if self._dispatcher is None:
+                    self._dispatcher = self.__create_dispatcher()
+        return self._dispatcher
 
 
     def on_connected(self):

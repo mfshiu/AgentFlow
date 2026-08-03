@@ -25,3 +25,10 @@ class MessageBroker(ABC):
     @abstractmethod
     def subscribe(self, topic:str, data_type):
         """Subscribe the topic."""
+
+
+    def unsubscribe(self, topic:str) -> None:
+        """Release a prior subscription. Default no-op so that existing
+        MessageBroker subclasses remain valid. Concrete brokers that
+        maintain a real subscription table should override."""
+        return None

@@ -1,0 +1,135 @@
+"""Verify MqttBroker.stop / publish / subscribe with a mocked paho Client.
+
+Target module: agentflow.broker.mqtt_broker (real code).
+"""
+
+
+def _prime_connected(broker, fake_client):
+    """Post-RFC-005: subscribe/unsubscribe only forward to the paho
+    client when the broker is currently connected. Fire _on_connect
+    once so the broker enters the connected state, then reset the
+    fake client's mock counters so tests can assert on the calls that
+    matter to them."""
+    broker._on_connect(
+        client=fake_client, userdata=None, flags={},
+        reasonCode=0, properties=None,
+    )
+    fake_client.subscribe.reset_mock()
+    fake_client.unsubscribe.reset_mock()
+
+
+# --------------------------------------------------------------------------
+# stop() — post-RFC-010: bounded helper-thread wrapper; NEW.stop() is a
+# no-op returning True. Tests that need paho calls now prime the broker
+# into RUNNING via `_prime_connected` first.
+# --------------------------------------------------------------------------
+
+def test_stop_calls_disconnect_and_loop_stop(broker, fake_client):
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    assert broker.stop(graceful_timeout_s=2.0) is True
+    fake_client.disconnect.assert_called_once_with()
+    fake_client.loop_stop.assert_called_once_with()
+
+
+def test_stop_calls_disconnect_before_loop_stop(broker, fake_client):
+    call_order = []
+    fake_client.disconnect.side_effect = lambda *a, **kw: call_order.append("disconnect")
+    fake_client.loop_stop.side_effect = lambda *a, **kw: call_order.append("loop_stop")
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    assert broker.stop(graceful_timeout_s=2.0) is True
+    assert call_order == ["disconnect", "loop_stop"]
+
+
+def test_stop_before_start_is_noop_returning_True_no_paho_calls(broker, fake_client):
+    # Post-RFC-010: NEW.stop() is a pure no-op. Callbacks are not yet
+    # registered on paho, and there is no state to fence.
+    assert broker.stop() is True
+    fake_client.disconnect.assert_not_called()
+    fake_client.loop_stop.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# publish() — post-RFC-012 requires broker to be in RUNNING + connected
+# state before publish reaches paho. Tests prime the broker to RUNNING
+# via `_prime_connected` first, and provide a valid MessageInfo return
+# so the RFC-012 rc-validation layer sees success (rc=0).
+# --------------------------------------------------------------------------
+
+class _RFC012SuccessInfo:
+    """Duck-typed MQTTMessageInfo with rc=0 (success)."""
+    rc = 0
+    mid = 1
+
+
+def test_publish_delegates_topic_and_payload_by_keyword(broker, fake_client):
+    _prime_connected(broker, fake_client)   # NEW → RUNNING
+    fake_client.publish.return_value = _RFC012SuccessInfo()
+    broker.publish("some/topic", b"payload-bytes")
+    fake_client.publish.assert_called_once_with(
+        topic="some/topic", payload=b"payload-bytes"
+    )
+
+
+def test_publish_returns_underlying_client_result(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    info = _RFC012SuccessInfo()
+    fake_client.publish.return_value = info
+    result = broker.publish("t", b"p")
+    # RFC-012 §7.10: success returns paho's original result unchanged.
+    assert result is info
+
+
+def test_publish_forwards_non_bytes_payload_unchanged(broker, fake_client):
+    # MqttBroker.publish does not serialise; that is the caller's job.
+    _prime_connected(broker, fake_client)
+    fake_client.publish.return_value = _RFC012SuccessInfo()
+    payload_obj = {"a": 1}
+    broker.publish("t", payload_obj)
+    fake_client.publish.assert_called_once_with(topic="t", payload=payload_obj)
+
+
+# --------------------------------------------------------------------------
+# subscribe()
+# --------------------------------------------------------------------------
+
+def test_subscribe_delegates_topic_by_keyword(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    broker.subscribe("some/topic", data_type="str")
+    fake_client.subscribe.assert_called_once_with(topic="some/topic")
+
+
+def test_subscribe_returns_underlying_client_result(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    sentinel = object()
+    fake_client.subscribe.return_value = sentinel
+    assert broker.subscribe("t", "str") is sentinel
+
+
+def test_subscribe_does_not_forward_data_type_to_paho(broker, fake_client):
+    # MqttBroker.subscribe drops data_type. Pin the current contract.
+    _prime_connected(broker, fake_client)
+    broker.subscribe("t", data_type="bytes")
+    args, kwargs = fake_client.subscribe.call_args
+    assert "data_type" not in kwargs
+    assert args == ()
+
+
+# --------------------------------------------------------------------------
+# unsubscribe() — added for R-02 (RFC-001)
+# --------------------------------------------------------------------------
+
+def test_unsubscribe_delegates_topic_to_client(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    # Register the topic first so unsubscribe has something to remove.
+    broker.subscribe("some/topic", "str")
+    fake_client.unsubscribe.reset_mock()
+    broker.unsubscribe("some/topic")
+    fake_client.unsubscribe.assert_called_once_with("some/topic")
+
+
+def test_unsubscribe_returns_underlying_client_result(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    broker.subscribe("t", "str")
+    sentinel = object()
+    fake_client.unsubscribe.return_value = sentinel
+    assert broker.unsubscribe("t") is sentinel
