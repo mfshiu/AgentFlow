@@ -298,15 +298,80 @@ class Agent(BrokerNotifier):
             return
 
         if stop_result is False:
-            state = getattr(self._agent_worker, 'state', 'unknown')
-            thread = getattr(self._agent_worker, 'work_thread', None)
-            logger.warning(self.M(
-                f"terminate: worker did not stop within its deadline; "
-                f"state={state}, thread={thread!r}. terminate() has "
-                f"returned but the worker thread may still be alive; "
-                f"because daemon=False, Python interpreter shutdown "
-                f"may still block on this thread (see RFC-009 §H)."
-            ))
+            # RFC-013 diagnostics: capability-based reads so this path
+            # works for any Worker subclass (ThreadWorker exposes the
+            # new properties; ProcessWorker / FakeWorker do not — for
+            # those, `getattr(..., default)` gracefully falls back and
+            # `requires_process_restart` becomes False → the existing
+            # WARNING path is taken).
+            #
+            # The diagnostics block itself is guarded so a misbehaving
+            # property (e.g. a subclass that raises from `.state`)
+            # cannot break Agent.terminate's never-raise contract.
+            needs_restart = False
+            state = 'unknown'
+            worker_type = type(self._agent_worker).__name__
+            thread = None
+            alive = None
+            daemon = None
+            ident = None
+            try:
+                state = getattr(self._agent_worker, 'state', 'unknown')
+                thread = getattr(self._agent_worker, 'work_thread', None)
+                needs_restart = bool(getattr(
+                    self._agent_worker, 'requires_process_restart', False,
+                ))
+                alive = getattr(self._agent_worker, 'thread_alive', None)
+                daemon = getattr(self._agent_worker, 'thread_daemon', None)
+                ident = getattr(
+                    self._agent_worker, 'worker_thread_ident', None,
+                )
+            except Exception as diag_ex:
+                # A property getter raised — do not let that break
+                # terminate's never-raise contract. Fall through to
+                # the WARNING path with what we already gathered.
+                try:
+                    logger.exception(self.M(
+                        f"terminate: diagnostics property raised "
+                        f"(continuing with best-effort values): "
+                        f"{diag_ex!r}"
+                    ))
+                except Exception:
+                    pass
+                needs_restart = False
+
+            if needs_restart:
+                # RFC-013 §7.7: ERROR-level signal — operator /
+                # supervisor intervention required. At most one ERROR
+                # per Agent.terminate invocation (this branch runs at
+                # most once).
+                try:
+                    logger.error(self.M(
+                        f"terminate: PROCESS RESTART REQUIRED — "
+                        f"worker_type={worker_type}, state={state}, "
+                        f"thread_ident={ident}, thread_alive={alive}, "
+                        f"daemon={daemon}. terminate() has returned "
+                        f"but the worker thread is a non-daemon thread "
+                        f"in STOP_TIMEOUT — external process restart "
+                        f"or supervisor containment required. Python "
+                        f"interpreter will NOT exit until an external "
+                        f"supervisor terminates this process. See "
+                        f"RFC-013."
+                    ))
+                except Exception:
+                    pass
+            else:
+                # Existing WARNING path preserved (recoverable
+                # STOP_TIMEOUT: worker thread may still be alive but
+                # is not the R-10.5 blocker — e.g. thread died on its
+                # own, or worker doesn't expose the RFC-013 property).
+                logger.warning(self.M(
+                    f"terminate: worker did not stop within its deadline; "
+                    f"state={state}, thread={thread!r}. terminate() has "
+                    f"returned but the worker thread may still be alive; "
+                    f"because daemon=False, Python interpreter shutdown "
+                    f"may still block on this thread (see RFC-009 §H)."
+                ))
 
 
 

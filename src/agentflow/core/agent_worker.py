@@ -449,6 +449,87 @@ class ThreadWorker(Worker):
 
 
     # ------------------------------------------------------------------
+    # RFC-013 process-exit observability
+    # ------------------------------------------------------------------
+
+    @property
+    def thread_alive(self) -> bool:
+        """RFC-013 §7.4: True iff `work_thread` exists AND is alive.
+
+        Computed on the fly; no lock, no cache. `Thread.is_alive()` is
+        thread-safe.
+        """
+        t = self.work_thread
+        return t is not None and t.is_alive()
+
+    @property
+    def thread_daemon(self) -> Optional[bool]:
+        """RFC-013 §7.5: `work_thread.daemon` flag, or None if no
+        thread exists. Read-only pin for the RFC-009 §7.13 policy
+        decision — production workers should always observe False here.
+        """
+        t = self.work_thread
+        return t.daemon if t is not None else None
+
+    @property
+    def worker_thread_ident(self) -> Optional[int]:
+        """RFC-013 §7.6: `work_thread.ident` (OS thread id) for
+        correlating with `py-spy dump --pid <pid>` / `gdb -p <pid>`.
+        Diagnostic-only; None when no thread exists OR when the thread
+        exists but has not started yet (Python's `Thread.ident` is
+        None before `start()`).
+        """
+        t = self.work_thread
+        return t.ident if t is not None else None
+
+    @property
+    def requires_process_restart(self) -> bool:
+        """RFC-013 §7.3: True iff, **at this instant**, a non-daemon
+        worker thread is still alive after its stop deadline expired.
+
+        Read it as a statement about the present, not a verdict:
+
+          - What True means: right now there exists a worker thread in
+            `STOP_TIMEOUT` that is still alive and non-daemon. Because
+            it is non-daemon, the Python interpreter will not exit
+            while it runs, so *guaranteeing* process exit requires
+            external containment (supervisor SIGKILL) or a process
+            restart.
+          - What True does **not** mean: that the thread is
+            permanently unrecoverable. The blocking call may yet
+            return on its own, and a retried `stop()` may still
+            succeed. This property makes no prediction about either.
+
+        Concretely: True iff ALL THREE hold —
+          - `state == WorkerState.STOP_TIMEOUT`
+          - `thread_alive` is True
+          - `thread_daemon is False`
+
+        Any False in the conjunction → False, so the property flips
+        back to False on its own as soon as the situation clears — no
+        reset call, no latch. In particular:
+          - Blocker released and thread died on its own between stop
+            and this read → thread_alive False → property False, even
+            though state may still be STOP_TIMEOUT (test proves this).
+          - Retry stop() reached STOPPED → state False → property False.
+          - Never started → thread_alive False → property False.
+          - ProcessWorker (or any worker without daemon=False threads)
+            → does not expose this property → callers use
+            getattr(worker, 'requires_process_restart', False).
+
+        No log, no side effect, no cache — this getter is safe to call
+        from any thread at any time.
+        """
+        if self.state != WorkerState.STOP_TIMEOUT:
+            return False
+        if not self.thread_alive:
+            return False
+        if self.thread_daemon is not False:
+            return False
+        return True
+
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
