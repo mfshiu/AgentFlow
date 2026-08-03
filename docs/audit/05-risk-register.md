@@ -465,7 +465,7 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 
 ## R-10 — `Worker.stop()` uses `join()` without timeout
 
-- **Status**: **RESOLVED** (2026-07-28) — ProcessWorker via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); ThreadWorker via [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md). Both worker strategies now have bounded shutdown paths. `Agent.terminate()` returns in bounded time regardless of handler / worker wedging. Two related residuals remain **Open**: broker-level wedged `stop()` (runtime-confirmed but out of RFC-009 scope) and non-daemon interpreter-exit blocking under `STOP_TIMEOUT` (documented architectural limitation).
+- **Status**: **RESOLVED** (2026-07-28) — ProcessWorker via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); ThreadWorker via [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md). Both worker strategies now have bounded shutdown paths. `Agent.terminate()` returns in bounded time regardless of handler / worker wedging. The broker-level wedged `stop()` residual was subsequently closed by RFC-010 (R-10.4). The non-daemon interpreter-exit residual under `STOP_TIMEOUT` (R-10.5) is now **Partially Resolved / Operationally Mitigated** by [RFC-013](../rfc/RFC-013-thread-worker-process-exit-policy.md) (2026-08-03) — observable and diagnosable in-process, with hard containment delegated to ProcessWorker or an external supervisor; it is deliberately not marked fully Resolved.
 - **Severity**: High
 - **Category**: Fault Isolation / Resource
 - **File / Function / Line** (historical):
@@ -487,7 +487,7 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 | **R-10.2** | `ThreadWorker.stop` unbounded `Thread.join()` — wedged worker thread blocks caller forever | **RESOLVED** (RFC-009) — bounded cooperative `join(graceful_timeout_s)`, `stop() -> bool`, wedged → `STOP_TIMEOUT` state, retriable |
 | **R-10.3** | `Agent.terminate()` unbounded wait chained through worker.stop | **RESOLVED** (RFC-008 + RFC-009) — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` (≈ 10s at defaults); logs WARNING on worker timeout; never raises |
 | **R-10.4** | `broker.stop()` itself wedges (root cause of R-10.2 trigger) | **RESOLVED** (RFC-010) — daemon helper-thread wrapper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED` states, single-helper retry, callback fencing |
-| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **OPEN / Documented architectural limitation** — RFC-009 §7.13 / §H explicitly does not resolve; `daemon=False` preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 confirms the helper thread is `daemon=True` (so helper alone does not block exit) but explicitly notes the worker thread waiting on `broker.stop()` still does. RFC-011 §0 confirms the startup helper is also `daemon=True` and does not itself block exit; the residual is worker-side |
+| **R-10.5** | Non-daemon worker thread in `STOP_TIMEOUT` blocks Python interpreter shutdown | **PARTIALLY RESOLVED / OPERATIONALLY MITIGATED** (RFC-013, 2026-08-03) — observability + diagnostics + operator guidance shipped; hard containment remains a supervisor responsibility. Detection **Resolved** (`requires_process_restart` + `thread_alive` / `thread_daemon` / `worker_thread_ident` properties, `Agent.terminate` ERROR path); in-process forced thread termination **Not supported by design** (daemon flip / `os._exit` / ctypes async cancellation all rejected — RFC-013 §5 B/F/J); operational containment **Supported** via ProcessWorker or an external supervisor. `daemon=False` still preserved by design to avoid mid-`__deactivating` corruption. RFC-010 §7.13 / RFC-011 §0 confirm both broker helpers are `daemon=True` (helpers alone do not block exit); the residual is worker-side. **Deliberately NOT marked fully Resolved.** See "Resolution (R-10.5)" below |
 | **R-10.6** | `MqttBroker.start()` unbounded on `client.connect` / `client.loop_start` (paho lifecycle synchronous with no timeout wrapper); wait=True timeout only bounds `_connected_evt.wait`; failed-start rollback leaks; late callback after failure pollutes state; concurrent start callers each call paho; cross-round callback contamination via same-instance retry | **RESOLVED** (RFC-011) — daemon startup helper, single monotonic deadline covers helper + callback wait, `START_TIMEOUT` state, terminal-instance contract (no same-instance retry), bounded rollback via `_run_client_shutdown_primitive`, `_transition_to_start_failure` sets `_stopping=True` for immediate RFC-010 fencing, concurrent-start coordination via `_start_complete_event` |
 | **R-10.7** | `MqttBroker.publish()` bare passthrough of `client.publish` — never inspects `MessageInfo.rc`, never validates result shape, never gates on lifecycle state. `rc=NO_CONN` / `QUEUE_SIZE` / `PROTOCOL` / unknown-nonzero silently swallowed; `None` / arbitrary result passed through; publish reaches paho from NEW / STARTING / STOPPED / all terminal states; `_publish_or_raise` breaks RFC-002 fast-fail contract for rc failures; `publish_sync` waits full timeout for a response that never arrives (verified elapsed ≥ 0.19s vs 0.2s bound) | **RESOLVED** (RFC-012) — `MqttPublishReason` enum + `MqttPublishError(RuntimeError)` with 7 structured fields; pre-call state gate (stopping > state > connected priority); `_normalise_publish_result` for v1 tuple / v2 MessageInfo / rc-mid coercion; `rc != MQTT_ERR_SUCCESS` fast-fail; unsupported shape raises with `__cause__` preservation; `Agent.publish` unchanged (fire-and-forget catches via `except Exception`); `publish_sync` restored to RFC-002 fast-fail (< 50 ms elapsed on rc failure). Publish-vs-stop full linearisation deferred to a future "operation barrier" RFC (documented residual race). |
 
@@ -566,7 +566,7 @@ Four narrow, all in the bounded-shutdown / safety direction:
 ### Known residuals NOT resolved by RFC-009
 
 - ~~**R-10.4 broker.stop() itself wedges**~~ — **RESOLVED 2026-07-28 (RFC-010)**. See "Resolution (R-10.4)" below.
-- **R-10.5 non-daemon interpreter-exit blocking** — a `STOP_TIMEOUT` worker leaves a live non-daemon thread; Python interpreter shutdown will still block on it. RFC-009 §7.13 keeps `daemon=False` on purpose (daemonising would trade a visible hang for silent mid-`__deactivating` corruption). Documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path. **RFC-010 does NOT resolve this** — the broker helper thread is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on `broker.stop()` still does.
+- **R-10.5 non-daemon interpreter-exit blocking** — a `STOP_TIMEOUT` worker leaves a live non-daemon thread; Python interpreter shutdown will still block on it. RFC-009 §7.13 keeps `daemon=False` on purpose (daemonising would trade a visible hang for silent mid-`__deactivating` corruption). Documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path. **RFC-010 does NOT resolve this** — the broker helper thread is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on `broker.stop()` still does. **Update (2026-08-03)**: the in-process blocking behaviour is unchanged and permanent, but the condition is now observable and diagnosable via RFC-013 — see "Resolution (R-10.5)" below.
 - **`BaseException` observability** — `_run_target` catches `Exception` only (RFC-009 §7.11); a `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` from `_activate` leaves state unchanged and, after `stop()`, gets marked `STOPPED` — masking the crash. A signal-based cleanup layer or a separate tracker would be needed to observe this. Deferred. (RFC-010 fixed the equivalent broker-side variant via `STOP_FAILED` — worker-side parity is future work.)
 - **Heartbeat / watchdog / automatic restart** — RFC-009 Out-of-scope (parity with RFC-008).
 - **Config-key surface** for `graceful_timeout_s` — deferred; method-arg only in first-phase.
@@ -624,6 +624,7 @@ Four narrow, all in the bounded-shutdown / safety direction:
 | Daemon | `daemon=False` | `daemon=False` | helper `daemon=True` |
 | Force-kill primitive | `Process.kill()` | none | none |
 | Interpreter-exit blocking risk | none (SIGKILL) | **YES** (R-10.5) | helper OK; worker still R-10.5 |
+| Restart-required observability (RFC-013) | n/a — no `STOP_TIMEOUT` state | `requires_process_restart` + `thread_alive` / `thread_daemon` / `worker_thread_ident`; `Agent.terminate` ERROR | n/a — broker layer unchanged by RFC-013 |
 
 ### Runtime verification (as of 2026-07-28)
 
@@ -647,7 +648,7 @@ Four narrow, all in the bounded-shutdown / safety direction:
 
 ### Known residuals NOT resolved by RFC-010
 
-- **R-10.5 non-daemon interpreter-exit blocking** (see above) — remains OPEN / Documented.
+- **R-10.5 non-daemon interpreter-exit blocking** (see above) — was OPEN / Documented at RFC-010 time; **Partially Resolved / Operationally Mitigated** by RFC-013 (2026-08-03), see "Resolution (R-10.5)" below.
 - ~~**`MqttBroker.start()` / `client.connect()` bounded lifecycle**~~ — **RESOLVED 2026-07-29 (RFC-011)** as R-10.6. See "Resolution (R-10.6)" below.
 - **`MessageBroker` ABC timeout contract** — RFC-010 §7.16 / RFC-011 §7.16 explicitly keep the ABC as `stop(self, options)` / `start(self, options)`; unifying across `EmptyBroker` / third-party subclasses requires a separate RFC.
 - **`STARTING.stop()` coordination** — first-phase raises `RuntimeError`; deferred (both RFC-010 mod 3 and RFC-011 §7.19).
@@ -721,7 +722,7 @@ Five narrow, all in the bounded-startup / correctness direction:
 
 ### Known residuals NOT resolved by RFC-011
 
-- **R-10.5 non-daemon interpreter-exit blocking** — still Open. RFC-011 helper is `daemon=True` (helper alone does not block exit); but if a `ThreadWorker` work thread (`daemon=False`) is waiting on `broker.start()` and the helper wedges, the work thread stays alive and interpreter shutdown blocks. Documented in RFC-009 §H / RFC-010 §7.13 / RFC-011 §0.
+- **R-10.5 non-daemon interpreter-exit blocking** — still Open at RFC-011 time. RFC-011 helper is `daemon=True` (helper alone does not block exit); but if a `ThreadWorker` work thread (`daemon=False`) is waiting on `broker.start()` and the helper wedges, the work thread stays alive and interpreter shutdown blocks. Documented in RFC-009 §H / RFC-010 §7.13 / RFC-011 §0. **Update (2026-08-03)**: RFC-013 makes this condition observable (`requires_process_restart`) and adds supervisor guidance; the blocking behaviour itself is unchanged — see "Resolution (R-10.5)" below.
 - **Same-instance retry** (Option D / E) — deferred. Fresh MqttBroker per attempt is the retry story; Agent's `__activating` already does this.
 - **`STARTING.stop()` mid-flight cancellation** — first-phase raises RuntimeError; deferred.
 - **`MessageBroker` ABC timeout signature** — kept as `start(self, options)` (§7.16); RFC-011's tighter signature satisfies it. Unification deferred.
@@ -854,9 +855,76 @@ Five narrow, all in the correctness / fast-fail direction:
 - **Publish metrics / counters** — deferred (parity with RFC-008/009/010/011).
 - **Offline publish queue / retry / backoff / batching / rate limiting** — separate RFCs.
 - **Other broker implementations** (Redis / ROS / DDS) — R-22 unregistered.
-- **R-10.5 non-daemon interpreter-exit blocking** — unchanged; documented across RFC-009/010/011.
+- **R-10.5 non-daemon interpreter-exit blocking** — unchanged at RFC-012 time; subsequently addressed as far as is architecturally possible by RFC-013 (2026-08-03) — see "Resolution (R-10.5)" below.
 
 ---
+
+### Resolution (R-10.5)
+
+- **Status**: **PARTIALLY RESOLVED / OPERATIONALLY MITIGATED** — 2026-08-03, see [RFC-013 ThreadWorker process-exit policy](../rfc/RFC-013-thread-worker-process-exit-policy.md) (Implemented). **Deliberately not marked fully Resolved**: the in-process residual is architectural and permanent.
+
+**What RFC-013 changed** — observability, diagnostics, and operator guidance. It changed **no** runtime control flow: `daemon=False` (RFC-009 §7.13) is preserved verbatim, `STOP_TIMEOUT` remains retriable, `WorkerState` is unchanged, `ThreadWorker.stop` keeps its signature and `bool` return, and ProcessWorker / broker / dispatcher / `Parcel` / wire are untouched.
+
+**Four additive read-only properties on `ThreadWorker`** (`src/agentflow/core/agent_worker.py`):
+
+| Property | Type | Contract |
+|---|---|---|
+| `thread_alive` | `bool` | `work_thread is not None and work_thread.is_alive()` |
+| `thread_daemon` | `Optional[bool]` | `work_thread.daemon`; `None` when no thread |
+| `worker_thread_ident` | `Optional[int]` | `work_thread.ident` (OS tid, for `py-spy` / `gdb`); `None` when no thread, and `None` before `start()` per CPython `Thread.ident` semantics |
+| `requires_process_restart` | `bool` | conjunction of the three conditions below |
+
+All four are **computed on every read — no cache, no logging, no state mutation**, and take no lock (each snapshots `self.work_thread` into a local, then calls `Thread.is_alive()` lock-external, preserving RFC-009 §F lock hygiene). Safe to poll from any thread, including a health-probe thread.
+
+**`requires_process_restart` precise semantics** — `True` iff **all three hold at the instant of the read**:
+
+1. `state == WorkerState.STOP_TIMEOUT`
+2. `thread_alive is True`
+3. `thread_daemon is False`
+
+- **`True` means**: right now a live non-daemon worker thread has missed its stop deadline, so the interpreter will not exit while it runs — **guaranteeing process exit requires external containment or a process restart**.
+- **`True` does NOT mean** the thread is permanently unrecoverable. The blocking call may still return and a retried `stop()` may still succeed. It is a present-tense condition, not a prognosis.
+
+**Recovery — the property is self-clearing** (no reset call, not a latch):
+
+- Blocker releases naturally and the thread exits, *without* a retry → `thread_alive` goes `False` → property `False`, **even though `state` may still read `STOP_TIMEOUT`** (state is history; the property is now). Verified by `test_J75` / `test_K88`.
+- Blocker releases and `stop()` is retried → `state` → `STOPPED` → property `False`. Verified by `test_J76` / `test_K89`.
+
+**`Agent.terminate` diagnostics** (`src/agentflow/core/agent.py`) — on the `worker.stop() is False` path, reads are **capability-based** (`getattr(worker, name, default)`), so ProcessWorker / `FakeWorker`, which do not expose the properties, yield `False` and take the pre-existing path:
+
+- `requires_process_restart is True` → **ERROR**, containing worker type, state, thread ident, alive, daemon, the phrase *"external process restart or supervisor containment required"*, and an RFC-013 reference. **At most one such ERROR per `terminate()` invocation**; no cross-invocation cache/dedup and no background re-alerting.
+- `requires_process_restart is False` → the pre-existing **WARNING** path, unchanged.
+
+Signature and return type unchanged; **never-raise preserved** — the diagnostic reads are themselves contained so a worker property that raises cannot break the contract (`test_L96`), and the branch holds no `raise` statement (`test_L98`, AST-pinned). The library calls **no `os._exit`** anywhere in `src/agentflow/` (`test_L97` / `test_M101`) and uses no ctypes async cancellation (`test_M102`).
+
+**Runtime evidence** — subprocess characterisation (real exit codes / timeout observation), 44 cases retained and extended to a **73-test** suite:
+
+- Wedged **non-daemon** ThreadWorker thread **prevents interpreter exit**; the parent must kill the process (`test_A2`, `test_C14`, `test_C15_C19`, `test_C20`, `test_J74`).
+- **`sys.exit()` does not bypass** the non-daemon join at shutdown (`test_A4`).
+- A **daemon** thread lets the process exit but may have its `finally` **truncated** — marker write missed (`test_A3`, `test_G46`, `test_G47`); this is why the daemon flip stays rejected.
+- **`os._exit` skips `atexit`** and cleanup (`test_A5`, `test_A7`).
+- **ProcessWorker offers bounded terminate/kill escalation** with an observable exit code (`test_F41`, `test_F43`, `test_F44`); ThreadWorker structurally cannot (`test_F45`).
+- **Final hard containment is the external supervisor's job** — parent reclaims via `terminate()` then `kill()` (`test_H54`, `test_H55`).
+
+**Dimension-by-dimension status**:
+
+| Dimension | Status |
+|---|---|
+| **Detection** | **Resolved** — condition is observable and machine-checkable in-process |
+| **In-process forced thread termination** | **Not supported by design** — RFC-013 §5 Options B (`daemon=True`), F (`os._exit`), J (ctypes async cancellation) all rejected; no safe CPython mechanism exists |
+| **Operational containment** | **Supported** — ProcessWorker for high-risk handlers, or an external supervisor for hard containment |
+| **Overall** | **Partially Resolved / Operationally Mitigated** |
+
+**Operator guidance shipped**: [`docs/deployment/worker-type-selection.md`](../deployment/worker-type-selection.md), [`docs/deployment/systemd.md`](../deployment/systemd.md), [`docs/deployment/container-liveness.md`](../deployment/container-liveness.md). These describe a health endpoint only as an **integration contract and illustrative sketch** — AgentFlow ships no health endpoint, no HTTP server, and no metrics exporter.
+
+**Known residuals NOT resolved by RFC-013**:
+
+- **The in-process residual itself is permanent.** Once a non-daemon Python thread is wedged in an uninterruptible call, nothing inside the process can reclaim it. This is a CPython property, not an AgentFlow defect.
+- **`WorkerState.UNRECOVERABLE`** — deferred with rationale (RFC-013 §5 Option D / Appendix A).
+- **`daemon=True` opt-in kwarg** — deferred to a future high-risk-handler containment RFC (Appendix B).
+- **Auto-fallback ThreadWorker → ProcessWorker** — deferred (§5 Option G).
+- **Metrics API / health endpoint implementation** — deferred; contract only.
+- **`BaseException` worker-side observability** — unchanged, still deferred (see R-10.2 residuals).
 
 ---
 
@@ -1200,7 +1268,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
-| R-10 | High | High | **Resolved 2026-08-02 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored. Residuals: R-10.5 non-daemon interpreter-exit (**Open / Documented**) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
+| R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | Open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |

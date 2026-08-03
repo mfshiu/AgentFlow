@@ -478,9 +478,16 @@ Key implementation notes (RFC-009 §0 divergences from the RFC design):
 - **Order preserved**: `dispatcher.stop()` (RFC-004 bounded) before `worker.stop()` (RFC-008 / RFC-009 bounded).
 - `dispatcher.stop()` wrapped in `try: … except Exception:` — a broken dispatcher does not block the worker cleanup path.
 - `worker.stop()` wrapped in `try: … except Exception:` — misbehaving worker `.stop()` never propagates to the caller.
-- Observes `worker.stop()` return value: **`False` → WARNING** with `state`, `work_thread`, and the daemon interpreter-exit caveat; `True` / `None` (legacy `FakeWorker`) → silent.
+- Observes `worker.stop()` return value: **`False` → ERROR or WARNING** depending on `requires_process_restart` (RFC-013 — see below); `True` / `None` (legacy `FakeWorker`) → silent.
 - **Bounded total wall time** ≈ `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s ≈ 10s` at defaults.
 - **Bounded return only guarantees `terminate()` itself returns**. If worker ended at `STOP_TIMEOUT` and `daemon=False`, Python interpreter shutdown may still block on that thread. This is a documented architectural limitation (see below).
+
+**Diagnostics on the `stop() is False` path (post-RFC-013, 2026-08-03)** — reads are **capability-based** (`getattr(worker, name, default)`), so ProcessWorker / `FakeWorker`, which do not expose the RFC-013 properties, resolve to `False` and take the pre-existing path:
+
+- `requires_process_restart is True` → **ERROR** with worker type, `state`, thread ident, alive, daemon, the phrase *"external process restart or supervisor containment required"*, and an RFC-013 reference. **At most one such ERROR per `terminate()` invocation.**
+- `requires_process_restart is False` → the pre-existing **WARNING** path, unchanged.
+
+Signature, return type, and the never-raise contract are all unchanged; the diagnostic reads are themselves contained, so a worker property that raises cannot break never-raise. `Agent.terminate` calls no `os._exit`.
 
 ### End-to-end sequence — thread-mode terminate under `broker.stop()` wedge
 
@@ -506,9 +513,10 @@ sequenceDiagram
     TW-->>TW: 5.0s elapsed<br/>work_thread.is_alive() == True
     TW->>TW: state STOPPING → STOP_TIMEOUT<br/>_last_stop_result = False<br/>_stop_complete_event.set()
     TW-->>A: return False
-    A->>A: logger.warning("worker did not stop within its deadline...")
+    A->>A: read requires_process_restart (RFC-013, capability-based)
+    A->>A: True → logger.error("PROCESS RESTART REQUIRED ...")<br/>False → logger.warning("worker did not stop ...")
     A-->>P: terminate() returns (bounded)
-    Note over P,T: Worker thread is still alive.<br/>Because daemon=False,<br/>interpreter shutdown may still block.<br/>(RFC-009 §H / R-10.5)
+    Note over P,T: Worker thread is still alive.<br/>Because daemon=False,<br/>interpreter shutdown may still block.<br/>(RFC-009 §H / R-10.5)<br/>Hard containment = external supervisor.
 ```
 
 Runtime evidence: `test_F1_agent_terminate_returns_bounded_when_broker_stop_wedges_and_logs_WARNING`, `test_F4_agent_terminate_never_raises_when_worker_stop_returns_False`, `test_C3_wedged_thread_returns_False_bounded_and_state_STOP_TIMEOUT`, `test_D1_STOP_TIMEOUT_retry_reaches_STOPPED_when_blocker_released`.
@@ -523,9 +531,31 @@ Runtime evidence: `test_F1_agent_terminate_returns_bounded_when_broker_stop_wedg
 
 ### Daemon / interpreter-exit limitation
 
-- `work_thread.daemon = False` preserved (RFC-009 §7.13). Daemonising would trade a visible hang for silent mid-`__deactivating` corruption (broker teardown interrupted at interpreter exit).
-- **`stop()` returning bounded only guarantees `Agent.terminate()` itself returns.** A worker left in `STOP_TIMEOUT` is a live non-daemon thread; Python interpreter shutdown blocks on it.
-- **This risk is NOT resolved by RFC-009.** It is deliberately documented in `ThreadWorker` docstring, `stop()` docstring, `Agent.terminate` docstring, and every WARNING log emitted by the timeout path. Tracked as [R-10.5](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+- `work_thread.daemon = False` preserved (RFC-009 §7.13, unchanged by RFC-013). Daemonising would trade a visible hang for silent mid-`__deactivating` corruption (broker teardown interrupted at interpreter exit) — subprocess-verified: a daemon thread lets the process exit but its `finally` marker write can be **truncated**.
+- **`stop()` returning bounded only guarantees `Agent.terminate()` itself returns.** A worker left in `STOP_TIMEOUT` is a live non-daemon thread; Python interpreter shutdown blocks on it, and `sys.exit()` does not bypass that join.
+- **This risk is NOT resolved in-process by RFC-009 or RFC-013, and cannot be.** Once a non-daemon Python thread is wedged in an uninterruptible call, nothing inside the process can reclaim it — a CPython property, not an AgentFlow defect. Tracked as [R-10.5](05-risk-register.md#r-10--workerstop-uses-join-without-timeout).
+
+### RFC-013 process-exit observability (2026-08-03)
+
+RFC-013 accepts the residual and makes it **observable and diagnosable**, changing no runtime control flow. Four additive read-only properties on `ThreadWorker` — **computed on every read, no cache, no logging, no state mutation**, and lock-free (snapshot `work_thread` into a local, then call `is_alive()` lock-external, preserving §F lock hygiene):
+
+| Property | Type | Contract |
+|---|---|---|
+| `thread_alive` | `bool` | `work_thread is not None and work_thread.is_alive()` |
+| `thread_daemon` | `Optional[bool]` | `work_thread.daemon`; `None` when no thread |
+| `worker_thread_ident` | `Optional[int]` | `work_thread.ident` (OS tid, for `py-spy` / `gdb`); `None` when no thread, and `None` before `start()` |
+| `requires_process_restart` | `bool` | `STOP_TIMEOUT` **and** `thread_alive` **and** `thread_daemon is False` |
+
+**`requires_process_restart` semantics.** `True` means that *right now* a live non-daemon worker thread has missed its stop deadline, so **guaranteeing process exit requires external containment or a process restart**. It does **not** mean the thread is permanently unrecoverable — the blocking call may still return, and a retried `stop()` may still succeed.
+
+**It is self-clearing** (present-tense, not a latch — no reset call):
+
+- Blocker releases and the thread exits *without* a retry → `thread_alive` `False` → property `False`, **even though `state` may still read `STOP_TIMEOUT`** (state is history; the property is now).
+- Blocker releases and `stop()` is retried → `state` → `STOPPED` → property `False`.
+
+`STOP_TIMEOUT` therefore remains **retriable**, exactly as under RFC-009. `WorkerState` gains no `UNRECOVERABLE` member.
+
+Runtime evidence lives in `tests/unit/core/test_thread_worker_process_exit.py` (**73 passed**), which retains the 44 subprocess characterisation cases proving: wedged non-daemon thread blocks interpreter exit; `sys.exit()` does not bypass the join; a daemon thread exits but may truncate `finally`; `os._exit` skips `atexit`; ProcessWorker offers bounded terminate/kill escalation; and **final hard containment is the external supervisor's responsibility**. Operator guidance: [`docs/deployment/`](../deployment/worker-type-selection.md).
 
 ### R-10 sub-risk status
 
@@ -534,8 +564,8 @@ Runtime evidence: `test_F1_agent_terminate_returns_bounded_when_broker_stop_wedg
 | R-10.1 `ProcessWorker.stop` unbounded join | **Resolved** by RFC-008 escalation ladder (SIGTERM / SIGKILL) |
 | R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** by RFC-009 cooperative bounded stop |
 | R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** — bounded by `dispatcher.shutdown_timeout_s + worker.graceful_timeout_s` |
-| R-10.4 broker.stop() itself wedges | **Open / Runtime Confirmed** — surrounded by bounded worker; broker itself not bounded |
-| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Open / Documented architectural limitation** — deliberate |
+| R-10.4 broker.stop() itself wedges | **Open / Runtime Confirmed** at RFC-009 time — **Resolved** by RFC-010 |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Partially Resolved / Operationally Mitigated** (RFC-013, 2026-08-03) — detection Resolved; in-process forced termination Not supported by design; containment via ProcessWorker or external supervisor. Deliberately **not** fully Resolved |
 
 ---
 
@@ -658,7 +688,7 @@ Runtime evidence: `test_C21` / `test_C22` (bounded timeout for disconnect/loop_s
 - `None` (legacy `EmptyBroker` / third-party brokers) → treated as success via `stopped is False` guard.
 - Any exception from `broker.stop()` → `logger.exception` + swallow (never-raise preserved).
 
-**Bounded return of `__deactivating()` only guarantees this method returns.** If the broker ended at `STOP_TIMEOUT` and a worker thread with `daemon=False` is waiting on it, Python interpreter shutdown may still block on the worker thread. RFC-010 explicitly does NOT resolve this (R-10.5 residual).
+**Bounded return of `__deactivating()` only guarantees this method returns.** If the broker ended at `STOP_TIMEOUT` and a worker thread with `daemon=False` is waiting on it, Python interpreter shutdown may still block on the worker thread. RFC-010 explicitly does NOT resolve this (R-10.5 residual). **Update (2026-08-03)**: the blocking behaviour remains unchanged, but RFC-013 makes the condition observable via `ThreadWorker.requires_process_restart` and an `Agent.terminate` ERROR — see §2.10 "RFC-013 process-exit observability".
 
 ### R-10 sub-risk status (post-RFC-010)
 
@@ -668,7 +698,7 @@ Runtime evidence: `test_C21` / `test_C22` (bounded timeout for disconnect/loop_s
 | R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** (RFC-009) |
 | R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** (RFC-008 + RFC-009) |
 | R-10.4 broker.stop() itself wedges | **Resolved 2026-07-28** (RFC-010 — daemon helper, `bool` return, `STOP_TIMEOUT` + `STOP_FAILED`, single-helper retry, callback fencing) |
-| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Open / Documented architectural limitation** — RFC-010 helper is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on broker still does |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT | **Partially Resolved / Operationally Mitigated** (RFC-013, 2026-08-03) — RFC-010 helper is `daemon=True` (so helper alone does not block exit), but the worker thread waiting on broker still does. The blocking behaviour is unchanged and permanent; RFC-013 adds detection (`requires_process_restart`) and supervisor guidance |
 
 ---
 
@@ -815,7 +845,7 @@ Dedicated `stop()` path when state is `START_TIMEOUT`:
 | R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** (RFC-009) |
 | R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** (RFC-008 + RFC-009) |
 | R-10.4 broker.stop() itself wedges | **Resolved** (RFC-010) |
-| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT / START_TIMEOUT | **Open / Documented architectural limitation** — RFC-010 stop helper `daemon=True`; RFC-011 startup helper `daemon=True`; but the worker thread waiting on broker is `daemon=False` (RFC-009 §7.13) |
+| R-10.5 non-daemon interpreter-exit blocking under STOP_TIMEOUT / START_TIMEOUT | **Partially Resolved / Operationally Mitigated** (RFC-013, 2026-08-03) — RFC-010 stop helper `daemon=True`; RFC-011 startup helper `daemon=True`; but the worker thread waiting on broker is `daemon=False` (RFC-009 §7.13, unchanged). Detection shipped; hard containment remains a supervisor responsibility |
 | R-10.6 `MqttBroker.start()` unbounded on connect/loop_start | **Resolved 2026-07-29** (RFC-011 — daemon startup helper, single-deadline, terminal-instance contract, bounded rollback primitive, callback fencing) |
 
 ---
@@ -921,7 +951,7 @@ Runtime evidence: `test_E43` verifies elapsed < 0.5 s vs 5 s timeout — pre-RFC
 | R-10.2 `ThreadWorker.stop` unbounded join | **Resolved** (RFC-009) |
 | R-10.3 `Agent.terminate` unbounded worker wait | **Resolved** (RFC-008 + RFC-009) |
 | R-10.4 broker.stop() itself wedges | **Resolved** (RFC-010) |
-| R-10.5 non-daemon interpreter-exit blocking | **Open / Documented architectural limitation** |
+| R-10.5 non-daemon interpreter-exit blocking | **Partially Resolved / Operationally Mitigated 2026-08-03** (RFC-013 — detection + diagnostics + operator guidance; in-process forced termination not supported by design; containment via ProcessWorker or external supervisor) |
 | R-10.6 `MqttBroker.start()` unbounded | **Resolved** (RFC-011) |
 | R-10.7 `MqttBroker.publish()` rc silently swallowed / publish_sync full-timeout wait | **Resolved 2026-08-02** (RFC-012) |
 
