@@ -28,9 +28,6 @@ from tests.fakes.mini_mqtt_server import MiniMqttServer
 
 pytestmark = pytest.mark.wire
 
-# Remove when issue #2 is fixed (strict: an unexpected pass fails).
-_ISSUE2 = pytest.mark.xfail(strict=True, reason='issue #2: MQTT auto-reconnect not implemented yet')
-
 FAST_RECONNECT = {'reconnect_min_delay': 1, 'reconnect_max_delay': 1}
 
 
@@ -91,7 +88,6 @@ def _wait(predicate, timeout=10.0):
     return MiniMqttServer.wait_until(predicate, timeout=timeout)
 
 
-@_ISSUE2
 def test_reconnects_and_resubscribes_after_unexpected_drop(server, make_broker):
     notifier = RecordingNotifier()
     b = make_broker(notifier, server, **FAST_RECONNECT)
@@ -113,7 +109,6 @@ def test_reconnects_and_resubscribes_after_unexpected_drop(server, make_broker):
     assert _wait(lambda: 'cmd/robot' in notifier.topics_received(), 5)
 
 
-@_ISSUE2
 def test_publish_succeeds_again_after_reconnect(server, make_broker):
     notifier = RecordingNotifier()
     b = make_broker(notifier, server, **FAST_RECONNECT)
@@ -126,7 +121,6 @@ def test_publish_succeeds_again_after_reconnect(server, make_broker):
     assert _wait(lambda: ('status/robot', b'alive') in server.published(), 5)
 
 
-@_ISSUE2
 def test_unexpected_drop_is_reported_to_notifier(server, make_broker):
     notifier = RecordingNotifier()
     make_broker(notifier, server, **FAST_RECONNECT)
@@ -137,7 +131,6 @@ def test_unexpected_drop_is_reported_to_notifier(server, make_broker):
     assert _wait(lambda: notifier.connects >= 2)
 
 
-@_ISSUE2
 def test_notifier_on_connect_exception_does_not_kill_network_thread(
     server, make_broker,
 ):
@@ -156,7 +149,6 @@ def test_notifier_on_connect_exception_does_not_kill_network_thread(
     assert _wait(lambda: server.connect_count() >= 2)
 
 
-@_ISSUE2
 def test_reconnect_false_keeps_legacy_no_reconnect_behaviour(server, make_broker):
     notifier = RecordingNotifier()
     b = make_broker(notifier, server, reconnect=False, **FAST_RECONNECT)
@@ -169,7 +161,6 @@ def test_reconnect_false_keeps_legacy_no_reconnect_behaviour(server, make_broker
     assert b.recovery_metrics()['connected'] is False
 
 
-@_ISSUE2
 def test_stop_during_reconnect_backoff_is_bounded_and_ends_retries(
     server, make_broker,
 ):
@@ -207,7 +198,6 @@ def _blackhole_reconnects(broker):
     return in_connect
 
 
-@_ISSUE2
 def test_stop_during_partitioned_reconnect_stays_within_budget(
     server, make_broker,
 ):

@@ -21,9 +21,6 @@ import pytest
 
 from agentflow.broker.mqtt_broker import MqttBroker
 
-# Remove when issue #2 is fixed (strict: an unexpected pass fails).
-_ISSUE2 = pytest.mark.xfail(strict=True, reason='issue #2: MQTT auto-reconnect not implemented yet')
-
 
 def _fire_connect(broker, fake_client, rc=0):
     broker._on_connect(client=fake_client, userdata=None, flags={},
@@ -39,7 +36,6 @@ def _fire_disconnect(broker, fake_client, rc=7):
 # Configuration
 # --------------------------------------------------------------------------
 
-@_ISSUE2
 def test_client_is_constructed_with_reconnect_on_failure_enabled(
     monkeypatch, fake_client, notifier,
 ):
@@ -54,14 +50,12 @@ def test_client_is_constructed_with_reconnect_on_failure_enabled(
     assert captured.get('reconnect_on_failure') is True
 
 
-@_ISSUE2
 def test_start_configures_default_reconnect_backoff(broker, fake_client):
     broker.start({})
     fake_client.reconnect_delay_set.assert_called_once_with(
         min_delay=1, max_delay=30)
 
 
-@_ISSUE2
 def test_start_honours_reconnect_delay_options(broker, fake_client):
     broker.start({'reconnect_min_delay': 2, 'reconnect_max_delay': 60})
     fake_client.reconnect_delay_set.assert_called_once_with(
@@ -77,7 +71,6 @@ def test_start_honours_reconnect_delay_options(broker, fake_client):
     {'reconnect_min_delay': float('-inf')},
     {'reconnect_min_delay': float('nan')},
 ])
-@_ISSUE2
 def test_invalid_reconnect_delay_options_fall_back_to_defaults(
     broker, fake_client, options,
 ):
@@ -86,7 +79,6 @@ def test_invalid_reconnect_delay_options_fall_back_to_defaults(
         min_delay=1, max_delay=30)
 
 
-@_ISSUE2
 def test_start_sets_default_connect_timeout(broker, fake_client):
     # A blocking reconnect TCP connect must fit inside the 5 s stop
     # budgets (paho's own default is 5 s).
@@ -94,14 +86,12 @@ def test_start_sets_default_connect_timeout(broker, fake_client):
     assert fake_client.connect_timeout == 2.0
 
 
-@_ISSUE2
 def test_start_honours_connect_timeout_option(broker, fake_client):
     broker.start({'connect_timeout': 1.5})
     assert fake_client.connect_timeout == 1.5
 
 
 @pytest.mark.parametrize('value', ['x', 0, -1, None, float('inf'), float('nan')])
-@_ISSUE2
 def test_invalid_connect_timeout_falls_back_to_default(broker, fake_client, value):
     broker.start({'connect_timeout': value})    # must not raise
     assert fake_client.connect_timeout == 2.0
@@ -111,7 +101,6 @@ def test_invalid_connect_timeout_falls_back_to_default(broker, fake_client, valu
 # reconnect: False (legacy opt-out)
 # --------------------------------------------------------------------------
 
-@_ISSUE2
 def test_reconnect_false_ends_paho_loop_on_unexpected_drop(broker, fake_client):
     broker.start({'reconnect': False})
     _fire_connect(broker, fake_client)
@@ -129,7 +118,6 @@ def test_reconnect_enabled_leaves_paho_loop_running_on_unexpected_drop(
     fake_client.disconnect.assert_not_called()
 
 
-@_ISSUE2
 def test_wait_false_first_connection_failure_does_not_retry_forever(
     broker, fake_client,
 ):
@@ -162,7 +150,6 @@ def _leftover_socket(fake_client):
     return sock
 
 
-@_ISSUE2
 def test_stop_closes_socket_left_by_reconnect_racing_stop(broker, fake_client):
     sock = _leftover_socket(fake_client)
     broker.start({})
@@ -171,7 +158,6 @@ def test_stop_closes_socket_left_by_reconnect_racing_stop(broker, fake_client):
     assert sock.fileno() == -1
 
 
-@_ISSUE2
 def test_start_rollback_closes_leftover_socket(broker, fake_client):
     sock = _leftover_socket(fake_client)
     assert broker._run_client_shutdown_primitive() is True
@@ -182,7 +168,6 @@ def test_start_rollback_closes_leftover_socket(broker, fake_client):
 # Disconnect reporting
 # --------------------------------------------------------------------------
 
-@_ISSUE2
 def test_unexpected_disconnect_is_reported_to_notifier(
     broker, fake_client, notifier,
 ):
@@ -214,7 +199,6 @@ def test_notifier_on_disconnect_exception_is_contained(
 # W-43: notifier._on_connect exceptions must not escape into paho
 # --------------------------------------------------------------------------
 
-@_ISSUE2
 def test_notifier_on_connect_exception_is_contained(
     broker, fake_client, notifier,
 ):
@@ -224,7 +208,6 @@ def test_notifier_on_connect_exception_is_contained(
     assert broker.recovery_metrics()['connected'] is True
 
 
-@_ISSUE2
 def test_recovery_still_runs_when_notifier_on_connect_raises(
     broker, fake_client, notifier,
 ):

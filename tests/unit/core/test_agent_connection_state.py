@@ -20,15 +20,10 @@ Contracts verified:
 import pickle
 import threading
 
-import pytest
-
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.core.agent import Agent
 
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
-
-# Remove when issue #2 is fixed (strict: an unexpected pass fails).
-pytestmark = pytest.mark.xfail(strict=True, reason='issue #2: MQTT auto-reconnect not implemented yet')
 
 
 HOOK_TIMEOUT = 3.0

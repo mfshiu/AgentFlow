@@ -1,6 +1,6 @@
 from paho.mqtt.client import Client
 from paho.mqtt.enums import CallbackAPIVersion
-import logging, os, threading, time
+import logging, math, os, socket, threading, time
 from enum import Enum
 from typing import Any, Dict, Optional
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -131,7 +131,29 @@ class MqttBroker(MessageBroker):
     at STOP_TIMEOUT the paho network thread is still alive; if a Worker
     with `daemon=False` is waiting on this broker, Python interpreter
     shutdown may still block. RFC-010 does NOT resolve this residual.
+
+    Automatic reconnect (issue #2): after an unexpected connection loss
+    paho's network loop reconnects with exponential back-off
+    (`reconnect_min_delay` .. `reconnect_max_delay` seconds, default
+    1 .. 30). Each successful CONNACK re-subscribes the registry
+    (RFC-005) and calls `notifier._on_connect()` again; each unexpected
+    loss calls `notifier._on_disconnect(planned=False)`. State stays
+    RUNNING throughout; `recovery_metrics()['connected']` tells whether
+    the link is currently up. `reconnect: False` restores the legacy
+    behaviour (the network loop ends on the first connection loss).
+    With `wait=False` a refused or dropped FIRST connection is not
+    retried (nobody awaits it and stop() refuses STARTING).
+
+    Each TCP connect attempt is bounded by `connect_timeout` (default
+    2 s, paho's own default is 5 s) so that a reconnect blocked by a
+    network partition fits inside the 5 s stop budgets. Not bounded by
+    it: DNS resolution, and hosts resolving to N addresses (up to N x
+    connect_timeout) — prefer an IP address on partition-prone links.
     """
+
+    _DEFAULT_RECONNECT_MIN_DELAY_S = 1
+    _DEFAULT_RECONNECT_MAX_DELAY_S = 30
+    _DEFAULT_CONNECT_TIMEOUT_S = 2.0
 
     def __init__(self, notifier: BrokerNotifier, *, wait: bool = True, timeout: float = 10.0):
         """建立 MQTT Broker 包裝類別
@@ -140,7 +162,10 @@ class MqttBroker(MessageBroker):
         :param timeout: 最長等待秒數
         """
         self._client = Client(callback_api_version=CallbackAPIVersion.VERSION2,
-                              reconnect_on_failure=False)
+                              reconnect_on_failure=True)
+        # Issue #2: set from the `reconnect` start() option; read by
+        # _on_disconnect on the paho network thread.
+        self._reconnect_enabled = True
         self.host = ""
         self.port = 0
         self.keepalive = 0
@@ -282,7 +307,16 @@ class MqttBroker(MessageBroker):
                 logger.info(f"MQTT broker connected: {self.host}:{self.port}, keepalive={self.keepalive}")
                 if snapshot:
                     self._recover_subscriptions(snapshot)
-                self._notifier._on_connect()
+                try:
+                    self._notifier._on_connect()
+                except Exception as ex:
+                    # W-43: an exception escaping into paho would kill
+                    # the network thread, and with it every later
+                    # reconnect (issue #2).
+                    logger.exception(
+                        f"notifier._on_connect raised; network loop kept "
+                        f"alive: {ex!r}"
+                    )
             finally:
                 self._connected_evt.set()
         else:
@@ -349,7 +383,9 @@ class MqttBroker(MessageBroker):
         # It does NOT clear `_stopping` and does NOT trigger recovery.
         planned = False
         with self._state_lock:
-            planned = self._stopping or (
+            stopping = self._stopping
+            ever_connected = self._ever_connected
+            planned = stopping or (
                 reasonCode == 0
                 or getattr(reasonCode, "value", None) == 0
             )
@@ -361,6 +397,32 @@ class MqttBroker(MessageBroker):
             logger.info(f"MQTT disconnected (planned): {reasonCode}")
         else:
             logger.warning(f"MQTT disconnected (unexpected): {reasonCode}")
+
+        if stopping:
+            # RFC-010 §F: no notifier delegation once stop() has fenced.
+            return
+        if not planned:
+            if self._reconnect_enabled and (ever_connected or self._wait):
+                logger.info("MQTT waiting for automatic reconnect")
+            else:
+                # End paho's network loop instead of reconnecting when
+                # `reconnect: False` (legacy), or when a wait=False
+                # broker's FIRST connection failed: nobody awaits it and
+                # stop() refuses STARTING, so retries could never be
+                # ended. loop_stop() from the network thread only flags
+                # termination; client.disconnect() would not work here
+                # because paho resets the state to CONNECTION_LOST after
+                # this callback returns.
+                try:
+                    self._client.loop_stop()
+                except Exception as ex:
+                    logger.exception(
+                        f"loop_stop() to end reconnects raised: {ex!r}"
+                    )
+        try:
+            self._notifier._on_disconnect(planned=planned)
+        except Exception as ex:
+            logger.exception(f"notifier._on_disconnect raised: {ex!r}")
 
 
     def _on_message(self, client, db, message):
@@ -493,6 +555,14 @@ class MqttBroker(MessageBroker):
         self.keepalive = int(options.get("keepalive", 60))
         if username := options.get("username"):
             self._client.username_pw_set(username, options.get("password"))
+        # Issue #2: automatic reconnect with bounded exponential back-off.
+        reconnect = options.get("reconnect", True)
+        if isinstance(reconnect, str):
+            reconnect = reconnect.strip().lower() not in ("false", "0", "no", "off")
+        self._reconnect_enabled = bool(reconnect)
+        min_delay, max_delay = self._reconnect_delays(options)
+        self._client.reconnect_delay_set(min_delay=min_delay, max_delay=max_delay)
+        self._client.connect_timeout = self._connect_timeout_option(options)
 
         # Spawn daemon startup helper.
         helper = threading.Thread(
@@ -612,6 +682,66 @@ class MqttBroker(MessageBroker):
             self._start_complete_event.set()
 
 
+    @classmethod
+    def _reconnect_delays(cls, options: dict):
+        """Issue #2: (min, max) reconnect back-off in whole seconds from
+        the `reconnect_min_delay` / `reconnect_max_delay` options.
+        Invalid values fall back to the defaults with a WARNING rather
+        than raising, so a bad value can never strand start() in
+        STARTING."""
+        default = (cls._DEFAULT_RECONNECT_MIN_DELAY_S,
+                   cls._DEFAULT_RECONNECT_MAX_DELAY_S)
+        raw_min = options.get("reconnect_min_delay", default[0])
+        raw_max = options.get("reconnect_max_delay", default[1])
+        try:
+            min_delay, max_delay = int(raw_min), int(raw_max)
+        except (TypeError, ValueError, OverflowError):
+            min_delay = max_delay = 0
+        if min_delay < 1 or max_delay < min_delay:
+            logger.warning(
+                f"Invalid reconnect delays (min={raw_min!r}, max={raw_max!r}); "
+                f"using defaults {default}"
+            )
+            return default
+        return min_delay, max_delay
+
+
+    @classmethod
+    def _connect_timeout_option(cls, options: dict) -> float:
+        """Issue #2: per-attempt TCP connect timeout (seconds) from the
+        `connect_timeout` option. Invalid values fall back to the
+        default with a WARNING rather than raising."""
+        raw = options.get("connect_timeout", cls._DEFAULT_CONNECT_TIMEOUT_S)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.0
+        if not math.isfinite(value) or value <= 0:
+            logger.warning(
+                f"Invalid connect_timeout {raw!r}; using default "
+                f"{cls._DEFAULT_CONNECT_TIMEOUT_S}"
+            )
+            return cls._DEFAULT_CONNECT_TIMEOUT_S
+        return value
+
+
+    def _close_leftover_socket(self) -> None:
+        """Issue #2: a reconnect() blocked in its TCP connect when the
+        shutdown ran can still succeed after disconnect() (which then
+        saw no socket and sent nothing), leaving an open socket and a
+        live broker-side session that nobody services. Call only after
+        loop_stop() has joined the network thread. Never raises."""
+        try:
+            sock = self._client.socket()
+            if isinstance(sock, socket.socket):
+                sock.close()
+        except Exception as ex:
+            try:
+                logger.exception(f"closing leftover socket raised: {ex!r}")
+            except Exception:
+                pass
+
+
     def _transition_to_start_failure(self, new_state: WorkerState,
                                      exception: BaseException):
         """RFC-011 §H: atomic transition into a startup failure state.
@@ -710,6 +840,7 @@ class MqttBroker(MessageBroker):
                         )
                     except Exception:
                         pass
+                self._close_leftover_socket()
             finally:
                 completed.set()
 
@@ -1045,6 +1176,7 @@ class MqttBroker(MessageBroker):
             logger.exception(
                 f"MqttBroker.stop: client.loop_stop() raised: {ex!r}"
             )
+        self._close_leftover_socket()
         # Reached only if both calls returned (with or without a
         # captured Exception; NOT reached if BaseException propagated
         # out of either call).

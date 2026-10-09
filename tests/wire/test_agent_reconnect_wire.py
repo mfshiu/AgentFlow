@@ -13,9 +13,7 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import TextParcel
 from tests.fakes.mini_mqtt_server import MiniMqttServer
 
-# Remove the xfail when issue #2 is fixed (strict: an unexpected pass fails).
-pytestmark = [pytest.mark.wire,
-              pytest.mark.xfail(strict=True, reason='issue #2: MQTT auto-reconnect not implemented yet')]
+pytestmark = pytest.mark.wire
 
 
 class EchoAgent(Agent):
