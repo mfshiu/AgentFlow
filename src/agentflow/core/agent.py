@@ -21,6 +21,7 @@ from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
 from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
+from agentflow.logging import redact_config
 
 
 import logging, os
@@ -66,7 +67,7 @@ class _HandlerRecord:
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
-        logger.debug(f'name: {name}, agent_config: {agent_config}')
+        logger.debug('name: %s, agent_config: %s', name, redact_config(agent_config))
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -209,7 +210,7 @@ class Agent(BrokerNotifier):
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
-        logger.debug(f'self.config: {self.config}')
+        logger.debug('self.config: %s', redact_config(self.config))
             
             
     def __create_worker(self):
@@ -228,7 +229,8 @@ class Agent(BrokerNotifier):
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
             self.config[config.CONCURRENCY_TYPE] = 'process'
-        logger.info(self.M(f"self.config: {self.config}"))
+        logger.info(self.M("Starting agent."))
+        logger.debug(self.M("self.config: %s"), redact_config(self.config))
         self.work_process = self._get_worker().start()
         
         self._on_start()
@@ -452,7 +454,7 @@ class Agent(BrokerNotifier):
         if not broker_config_all or not isinstance(broker_config_all, dict):
             logger.error(self.M("Broker configuration is missing or invalid."))
             return False
-        logger.debug(self.M(f"broker_config_all: {broker_config_all}"))
+        logger.debug(self.M("broker_config_all: %s"), redact_config(broker_config_all))
         broker_name = broker_config_all['broker_name']
         broker_config = broker_config_all[broker_name]
         

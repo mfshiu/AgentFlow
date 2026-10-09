@@ -1,4 +1,6 @@
 import logging, os
+from agentflow.logging import log_publish
+
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from .message_broker import MessageBroker
@@ -27,7 +29,7 @@ class RedisBroker(MessageBroker):
 
 
     def publish(self, topic:str, payload):
-        logger.info(f"topic: {topic}, payload: {payload}")
+        log_publish(logger, topic, payload)
         
     
     def subscribe(self, topic:str, data_type):
