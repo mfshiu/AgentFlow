@@ -129,7 +129,11 @@ exact scenario `requires_process_restart` exists to surface.
 For AgentFlow, the natural mapping is:
 
 - **Readiness** — broker connected, agents started, queues below
-  their high-water mark. Recoverable, so drop traffic and wait.
+  their high-water mark. Recoverable, so drop traffic and wait. The
+  MQTT broker reconnects automatically with back-off (unless
+  configured with `reconnect: False`); read the link state with
+  `Agent.is_connected()` from inside the agent, or react to the
+  `on_disconnected()` / `on_reconnected()` hooks.
 - **Liveness** — the main loop is responsive, and (if your deployment
   chooses) no agent is stuck with `requires_process_restart`. A
   restart is the only remedy for a wedged non-daemon thread, so this
