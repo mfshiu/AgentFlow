@@ -22,7 +22,7 @@ class DdsBroker(MessageBroker):
         self._notifier._on_connect()
 
 
-    def _on_message(self, client:Client, db, message):
+    def _on_message(self, client, db, message):
         try:
             self._notifier._on_message(message.topic, message.payload)
         except Exception as ex:
