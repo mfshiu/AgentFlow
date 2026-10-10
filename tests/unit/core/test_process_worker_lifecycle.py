@@ -37,17 +37,6 @@ import time
 
 import pytest
 
-# Known Windows-only flake (#48). On Windows, multiprocessing creates the
-# child BEFORE pickling the Agent into it. The start-pickle-failure tests
-# therefore leave an orphaned child whose process handle ProcessWorker
-# never sees; it later duplicates a recycled parent handle and corrupts
-# the next spawn (WinError 5/6, EOFError, exitcode 1). The fix changes
-# which Agents ProcessWorker.start accepts and is tracked in #48.
-_WINDOWS_ORPHAN_FLAKE = pytest.mark.xfail(
-    sys.platform == 'win32', strict=False,
-    reason='#48: orphan child from the preceding pickle-failure test',
-)
-
 # --------------------------------------------------------------------------
 # Ensure spawned children can import module-level helpers from this file.
 # --------------------------------------------------------------------------
@@ -303,7 +292,6 @@ def test_start_after_START_FAILED_raises_runtime_error():
 # C. Real spawn — success path (RFC-008 §C)
 # ==========================================================================
 
-@_WINDOWS_ORPHAN_FLAKE
 def test_start_spawns_functional_child_that_exits_cleanly():
     """End-to-end: start spawns a child that unpickles the Agent,
     runs _activate, receives 'terminate', and exits with code 0."""
@@ -608,7 +596,6 @@ def _windows_process_has_exited(pid):
 
 @pytest.mark.skipif(sys.platform != 'win32',
                     reason='POSIX spawn pickles before starting the child')
-@pytest.mark.xfail(strict=True, reason='#48: orphan child not terminated yet')
 def test_start_pickle_failure_leaves_no_orphan_child_on_windows(monkeypatch):
     """#48: on Windows, multiprocessing creates the child (CreateProcess)
     BEFORE pickling the Agent into it. When that pickling fails, the
@@ -640,7 +627,6 @@ def test_start_pickle_failure_leaves_no_orphan_child_on_windows(monkeypatch):
 # H. Observability + orphan sanity (RFC-008 §7.14 + acceptance #9)
 # ==========================================================================
 
-@_WINDOWS_ORPHAN_FLAKE
 def test_exitcode_property_is_None_before_stop_and_int_after():
     agent = Agent(name='pw-exit', agent_config=_minimal_empty_broker_config())
     pw = ProcessWorker(agent)
