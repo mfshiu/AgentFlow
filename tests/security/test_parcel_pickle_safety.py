@@ -37,9 +37,6 @@ from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
 pytestmark = pytest.mark.security
 
-# Remove when issue #1 is fixed (strict: an unexpected pass fails).
-_ISSUE1 = pytest.mark.xfail(strict=True, reason='issue #1: BinaryParcel still uses unrestricted pickle.loads')
-
 
 # --------------------------------------------------------------------------
 # Harmless gadget + helpers
@@ -104,7 +101,6 @@ def _subscribe_recorder(agent, topic='svc/in'):
 # Rejection of code-executing payloads
 # --------------------------------------------------------------------------
 
-@_ISSUE1
 def test_gadget_payload_is_rejected_without_executing():
     payload = _binary_payload(_managed(_Gadget()))
     with pytest.raises(TypeError):
@@ -112,7 +108,6 @@ def test_gadget_payload_is_rejected_without_executing():
     assert _GADGET_CALLS == []
 
 
-@_ISSUE1
 def test_gadget_payload_rejection_uses_parcel_decode_error():
     payload = _binary_payload(_managed(_Gadget()))
     with pytest.raises(parcel_mod.ParcelDecodeError):
@@ -120,7 +115,6 @@ def test_gadget_payload_rejection_uses_parcel_decode_error():
     assert _GADGET_CALLS == []
 
 
-@_ISSUE1
 def test_parcel_decode_error_is_a_type_error():
     # Parcel.from_payload has always raised TypeError for invalid
     # payloads; existing `except TypeError` callers keep working.
@@ -137,7 +131,6 @@ def test_parcel_decode_error_is_a_type_error():
     ('__builtin__', 'eval'),        # protocol <= 2 spelling
     ('_codecs', 'encode'),          # protocol 2 bytes; not allowlisted
 ])
-@_ISSUE1
 def test_payload_referencing_unsafe_global_is_rejected(module, name):
     with pytest.raises(parcel_mod.ParcelDecodeError):
         Parcel.from_payload(_global_ref_payload(module, name))
@@ -160,7 +153,6 @@ def _build_on_global_payload(module, name, attr, value):
     return BinaryParcel.HEAD + body
 
 
-@_ISSUE1
 def test_build_on_allowlisted_python_class_cannot_mutate_it():
     allowed = {(__name__, '_MutableConfig')}
     payload = _build_on_global_payload(__name__, '_MutableConfig', 'flag', 'tampered')
@@ -174,7 +166,6 @@ def test_build_on_allowlisted_python_class_cannot_mutate_it():
     (__name__, '_record'),          # Python function (mutable __defaults__ etc.)
     ('os', 'path'),                 # a module object
 ])
-@_ISSUE1
 def test_allowlisted_mutable_globals_are_still_refused(module, name):
     with pytest.raises(parcel_mod.ParcelDecodeError):
         Parcel.from_payload(_global_ref_payload(module, name),
@@ -182,7 +173,6 @@ def test_allowlisted_mutable_globals_are_still_refused(module, name):
     assert _GADGET_CALLS == []
 
 
-@_ISSUE1
 def test_bytearray_cannot_be_built_from_an_int():
     # {'content': bytearray(50_000_000)} via GLOBAL builtins.bytearray +
     # REDUCE: a few bytes of payload that would otherwise allocate 50 MB
@@ -206,7 +196,6 @@ def test_protocol_0_to_2_builtin_spelling_is_normalised(protocol):
     assert Parcel.from_payload(payload).content == content
 
 
-@_ISSUE1
 def test_builtin_compat_name_mapping_is_still_refused():
     # _compat_pickle maps ('__builtin__', 'reduce') to functools.reduce;
     # normalising the module name must not make it resolvable.
@@ -214,14 +203,12 @@ def test_builtin_compat_name_mapping_is_still_refused():
         Parcel.from_payload(_global_ref_payload('__builtin__', 'reduce'))
 
 
-@_ISSUE1
 def test_persistent_id_payload_is_rejected():
     payload = BinaryParcel.HEAD + b'\x80\x02X\x01\x00\x00\x00aQ.'   # BINPERSID
     with pytest.raises(TypeError):
         Parcel.from_payload(payload)
 
 
-@_ISSUE1
 def test_gadget_delivered_to_agent_is_not_executed_and_not_dispatched():
     agent, broker = _agent()
     got, done = _subscribe_recorder(agent)
@@ -274,7 +261,6 @@ def test_agent_still_receives_binary_parcels_by_default():
         agent.terminate()
 
 
-@_ISSUE1
 def test_protocol_2_bytes_are_rejected_by_default():
     # Documented limitation: protocol <= 2 encodes bytes through
     # _codecs.encode, which is not allowlisted. AgentFlow itself never
@@ -288,7 +274,6 @@ def test_protocol_2_bytes_are_rejected_by_default():
 # Opt-ins and opt-outs
 # --------------------------------------------------------------------------
 
-@_ISSUE1
 def test_datetime_is_rejected_unless_allowlisted():
     payload = _binary_payload(_managed({'at': datetime.datetime(2026, 1, 1)}))
     with pytest.raises(parcel_mod.ParcelDecodeError):
@@ -298,7 +283,6 @@ def test_datetime_is_rejected_unless_allowlisted():
     assert pcl.content == {'at': datetime.datetime(2026, 1, 1)}
 
 
-@_ISSUE1
 def test_parse_pickle_globals_accepts_dotted_and_colon_forms():
     assert parcel_mod.parse_pickle_globals(
         ['datetime.datetime', 'collections:OrderedDict', 'a.b.c:Outer.Inner']
@@ -307,7 +291,6 @@ def test_parse_pickle_globals_accepts_dotted_and_colon_forms():
 
 
 @pytest.mark.parametrize('entry', ['nodot', '', '.name', 'module.', ':x', 'm:', 123, None])
-@_ISSUE1
 def test_parse_pickle_globals_rejects_malformed_entries(entry):
     with pytest.raises(ValueError):
         parcel_mod.parse_pickle_globals([entry])
@@ -332,13 +315,11 @@ def test_agent_codec_config_allowlists_extra_globals():
     ({'accept_pickles': False}, ValueError),    # misspelled key
     ('not a dict', TypeError),
 ])
-@_ISSUE1
 def test_agent_with_malformed_codec_config_fails_at_construction(codec, error):
     with pytest.raises(error):
         Agent(name='bad_codec', agent_config={'codec': codec})
 
 
-@_ISSUE1
 def test_agent_can_refuse_pickle_payloads_entirely():
     agent, broker = _agent({'codec': {'accept_pickle': False}})
     got, done = _subscribe_recorder(agent)
@@ -353,7 +334,6 @@ def test_agent_can_refuse_pickle_payloads_entirely():
         agent.terminate()
 
 
-@_ISSUE1
 def test_parcel_from_payload_accept_pickle_false():
     with pytest.raises(parcel_mod.ParcelDecodeError):
         Parcel.from_payload(BinaryParcel({'a': 1}).payload(), accept_pickle=False)
@@ -374,7 +354,6 @@ def test_parcel_from_payload_accept_pickle_false():
     TextParcel.HEAD + b'"just a string"',
     TextParcel.HEAD + b'{not json',
 ])
-@_ISSUE1
 def test_malformed_body_raises_parcel_decode_error(payload):
     with pytest.raises(parcel_mod.ParcelDecodeError):
         Parcel.from_payload(payload)
