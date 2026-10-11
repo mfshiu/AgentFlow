@@ -1334,7 +1334,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Compatibility.** Message shapes are unchanged. `on_parents_message` no longer receives the agent's own broadcasts.
 
-**Still open.** Control messages are unauthenticated (#13). The same-name replica `terminate` that this left open was fixed under #38; see R-09.
+**Still open.** Control-message authentication (#13) is tracked under R-26. The same-name replica `terminate` that this left open was fixed under #38; see R-09.
 
 ---
 
@@ -1440,6 +1440,61 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ---
 
+## R-26 — Holon control messages are unauthenticated
+
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #13). The forged terminate, the registration flood and the auto-reply confused deputy are closed or opt-in closable; see [Control-plane authentication](#control-plane-authentication-2026-10-12-issue-13). Reply forgery (`publish_sync` takes the first reply) and transport security remain **Open**.
+- **Severity**: Medium on a trusted single-tenant broker; High on a shared one
+- **Category**: Security
+- **File / Function / Line**: `src/agentflow/core/agent.py` — `_handle_parents` (terminate), `_handle_children` / `__register_child` (registration), `_on_message` (auto-reply to `topic_return`), `__generate_return_topic` (reply topics).
+- **Trigger**: Any client able to publish to the broker. Control topics derive from agent names (R-09).
+- **Impact**:
+  - A `terminate` with no `parent_id`, or from an agent that never registered the child, stopped it.
+  - Forged `register_child` messages grew `_children` without bound, and each one was answered.
+  - A request whose `topic_return` named a control topic made the service publish the requester's content there under its own identity. In the analysis, this terminated another subtree.
+  - Reply topics came from the seedable `random` module.
+- **Confidence**: High (reproduced with mocks and FakeBroker; see the issue).
+
+### Control-plane authentication (2026-10-12, issue #13)
+
+**Change** (`src/agentflow/core/agent.py`, new `src/agentflow/core/holon_auth.py`). A new optional `holon` config section is validated at construction like `codec`: unknown keys and wrong types raise.
+
+- **Registered parents only.**
+  - `terminate` is honoured only when its `parent_id` is a registered parent; one without a `parent_id` is ignored.
+  - The dispatcher does not order messages, so a parent's `terminate` can overtake its `register_parent`. Such a terminate is deferred and runs when that parent registers. At most 8 wait, for 10 s each, oldest dropped first.
+  - `holon.trust_unregistered_parents: True` restores the old behaviour.
+- **`holon.max_children`** (default unlimited). A new child beyond the cap is refused under `_holon_lock`: no `register_parent` answer, and no `on_register_child` / `on_children_message`. Known children may still re-register.
+  - The default stays unlimited because members never expire yet (R-18). Leave headroom for children that restart.
+- **`holon.control_secret`** (str or bytes, at least 16 bytes), opt-in.
+  - The control subjects `terminate`, `register_child`, `register_parent` and `parent_online` carry `auth = {v, ts, mac}`. The MAC is HMAC-SHA256 over a canonical JSON of the topic, the millisecond timestamp and the message.
+  - Receivers drop control messages that are unsigned, tampered, sent to another topic, malformed, or further than `holon.control_max_age` (default 300 s) from the local clock. Verification never raises.
+  - Application subjects stay unauthenticated, like every other topic.
+  - The `auth` field is stripped before hooks run, and agents without a secret ignore it.
+- **Auto-replies.** An auto-reply is withheld when `topic_return` is a holon control topic (`to_child.*`, `to_parent.*`, or their `{agent_id}.`-prefixed forms). The handler still runs.
+- **Reply topics** come from `secrets`.
+- **Logging.** Refused messages are logged at WARNING on the 1st, 2nd, 4th, ... occurrence per kind and at DEBUG otherwise, so a flood cannot flood the log.
+
+**Compatibility.**
+
+- Message shapes are unchanged without a secret.
+- A `terminate` from an unregistered sender is now ignored. Tools that stop agents by publishing on `to_child.{name}` need `trust_unregistered_parents`, or must be a registered parent.
+- `control_secret` must be set on every agent of a holon at once. An agent without it sends unsigned control messages, which secret-holding agents drop.
+- Until #14 is fixed, Agent construction logs the full config at DEBUG, secret included. The redaction proposed in #81 covers keys containing `secret`.
+
+**Verification.**
+
+- `tests/security/test_holon_control_auth.py` (50 tests): registered-parent terminate (incl. the deferred, expiring and bounded cases), `max_children`, config validation, HMAC binding and malformed input, a FakeBus holon sharing a secret, agents with another secret, auto-reply topics, and reply-topic randomness.
+- `tests/wire/test_holon_terminate_wire.py`: a 3-level holon sharing a secret converges and terminates over real MqttBroker clients, and every control message on the wire is signed.
+
+**Still open.**
+
+- `publish_sync` takes the first reply on its topic; correlation ids (#36) and per-agent inboxes (roadmap P2-2) remain.
+- Replays on the same topic within the age window are not detected. The operations are idempotent (#5, #6).
+- The opt-in secret is shared by the whole holon, and any holder can impersonate any member.
+- TLS, per-agent broker accounts and ACLs (#3) remain the primary defence; the holon v2 namespace (P2-7) would let ACLs restrict who writes control topics.
+- `_parents` is not capped.
+
+---
+
 ## Summary table (sorted by severity, then confidence)
 
 | ID | Severity | Confidence | Status | Title |
@@ -1463,6 +1518,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-19 | Medium | High | Open | Parcel `version` never validated |
 | R-20 | Medium | High | Open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
+| R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
