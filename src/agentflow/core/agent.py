@@ -42,6 +42,10 @@ _DEFAULT_CONTROL_MAX_AGE_S = 300.0
 # _MAX_PENDING_TERMINATES wait at a time.
 _PENDING_TERMINATE_TTL_S = 10.0
 _MAX_PENDING_TERMINATES = 8
+# Issue #13: how long a terminating parent waits for on_register_child
+# hooks that are still running, so those children get register_parent
+# before its terminate.
+_REGISTRATION_DRAIN_S = 3.0
 # Issue #13: holon control topics, to_child.* / to_parent.* and their
 # {agent_id}.-prefixed unicast forms.
 _HOLON_CONTROL_TOPIC = re.compile(r'(?:[0-9a-f]{32}\.)?to_(?:child|parent)\.')
@@ -755,6 +759,7 @@ class Agent(BrokerNotifier):
         try:
             logger.warning(self.M('Terminating..'))
 
+            self.__await_registrations(_REGISTRATION_DRAIN_S)
             self._notify_children('terminate')
             def stop():
                 time.sleep(1)
@@ -767,6 +772,25 @@ class Agent(BrokerNotifier):
             with self._terminate_lock:
                 self._terminating = False
             raise
+
+
+    def __await_registrations(self, timeout):
+        """Issue #13: wait, at most `timeout` seconds, until no
+        on_register_child hook is running. Such a child has not been
+        sent register_parent yet (#6), so without a control secret it
+        holds our terminate back until register_parent arrives, and our
+        broker stops about 1 s after the terminate."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._holon_lock:
+                running = len(self._children_registering)
+            if not running:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(self.M(
+                    f"Terminating while {running} child registration hook(s) still run."))
+                return
+            time.sleep(0.01)
 
 
     def __deactivating(self):

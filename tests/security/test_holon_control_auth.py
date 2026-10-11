@@ -181,7 +181,6 @@ class SlowRegistrationParent(Agent):
         return self._Agent__terminate_event.wait(timeout)
 
 
-@xfail_review
 def test_parent_terminating_during_a_slow_registration_still_stops_that_child(bus):
     """A parent answers register_child only after on_register_child
     returns (#6), and its broker stops about 1 s after _terminate. A
