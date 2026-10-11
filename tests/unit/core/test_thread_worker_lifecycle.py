@@ -550,8 +550,8 @@ class _HangingBroker:
         self.stop_started.set()
         self._release.wait(timeout=30.0)
 
-    def publish(self, topic, payload): pass
-    def subscribe(self, topic, data_type): return None
+    def publish(self, topic, payload, **options): pass
+    def subscribe(self, topic, data_type, **options): return None
     def unsubscribe(self, topic): pass
 
 
@@ -561,8 +561,8 @@ class _FastBroker:
 
     def start(self, options: dict): return None
     def stop(self): self.stop_calls += 1
-    def publish(self, topic, payload): pass
-    def subscribe(self, topic, data_type): return None
+    def publish(self, topic, payload, **options): pass
+    def subscribe(self, topic, data_type, **options): return None
     def unsubscribe(self, topic): pass
 
 

@@ -466,9 +466,9 @@ def test_scenario_6_two_agent_reply_does_not_loop_via_hub_broker():
         class HubAdapter:
             def start(self, options): pass
             def stop(self): pass
-            def publish(self, topic, payload):
+            def publish(self, topic, payload, **options):
                 hub_publish(topic, payload)
-            def subscribe(self, topic, data_type):
+            def subscribe(self, topic, data_type, **options):
                 subscriptions.setdefault(topic, []).append(notifier)
             def unsubscribe(self, topic):
                 subs = subscriptions.get(topic, [])

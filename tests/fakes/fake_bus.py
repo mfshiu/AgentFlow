@@ -34,6 +34,8 @@ class FakeBusBroker:
         self._notifier = notifier
         self.connected = False
         self.published: List[Tuple[str, bytes]] = []
+        self.published_qos: List[int] = []          # parallel to published
+        self.subscribe_qos: Dict[str, int] = {}     # topic -> last requested QoS
 
     # -- MessageBroker interface used by Agent ------------------------------
 
@@ -45,16 +47,18 @@ class FakeBusBroker:
         self._bus._detach(self)
         return True
 
-    def subscribe(self, topic: str, data_type):
+    def subscribe(self, topic: str, data_type, *, qos: int = 0):
+        self.subscribe_qos[topic] = qos
         self._bus._subscribe(self, topic)
 
     def unsubscribe(self, topic: str):
         self._bus._unsubscribe(self, topic)
 
-    def publish(self, topic: str, payload):
+    def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False):
         if not self.connected:
             raise RuntimeError(f'FakeBusBroker: publish while disconnected ({topic!r})')
         self.published.append((topic, payload))
+        self.published_qos.append(qos)
         self._bus._route(topic, payload)
 
     def topics_published(self) -> List[str]:
