@@ -506,13 +506,13 @@ def _make_agent_wired_to(broker):
     return a
 
 
-def test_E41_agent_publish_returns_None_and_swallows_MqttPublishError(broker, fake_client):
-    """RFC-012 §E: fire-and-forget preserved."""
+def test_E41_agent_publish_returns_False_and_swallows_MqttPublishError(broker, fake_client):
+    """RFC-012 §E: fire-and-forget preserved; issue #4 reports False."""
     _prime_connected(broker, fake_client)
     _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
     agent = _make_agent_wired_to(broker)
     result = agent.publish("t", "hello")
-    assert result is None   # swallowed by except Exception
+    assert result is False   # swallowed by except Exception
 
 
 def test_E42_publish_or_raise_propagates_MqttPublishError(broker, fake_client):
@@ -567,12 +567,13 @@ def test_E45_rc_failure_and_Exception_both_fast_fail_uniformly(broker, fake_clie
     with pytest.raises(ConnectionError):
         agent._publish_or_raise("t", "x")
 
-    # Both cases: Agent.publish silently swallows (fire-and-forget).
+    # Both cases: Agent.publish swallows (fire-and-forget) and, since
+    # issue #4, reports False.
     fake_client.publish.side_effect = None
     _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
     fake_client.publish.side_effect = ConnectionError("nope")
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
 
 
 def test_E46_agent_publish_source_still_fire_and_forget_shape():
@@ -631,13 +632,13 @@ def test_E49_publish_sync_rc_failure_never_enters_event_wait(broker, fake_client
     assert elapsed < 0.5
 
 
-def test_E50_agent_publish_from_STOPPED_broker_silent(broker, fake_client):
+def test_E50_agent_publish_from_STOPPED_broker_reports_False(broker, fake_client):
     """State-gate MqttPublishError caught by Agent.publish's
-    fire-and-forget; caller sees None."""
+    fire-and-forget; caller sees False (issue #4)."""
     _prime_connected(broker, fake_client)
     broker.stop(graceful_timeout_s=2.0)
     agent = _make_agent_wired_to(broker)
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
 
 
 # ===========================================================================

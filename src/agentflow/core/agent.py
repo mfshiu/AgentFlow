@@ -976,18 +976,23 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def publish(self, topic, data=None, *, qos=0):
+    def publish(self, topic, data=None, *, qos=0) -> bool:
         # Fire-and-forget contract: catch every Exception so callers who
         # ignore the return value never see a broker-side failure. To
         # get the raise-on-failure variant, use publish_sync (which
         # goes through _publish_or_raise) or call _publish_or_raise
         # directly. Issue #4: `qos` (0, 1 or 2) is checked up front; an
         # invalid one is a programming error and raises ValueError.
+        # Returns True when the broker accepted the message and False
+        # when it did not (the failure is logged); it used to return
+        # None either way.
         check_qos(qos)
         try:
             self._publish_or_raise(topic, data, qos=qos)
+            return True
         except Exception as ex:
             logger.exception(ex)
+            return False
 
 
     def _publish_or_raise(self, topic, data=None, *, qos=0) -> None:

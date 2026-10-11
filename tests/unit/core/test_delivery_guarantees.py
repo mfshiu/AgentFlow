@@ -253,7 +253,6 @@ def test_the_deduplication_window_is_bounded():
 # D. Reported losses
 # ==========================================================================
 
-@xfail_4
 def test_publish_reports_whether_the_broker_accepted_the_message(agent_and_broker):
     agent, broker = agent_and_broker
     assert agent.publish('t', 'x') is True
