@@ -1,3 +1,4 @@
+import copy
 import inspect
 import logging
 import math
@@ -927,9 +928,24 @@ class Agent(BrokerNotifier):
             pcl = Parcel.from_content(data)
             pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
 
+        # RFC-014 (issue #36): a fresh, unpredictable id per request, set
+        # on a copy so that the caller's Parcel is not modified.
+        correlation_id = secrets.token_hex(16)
+        request = copy.copy(pcl)
+        request.correlation_id = correlation_id
+
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
+            reply_id = pcl_resp.correlation_id
+            if reply_id is not None and reply_id != correlation_id:
+                # RFC-014: the reply to another request on this topic,
+                # e.g. a late reply to an earlier call with the same
+                # topic_wait. A reply without an id comes from a service
+                # older than RFC-014 and is accepted as before.
+                logger.debug(self.M(
+                    f"Ignored a reply on {topic_resp!r} to another request ({reply_id!r})."))
+                return
             # Duplicate arriving before cleanup: keep the first response.
             if data_event.event.is_set():
                 return
@@ -968,9 +984,16 @@ class Agent(BrokerNotifier):
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
-            self._publish_or_raise(topic, pcl)
+            self._publish_or_raise(topic, request)
             if data_event.event.wait(timeout):
-                return data_event.data
+                reply = data_event.data
+                # RFC-014: the id served only to match this reply. Clear
+                # it so that forwarding this Parcel by hand to another
+                # requester (e.g. a gateway answering in on_message)
+                # does not carry a foreign id that requester would
+                # ignore. The Parcel was decoded for this call alone.
+                reply.correlation_id = None
+                return reply
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
         finally:
             # RFC-006 §7.5 + RFC-007 §7.8: triple check under lock —
@@ -1523,13 +1546,18 @@ class Agent(BrokerNotifier):
                     data_resp = err_pcl
                     logger.debug(data_resp)
                 # RFC-003 R-strip-topic_return: the auto-reply must
-                # never carry topic_return. If the handler returned a
-                # Parcel whose topic_return is truthy, reconstruct
-                # instead of mutating the caller's object.
-                if isinstance(data_resp, Parcel) and data_resp.topic_return:
-                    stripped = type(data_resp)(data_resp.content)
-                    stripped.error = data_resp.error
-                    data_resp = stripped
+                # never carry topic_return. RFC-014 (issue #36): it
+                # carries the request's correlation id. If the handler
+                # returned a Parcel that differs in either, reply with a
+                # shallow copy instead of mutating the caller's object;
+                # a copy keeps a subclass's own state and never calls
+                # its constructor.
+                if not isinstance(data_resp, Parcel):
+                    data_resp = Parcel.from_content(data_resp)
+                elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
+                    data_resp = copy.copy(data_resp)
+                    data_resp.topic_return = None
+                data_resp.correlation_id = pcl.correlation_id
                 self.publish(pcl.topic_return, data_resp)
             else:
                 try:

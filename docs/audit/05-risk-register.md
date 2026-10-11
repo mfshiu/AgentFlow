@@ -1359,6 +1359,10 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Cannot correlate publish → subscribe → response; cannot deduplicate; cannot detect stale messages.
 - **Confidence**: High
 - **Recommended verification test**: Read the parcel schema.
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #36, [RFC-014](../rfc/RFC-014-request-reply-correlation.md)).
+  - The envelope now carries an optional `correlation_id`. `publish_sync` stamps a fresh one on every request, auto-replies echo it, and `publish_sync` ignores replies to other requests, such as a late reply to an earlier call on the same `topic_wait`.
+  - Uncorrelated parcels encode exactly as before.
+  - Still open: message id and deduplication (#4), timestamp, source, trace context (#65), deadline, attempt, and the per-agent reply inbox (P2-2).
 
 ---
 
@@ -1531,7 +1535,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
-| R-20 | Medium | High | Open | No message metadata for tracing |
+| R-20 | Medium | High | **Partially resolved 2026-10-12 (#36, RFC-014)**: request/reply `correlation_id`; message id, timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
