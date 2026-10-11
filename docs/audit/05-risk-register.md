@@ -1568,6 +1568,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-09 | High | High | **Partially resolved 2026-10-11 (#38)**: same-name replica / grandchild addressing fixed; name validation and namespace still open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
+| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions (#17) and outbound bound (#35) still open | At-most-once delivery, silent losses |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
@@ -1580,7 +1581,6 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
-| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions (#17) and outbound bound (#35) still open | At-most-once delivery, silent losses |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |

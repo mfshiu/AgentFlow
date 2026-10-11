@@ -814,8 +814,9 @@ def test_G70_MqttBroker_publish_still_no_return_annotation_success_type_paho_dep
 
 def test_G71_message_broker_ABC_signature_unchanged(broker):
     """The positional parameters are unchanged. Issue #4 added the
-    keyword-only `qos` and `retain`, with defaults, so existing calls
-    and overrides keep working."""
+    keyword-only `qos` and `retain`, with defaults, so existing callers
+    keep working. Overrides must accept the new keywords: Agent always
+    passes `qos`, even 0 (the brokers are a closed set, BrokerMaker)."""
     sig = inspect.signature(MessageBroker.publish)
     positional = [n for n, p in sig.parameters.items()
                   if p.kind is not inspect.Parameter.KEYWORD_ONLY]

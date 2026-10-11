@@ -43,7 +43,8 @@ MessageBroker.subscribe(topic, data_type, *, qos: int = 0)
 - **MqttBroker** hands `qos` and `retain` to paho.
   - With the defaults, the paho call keeps its pre-RFC-015 shape (RFC-012 pins it).
   - `check_qos()` refuses anything but the ints 0, 1 and 2 with `ValueError`, before the RFC-012 gate.
-  - The RFC-005 registry maps `topic -> (data_type, qos)`, so the resubscribe after a reconnect keeps each topic's QoS.
+  - The RFC-005 registry maps `topic -> (data_type, qos)`, so the resubscribe after a reconnect keeps each topic's QoS. Recovery reads each topic's live entry, so a `subscribe()` made while it runs is not undone.
+  - For QoS ≥ 1, paho's `MQTT_ERR_NO_CONN` (socket already gone, disconnect not reported yet) counts as accepted: paho keeps the message and sends it after the reconnect.
 - **Other brokers**: Empty, Redis, ROS, ROS-Noetic and DDS accept the keywords and ignore them. Brokers are a closed set (`BrokerMaker`).
 
 ### 2.2 Which traffic uses QoS 1
@@ -84,6 +85,7 @@ MessageBroker.subscribe(topic, data_type, *, qos: int = 0)
 | Connection drops while a QoS 1 message (control / RPC) is in flight from the publisher | lost | paho resends it after the reconnect (with DUP); the receiver handles it once |
 | Duplicate delivery of a message carrying an id | handled twice | handled once (within the 4096-id window) |
 | Publishing while disconnected | `publish` → `None`, logged | `publish` → `False`, logged; `publish_sync` raises at once (RFC-002 / RFC-012) |
+| Publishing in the moment between paho losing the socket and reporting the disconnect | QoS 0: lost and reported as failed | QoS 0: still reported as failed. QoS ≥ 1: paho keeps the message and sends it after the reconnect, so it is reported as accepted; reporting a failure would make callers retry and the receiver run the request twice |
 | Subscriber disconnected while the broker holds a message for it | lost | still lost: a clean session keeps nothing for a disconnected client (#17) |
 | Request dropped by a full dispatcher | requester times out | requester gets an "overloaded" error reply at once |
 
