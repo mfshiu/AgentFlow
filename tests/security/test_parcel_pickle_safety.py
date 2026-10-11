@@ -334,6 +334,16 @@ def test_agent_can_refuse_pickle_payloads_entirely():
         agent.terminate()
 
 
+def test_subclass_decoders_accept_the_same_keywords():
+    # Parcel.from_payload's keyword-only options are accepted by the
+    # subclass decoders too (signature-compatible overrides).
+    with pytest.raises(parcel_mod.ParcelDecodeError):
+        BinaryParcel.from_payload(BinaryParcel({'a': 1}).payload(), accept_pickle=False)
+    out = TextParcel.from_payload(TextParcel({'a': 1}).payload(),
+                                  accept_pickle=False, pickle_allowed_globals=None)
+    assert out.content == {'a': 1}
+
+
 def test_parcel_from_payload_accept_pickle_false():
     with pytest.raises(parcel_mod.ParcelDecodeError):
         Parcel.from_payload(BinaryParcel({'a': 1}).payload(), accept_pickle=False)

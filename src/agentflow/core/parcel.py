@@ -207,13 +207,9 @@ class Parcel(ABC):
         ParcelDecodeError (a TypeError) for refused or malformed
         payloads."""
         if BinaryParcel.is_payload(payload):
-            if not accept_pickle:
-                raise ParcelDecodeError(
-                    "BinaryParcel (pickle) payloads are refused "
-                    "(codec.accept_pickle is False)"
-                )
             return BinaryParcel.from_payload(
-                payload, pickle_allowed_globals=pickle_allowed_globals)
+                payload, accept_pickle=accept_pickle,
+                pickle_allowed_globals=pickle_allowed_globals)
         if TextParcel.is_payload(payload):
             return TextParcel.from_payload(payload)
         raise TypeError("Not valid Parcel payload.")
@@ -272,10 +268,16 @@ class BinaryParcel(Parcel):
     def from_payload(
         payload: bytes,
         *,
+        accept_pickle: bool = True,
         pickle_allowed_globals: Optional[Iterable[Tuple[str, str]]] = None,
     ) -> "BinaryParcel":
         if not isinstance(payload, (bytes, bytearray)):
             raise TypeError("payload must be bytes for BinaryParcel")
+        if not accept_pickle:
+            raise ParcelDecodeError(
+                "BinaryParcel (pickle) payloads are refused "
+                "(codec.accept_pickle is False)"
+            )
         raw = bytes(payload)[len(BinaryParcel.HEAD):]
         allowed = DEFAULT_PICKLE_ALLOWED_GLOBALS
         if pickle_allowed_globals:
@@ -303,7 +305,14 @@ class TextParcel(Parcel):
         super().__init__(content, topic_return)
 
     @staticmethod
-    def from_payload(payload: bytes) -> "TextParcel":
+    def from_payload(
+        payload: bytes,
+        *,
+        accept_pickle: bool = True,
+        pickle_allowed_globals: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> "TextParcel":
+        # The keyword options match Parcel.from_payload; JSON payloads
+        # never unpickle, so they do not apply here.
         if not isinstance(payload, (bytes, bytearray)):
             raise TypeError("payload must be bytes for TextParcel")
         raw = bytes(payload)[len(TextParcel.HEAD):]
