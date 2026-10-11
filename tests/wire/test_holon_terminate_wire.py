@@ -13,10 +13,7 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel
 from tests.fakes.mini_mqtt_server import MiniMqttServer
 
-# Skipped (not xfail) until issue #5 is fixed: on a real connection the
-# echo storm would spawn thousands of threads before failing.
-pytestmark = [pytest.mark.wire,
-              pytest.mark.skip(reason='issue #5: mid-tier terminate echo storm not fixed yet')]
+pytestmark = pytest.mark.wire
 
 
 class WireAgent(Agent):

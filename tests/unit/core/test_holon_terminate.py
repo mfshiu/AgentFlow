@@ -28,9 +28,6 @@ from tests.fakes.fake_bus import FakeBus
 MAX_DELIVERIES = 300
 SETTLE_S = 0.5
 
-# Remove when issue #5 is fixed (strict: an unexpected pass fails).
-_ISSUE5 = pytest.mark.xfail(strict=True, reason='issue #5: mid-tier terminate echo storm not fixed yet')
-
 
 class TerminateAgent(Agent):
     def __init__(self, name):
@@ -87,7 +84,6 @@ def _settle():
     FakeBus.wait_until(lambda: False, timeout=SETTLE_S)
 
 
-@_ISSUE5
 def test_root_terminate_runs_each_body_once_and_mid_broadcasts_once(bus):
     root, mid, leaf = _hierarchy(bus)
     threads_before = threading.active_count()
@@ -108,7 +104,6 @@ def test_cascade_reaches_every_level(bus):
         assert a._Agent__terminate_event.wait(5), f'{a.name} did not stop'
 
 
-@_ISSUE5
 def test_terminate_is_idempotent(bus):
     mid = _agent(bus, 'b.a')
     bus.connect(mid)
@@ -121,7 +116,31 @@ def test_terminate_is_idempotent(bus):
     assert mid._Agent__terminate_event.wait(5)
 
 
-@_ISSUE5
+class FailingOnceAgent(TerminateAgent):
+    """The first terminate broadcast raises, as a failed Thread.start,
+    a KeyboardInterrupt or a raising subclass override would."""
+    def __init__(self, name):
+        super().__init__(name)
+        self.fail_next_terminate = True
+
+    def _notify_children(self, subject, *args, **kwargs):
+        if subject == 'terminate' and self.fail_next_terminate:
+            self.fail_next_terminate = False
+            raise RuntimeError('terminate broadcast failed')
+        return super()._notify_children(subject, *args, **kwargs)
+
+
+def test_terminate_that_failed_part_way_can_be_retried(bus):
+    mid = FailingOnceAgent('b.a')
+    bus.attach(mid)
+    bus.agents.append(mid)
+    bus.connect(mid)
+    with pytest.raises(RuntimeError):
+        mid._terminate()
+    mid._terminate()                # e.g. the worker stop retries
+    assert mid._Agent__terminate_event.wait(5),         'a failed first _terminate left the agent unstoppable'
+
+
 def test_own_broadcast_never_reaches_own_on_parents_message(bus):
     root, mid, leaf = _hierarchy(bus)
     mid._notify_children('hello')

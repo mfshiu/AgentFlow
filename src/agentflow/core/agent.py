@@ -90,6 +90,9 @@ class Agent(BrokerNotifier):
         self._holon_lock = threading.Lock()
         # Children whose first on_register_child is still running.
         self._children_registering: set = set()
+        # Issue #5: _terminate runs its body once (test-and-set).
+        self._terminate_lock = threading.Lock()
+        self._terminating = False
         
         self._message_broker = None
         self.__topic_handlers: dict[str, _HandlerRecord] = {}
@@ -141,6 +144,7 @@ class Agent(BrokerNotifier):
         '_parents',
         '_holon_lock',
         '_children_registering',
+        '_terminate_lock',
     })
 
     def __getstate__(self):
@@ -214,6 +218,8 @@ class Agent(BrokerNotifier):
         self._parents = {}
         self._holon_lock = threading.Lock()
         self._children_registering = set()
+        self._terminate_lock = threading.Lock()
+        self._terminating = False
         self._broker_connected = False
         if '_Agent__topic_handlers' not in self.__dict__:
             self._Agent__topic_handlers = {}
@@ -598,13 +604,28 @@ class Agent(BrokerNotifier):
             
             
     def _terminate(self):
-        logger.warning(self.M('Terminating..'))
-        
-        self._notify_children('terminate')
-        def stop():
-            time.sleep(1)
-            self.__terminate_event.set()
-        threading.Thread(target=stop).start()          
+        # Issue #5: run once. A worker stop, a parent's terminate and any
+        # echo of our own broadcast may all call this; only the first
+        # notifies the children and starts the delayed stop.
+        with self._terminate_lock:
+            if self._terminating:
+                return
+            self._terminating = True
+        try:
+            logger.warning(self.M('Terminating..'))
+
+            self._notify_children('terminate')
+            def stop():
+                time.sleep(1)
+                self.__terminate_event.set()
+            threading.Thread(target=stop).start()
+        except BaseException:
+            # The body did not finish (e.g. Thread.start failed, or a
+            # KeyboardInterrupt landed): let the next request retry it,
+            # or the agent could never stop.
+            with self._terminate_lock:
+                self._terminating = False
+            raise
 
 
     def __deactivating(self):
@@ -947,6 +968,13 @@ class Agent(BrokerNotifier):
         #     'target_children': [child_id, ..]
         # }
         
+        if parent.get('parent_id') == self.agent_id:
+            # Issue #5: our own broadcast on to_child.{self.name}, echoed
+            # back by the broker. Never act on it (a mid-tier agent's own
+            # terminate used to re-trigger itself endlessly) and never
+            # pass it to on_parents_message.
+            return None
+
         if target_children := parent.get('target_children'):
             if not self.agent_id in target_children:
                 return  # Not in the target children.
