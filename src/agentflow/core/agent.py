@@ -109,6 +109,67 @@ class _HandlerRecord:
     handler: Callable
 
 
+class _ReplyRouter:
+    """RFC-014 §8 (issue #36): the publish_sync calls waiting on one
+    reply topic, by correlation id. It is the topic's PUBLISH_SYNC
+    handler, so concurrent calls can share a topic_wait.
+
+    A reply goes to the caller whose correlation id it carries. One
+    without an id (a responder older than RFC-014) goes to the caller
+    waiting if there is exactly one; with several it cannot be
+    attributed, and nobody takes it rather than risk handing a caller
+    another's answer (RFC-006 Option D, FIFO, stays rejected). The
+    first reply a caller receives wins."""
+
+    def __init__(self, owner_tag: str):
+        self._owner_tag = owner_tag
+        self._lock = threading.Lock()
+        self._waiters: dict = {}        # correlation id -> Agent.DataEvent
+        self._unattributed = 0
+
+    def add(self, correlation_id: str, waiter) -> None:
+        with self._lock:
+            self._waiters[correlation_id] = waiter
+
+    def remove(self, correlation_id: str) -> bool:
+        """Remove a caller. Returns whether none is left."""
+        with self._lock:
+            self._waiters.pop(correlation_id, None)
+            return not self._waiters
+
+    def __call__(self, topic, reply) -> None:
+        reply_id = reply.correlation_id
+        unattributed = 0
+        with self._lock:
+            waiting = len(self._waiters)
+            if reply_id is not None:
+                waiter = self._waiters.get(reply_id)
+            elif waiting == 1:
+                waiter = next(iter(self._waiters.values()))
+            else:
+                waiter = None
+                if waiting:
+                    self._unattributed += 1
+                    unattributed = self._unattributed
+            if waiter is not None:
+                if not waiter.event.is_set():
+                    waiter.data = reply
+                    waiter.event.set()
+                return
+        if unattributed:
+            # WARNING on the 1st, 2nd, 4th, ... occurrence, so that a
+            # flood cannot flood the log.
+            level = logging.WARNING if unattributed & (unattributed - 1) == 0 else logging.DEBUG
+            logger.log(level, f"{self._owner_tag} Ignored a reply without a correlation id "
+                              f"on {topic!r}: {waiting} calls wait there, so it cannot be "
+                              f"attributed. Its responder predates RFC-014.")
+        else:
+            # A reply to another request, e.g. a late reply to an
+            # earlier call with the same topic_wait.
+            logger.debug(f"{self._owner_tag} Ignored a reply on {topic!r} to another "
+                         f"request ({reply_id!r}).")
+
+
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
@@ -152,6 +213,12 @@ class Agent(BrokerNotifier):
         # atomic identity-check-and-pop for publish_sync. Uses RLock
         # for future-proofing (RFC-006 Appendix B).
         self._handlers_lock = threading.RLock()
+        # RFC-014 §8: a publish_sync call joins its reply topic and
+        # subscribes, or leaves it and unsubscribes, under this lock, so
+        # a call that joins while the last one leaves never subscribes
+        # before that unsubscribe lands. Reentrant: a failed subscribe
+        # leaves while holding it.
+        self._reply_topics_lock = threading.RLock()
 
         self._broker = None
         self._connected_once = False
@@ -187,6 +254,7 @@ class Agent(BrokerNotifier):
     # in a child process context.
     _RUNTIME_ONLY_FIELDS = frozenset({
         '_handlers_lock',
+        '_reply_topics_lock',
         '_dispatcher_init_lock',
         '_dispatcher',
         '_broker',
@@ -263,6 +331,7 @@ class Agent(BrokerNotifier):
         child process."""
         self.__dict__.update(state)
         self._handlers_lock = threading.RLock()
+        self._reply_topics_lock = threading.RLock()
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
         self._broker = None
@@ -935,52 +1004,10 @@ class Agent(BrokerNotifier):
         request.correlation_id = correlation_id
 
         data_event = Agent.DataEvent(self._get_worker().create_event())
-
-        def handle_response(topic_resp, pcl_resp:Parcel):
-            reply_id = pcl_resp.correlation_id
-            if reply_id is not None and reply_id != correlation_id:
-                # RFC-014: the reply to another request on this topic,
-                # e.g. a late reply to an earlier call with the same
-                # topic_wait. A reply without an id comes from a service
-                # older than RFC-014 and is accepted as before.
-                logger.debug(self.M(
-                    f"Ignored a reply on {topic_resp!r} to another request ({reply_id!r})."))
-                return
-            # Duplicate arriving before cleanup: keep the first response.
-            if data_event.event.is_set():
-                return
-            data_event.data = pcl_resp
-            data_event.event.set()
-
-        # RFC-006 + RFC-007: atomic collision check + register under
-        # _handlers_lock. Any pre-existing record (NORMAL or
-        # PUBLISH_SYNC) is a collision; distinguish in the exception
-        # message. Register as PUBLISH_SYNC owner so subscribe/unsubscribe
-        # from other callers can refuse to trample the waiter (RFC-007
-        # §7.3, §7.4).
-        with self._handlers_lock:
-            existing = self.__topic_handlers.get(pcl.topic_return)
-            if existing is not None:
-                if existing.owner_type is _HandlerOwnerType.PUBLISH_SYNC:
-                    raise TopicWaitCollisionError(
-                        f"topic_wait {pcl.topic_return!r} is already awaited "
-                        f"by another publish_sync on this Agent"
-                    )
-                # NORMAL owner: publish_sync must not trample it.
-                raise TopicWaitCollisionError(
-                    f"topic_wait {pcl.topic_return!r} is already registered "
-                    f"by a normal subscribe handler; publish_sync would "
-                    f"trample it and is refused"
-                )
-            self.__topic_handlers[pcl.topic_return] = _HandlerRecord(
-                _HandlerOwnerType.PUBLISH_SYNC, handle_response,
-            )
+        reply_topic = pcl.topic_return
+        router = self.__join_reply_topic(reply_topic, correlation_id, data_event)
 
         try:
-            # broker.subscribe outside the collision lock (RFC-005
-            # principle: never hold a framework lock across broker I/O).
-            if self._broker:
-                self._broker.subscribe(pcl.topic_return, "str")
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
@@ -994,26 +1021,72 @@ class Agent(BrokerNotifier):
                 # ignore. The Parcel was decoded for this call alone.
                 reply.correlation_id = None
                 return reply
-            raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
+            raise TimeoutError(f"No response received within timeout period for topic: {reply_topic}.")
         finally:
-            # RFC-006 §7.5 + RFC-007 §7.8: triple check under lock —
-            # record exists, owner is PUBLISH_SYNC, handler identity
-            # matches. Only then pop and unsubscribe. broker.unsubscribe
-            # outside the lock so we never hold a framework lock across
-            # broker I/O.
+            self.__leave_reply_topic(reply_topic, correlation_id, router)
+
+
+    def __join_reply_topic(self, reply_topic, correlation_id, waiter) -> _ReplyRouter:
+        """Register a publish_sync call on its reply topic.
+
+        RFC-014 §8: concurrent calls share a reply topic through one
+        _ReplyRouter, registered as the topic's PUBLISH_SYNC handler, so
+        Agent.subscribe / unsubscribe still refuse to trample it
+        (RFC-007 §7.3, §7.4). The first call subscribes the topic. A
+        topic owned by a normal subscribe handler is refused with
+        TopicWaitCollisionError (RFC-006 / RFC-007).
+
+        Under _reply_topics_lock (see __init__). The broker is still
+        called outside _handlers_lock (RFC-005)."""
+        with self._reply_topics_lock:
             with self._handlers_lock:
-                record = self.__topic_handlers.get(pcl.topic_return)
-                if (record is not None
-                        and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
-                        and record.handler is handle_response):
-                    self.__topic_handlers.pop(pcl.topic_return, None)
-                    need_broker_unsubscribe = True
+                record = self.__topic_handlers.get(reply_topic)
+                if record is None:
+                    router = _ReplyRouter(self.name_tag)
+                    self.__topic_handlers[reply_topic] = _HandlerRecord(
+                        _HandlerOwnerType.PUBLISH_SYNC, router,
+                    )
+                    first = True
+                elif (record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+                        and isinstance(record.handler, _ReplyRouter)):
+                    router = record.handler
+                    first = False
                 else:
-                    need_broker_unsubscribe = False
-            if need_broker_unsubscribe:
+                    # NORMAL owner: publish_sync must not trample it.
+                    raise TopicWaitCollisionError(
+                        f"topic_wait {reply_topic!r} is already registered "
+                        f"by a normal subscribe handler; publish_sync would "
+                        f"trample it and is refused"
+                    )
+                router.add(correlation_id, waiter)
+            if first and self._broker:
                 try:
-                    if self._broker:
-                        self._broker.unsubscribe(pcl.topic_return)
+                    self._broker.subscribe(reply_topic, "str")
+                except BaseException:
+                    # RFC-006 §7.6: leave the registry clean, re-raise.
+                    self.__leave_reply_topic(reply_topic, correlation_id, router)
+                    raise
+        return router
+
+
+    def __leave_reply_topic(self, reply_topic, correlation_id, router) -> None:
+        """Unregister a publish_sync call. The last call to leave removes
+        the router and unsubscribes the topic. RFC-006 §7.5 / RFC-007
+        §7.8 triple check: only a record that still holds this router
+        as a PUBLISH_SYNC handler is removed. Under _reply_topics_lock;
+        the broker is called outside _handlers_lock."""
+        with self._reply_topics_lock:
+            with self._handlers_lock:
+                empty = router.remove(correlation_id)
+                record = self.__topic_handlers.get(reply_topic)
+                last = (empty and record is not None
+                        and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+                        and record.handler is router)
+                if last:
+                    self.__topic_handlers.pop(reply_topic, None)
+            if last and self._broker:
+                try:
+                    self._broker.unsubscribe(reply_topic)
                 except Exception as cleanup_ex:
                     logger.exception(cleanup_ex)
 

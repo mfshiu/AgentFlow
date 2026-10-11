@@ -87,9 +87,6 @@ def _reply_to(broker, request, content):
     broker.deliver(request.topic_return, reply.payload())
 
 
-xfail_shared = pytest.mark.xfail(
-    strict=True, reason='issue #36: concurrent publish_sync calls cannot share a topic_wait')
-
 
 def _spawn_publish_sync(agent, topic_wait, content, timeout):
     """Start publish_sync on a daemon background thread. Returns
@@ -137,7 +134,6 @@ def test_second_subscribe_overwrites_first_handler_in_registry():
         agent.terminate()
 
 
-@xfail_shared
 def test_shared_topic_wait_keeps_one_registry_entry_and_one_subscription():
     """RFC-014 §8 (was RFC-006 fail-fast): a second publish_sync on an
     already-awaited topic_wait joins the first instead of raising."""
@@ -161,7 +157,6 @@ def test_shared_topic_wait_keeps_one_registry_entry_and_one_subscription():
         agent.terminate()
 
 
-@xfail_shared
 def test_an_uncorrelated_reply_is_not_guessed_between_several_waiters():
     """A responder older than RFC-014 sends no correlation id. With one
     caller waiting the reply is taken as before; with several it cannot
@@ -454,7 +449,6 @@ def test_agent_terminate_during_concurrent_publish_sync_does_not_hang_waiters():
 # E. Stress: N callers share one topic_wait
 # ==========================================================================
 
-@xfail_shared
 @pytest.mark.parametrize('n', [3, 10, 50])
 def test_N_callers_share_one_topic_wait(n):
     """n concurrent callers on one topic_wait: one subscription, and
@@ -485,7 +479,6 @@ def test_N_callers_share_one_topic_wait(n):
 # F. Atomicity stress (register / cleanup race)
 # ==========================================================================
 
-@xfail_shared
 def test_concurrent_callers_on_one_topic_wait_race_stress():
     """Rounds of 8 concurrent publish_sync calls on one topic_wait,
     answered inline from broker.publish by an RFC-014 responder, so
@@ -568,7 +561,6 @@ class _SlowUnsubscribeBroker(FakeBroker):
         super().unsubscribe(topic)
 
 
-@xfail_shared
 def test_a_caller_joining_while_the_last_one_unsubscribes_stays_subscribed():
     """The last caller to leave a topic_wait unsubscribes it after
     releasing the registry lock. A caller arriving meanwhile must not
@@ -608,7 +600,6 @@ def test_a_caller_joining_while_the_last_one_unsubscribes_stays_subscribed():
 # G. Shared topic_wait (RFC-014 §8), and an aspirational strict xfail
 # ==========================================================================
 
-@xfail_shared
 def test_both_callers_should_receive_own_response_with_shared_topic_wait():
     """RFC-014 §8: each caller gets the reply carrying its own
     correlation id, whatever order the replies arrive in."""
