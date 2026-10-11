@@ -1,6 +1,6 @@
 # RFC-011 — MqttBroker bounded startup
 
-- **Status**: **Implemented** (2026-07-29)
+- **Status**: **Implemented** (2026-07-29). *Amended 2026-10-12 (issue #17): the paho Client is built once per broker inside start()'s NEW → STARTING transition, when its client id and clean session are known; a later start() still raises before building anything (§7.5), now checked behaviourally by test F59.*
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-10.6 (`MqttBroker.start` unbounded on `client.connect` / `client.loop_start` — runtime-confirmed); downstream of RFC-005 (subscription recovery), RFC-008 (ProcessWorker lifecycle), RFC-009 (ThreadWorker lifecycle), RFC-010 (broker bounded shutdown)
 - **Scope**: Give `MqttBroker.start()` a bounded, deterministic startup contract — a broker-side startup state machine, concurrent-start coordination, per-attempt daemon helper thread, exception isolation, symmetric bounded rollback (`START_TIMEOUT` + `START_FAILED` both invoke a private client-shutdown primitive), callback fencing after start-failure, and a well-defined observation surface for `Agent.__activating`. Close the R-10.6 residual from RFC-010 §Appendix D.

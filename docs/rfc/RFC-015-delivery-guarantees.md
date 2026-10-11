@@ -13,7 +13,7 @@
   - `Agent.publish` reporting its outcome.
   - An error reply for requests the dispatcher drops.
 - **Explicitly out of scope**:
-  - Persistent sessions and stable client ids (#17), without which the broker does not keep messages for a disconnected subscriber.
+  - Persistent sessions and stable client ids were out of scope at first; issue #17 added them (§6).
   - Bounding the outbound buffer (#35).
   - Decode-failure observability (#15).
   - Retained / last-will messages and membership expiry (R-18).
@@ -86,7 +86,7 @@ MessageBroker.subscribe(topic, data_type, *, qos: int = 0)
 | Duplicate delivery of a message carrying an id | handled twice | handled once (within the 4096-id window) |
 | Publishing while disconnected | `publish` → `None`, logged | `publish` → `False`, logged; `publish_sync` raises at once (RFC-002 / RFC-012) |
 | Publishing in the moment between paho losing the socket and reporting the disconnect | QoS 0: lost and reported as failed | QoS 0: still reported as failed. QoS ≥ 1: paho keeps the message and sends it after the reconnect, so it is reported as accepted; reporting a failure would make callers retry and the receiver run the request twice |
-| Subscriber disconnected while the broker holds a message for it | lost | still lost: a clean session keeps nothing for a disconnected client (#17) |
+| Subscriber disconnected while the broker holds a message for it | lost | default (clean session): still lost. With `clean_session: false` and a stable `client_id` (§6), the broker keeps QoS ≥ 1 messages for the client and delivers them when it reconnects |
 | Request dropped by a full dispatcher | requester times out | requester gets an "overloaded" error reply at once |
 
 Delivery is therefore **at least once with deduplication** for QoS 1 traffic between connected peers. It is not end-to-end exactly-once: duplicates beyond the window, or from senders without ids, still reach handlers. Handlers with side effects should stay idempotent; the holon operations are (#5, #6).
@@ -115,3 +115,20 @@ Delivery is therefore **at least once with deduplication** for QoS 1 traffic bet
   - the error reply for a dropped request, and none for a dropped plain message;
   - a `publish_sync` caller failing fast against an overloaded service.
 - The RFC-002 / RFC-012 tests that pinned `publish` returning `None` now assert `True` / `False`. RFC-012's ABC-signature test pins the positional parameters plus the new keyword-only ones.
+- §6: `tests/unit/test_mqtt_broker_session.py` covers the default and templated client ids, clean session, invalid options, refusal classification and the Agent not retrying. `tests/wire/test_mqtt_session_wire.py` checks the id and clean-session flag a real Agent sends, and a rejected id failing fast without retries.
+
+## 6. Client identity and persistent sessions (issue #17)
+
+Before #17 the paho Client had no client id, so every connection sent a zero-length one. Brokers assigned a new id each time, so persistent sessions and per-agent ACLs were impossible, and broker logs could not be matched to agents.
+
+**Options** (`broker` section, MQTT):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `client_id` | `'{name}-{agent_id:.12}'` | Template with `{name}` and `{agent_id}`, the Agent's. Write literal braces as `{{ }}`. The result must be 1 to 65535 UTF-8 bytes. |
+| `clean_session` | `true` | `false` keeps the broker-side session across reconnects of the same client id: its subscriptions, and QoS ≥ 1 messages that arrive while it is disconnected. |
+
+- **Uniqueness.** MQTT disconnects the older of two connections that share a client id. The default includes the agent id, so it is unique per Agent instance. A fixed id, or a template such as `'{name}'`, must be unique among all of the broker's clients. Two agents sharing one would keep disconnecting each other.
+- **Persistence.** With the default id, a persistent session lasts across reconnects within one process. A new Agent instance (a restart) has a new id and therefore a new session. To resume a session across restarts, use a stable id such as `'{name}'` with unique names. A broker keeps abandoned persistent sessions until its own expiry setting (for example mosquitto's `persistent_client_expiration`), so prefer the default `clean_session: true` unless you need queuing.
+- **Construction.** The paho Client is built once, in `start()`'s NEW → STARTING transition, with the client id, clean session, MQTT 3.1.1 and `reconnect_on_failure` (#2). Options are parsed before any state change, so a malformed one raises `ValueError` and leaves the broker NEW (RFC-011 amended).
+- **Refusals.** A refused CONNACK raises `MqttConnectRefused`, a `ConnectionError` with the reason code. It is not retryable when connecting again with the same configuration cannot succeed: unsupported protocol, client id rejected, bad user name or password, not authorised. That is MQTT 3.1.1 codes 1 / 2 / 4 / 5 and paho's MQTT 5 codes for them, plus 138 / 140. `Agent.__activating` then gives up at once instead of retrying three times, 5 s apart.
