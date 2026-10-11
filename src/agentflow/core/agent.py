@@ -3,8 +3,8 @@ import logging
 import math
 import pickle
 import queue
-import random
 import re
+import secrets
 import string
 import threading
 import time
@@ -869,7 +869,8 @@ class Agent(BrokerNotifier):
         
     def __generate_return_topic(self, topic):
         alphabet = string.digits + string.ascii_lowercase
-        rand = ''.join(random.choice(alphabet) for _ in range(10))
+        # Issue #13: from `secrets`, not the seedable, predictable `random`.
+        rand = ''.join(secrets.choice(alphabet) for _ in range(10))
         return f"{self.tag}-{rand}/{topic}"
 
     @final

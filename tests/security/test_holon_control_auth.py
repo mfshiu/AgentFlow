@@ -48,8 +48,6 @@ KEY = SECRET.encode()
 OTHER_SECRET = 'another-holon-secret-987654321'
 SETTLE_S = 0.3
 
-xfail_13 = pytest.mark.xfail(strict=True, reason='issue #13: holon control messages are not authenticated')
-
 
 def _holon_auth():
     from agentflow.core import holon_auth   # added by the issue #13 fix
@@ -422,7 +420,6 @@ def test_auto_reply_to_other_topics_is_unchanged(echo_service, topic_return):
     assert FakeBus.wait_until(lambda: topic_return in [t for t, _ in broker.publish_calls], timeout=2)
 
 
-@xfail_13
 def test_reply_topics_do_not_come_from_the_seedable_prng():
     agent = Agent('svc', {})
     generate = agent._Agent__generate_return_topic
