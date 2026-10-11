@@ -303,8 +303,8 @@ def test_publish_sync_cleans_up_when_broker_subscribe_raises():
     try:
         broker._original_subscribe = broker.subscribe
 
-        def raising_subscribe(topic, data_type):
-            broker._original_subscribe(topic, data_type)
+        def raising_subscribe(topic, data_type, **options):
+            broker._original_subscribe(topic, data_type, **options)
             raise RuntimeError('broker.subscribe failed')
 
         broker.subscribe = raising_subscribe
@@ -509,8 +509,8 @@ def test_concurrent_callers_on_one_topic_wait_race_stress():
     agent, broker = _make_agent()
     original_publish = broker.publish
     try:
-        def respond(pub_topic, payload):
-            original_publish(pub_topic, payload)
+        def respond(pub_topic, payload, **options):
+            original_publish(pub_topic, payload, **options)
             request = Parcel.from_payload(payload)
             if request.topic_return:
                 _reply_to(broker, request, f'reply-{request.content}')

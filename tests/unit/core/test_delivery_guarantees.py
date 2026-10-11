@@ -115,7 +115,6 @@ def _sent(agent):
 # A. QoS
 # ==========================================================================
 
-@xfail_4
 def test_holon_control_messages_travel_at_qos_1(bus):
     root, child = _agent(bus, 'a'), _agent(bus, 'b.a')
     assert bus.wait_until(lambda: child.agent_id in root._children
@@ -154,7 +153,6 @@ def test_application_publish_and_subscribe_default_to_qos_0(agent_and_broker):
     assert broker.subscribe_qos['s'] == 0
 
 
-@xfail_4
 def test_application_publish_and_subscribe_take_a_qos(agent_and_broker):
     agent, broker = agent_and_broker
     agent.publish('t', 'x', qos=1)
@@ -163,7 +161,6 @@ def test_application_publish_and_subscribe_take_a_qos(agent_and_broker):
     assert broker.subscribe_qos['s'] == 2
 
 
-@xfail_4
 @pytest.mark.parametrize('qos', [-1, 3, True, '1', None])
 def test_invalid_qos_is_refused_up_front(agent_and_broker, qos):
     agent, broker = agent_and_broker

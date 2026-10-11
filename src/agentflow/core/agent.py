@@ -20,6 +20,7 @@ from agentflow.core.parcel import Parcel, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
+from agentflow.broker.message_broker import check_qos
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
@@ -31,6 +32,11 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
 _CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
+
+# Issue #4: holon control messages and publish_sync requests / replies
+# travel at QoS 1 (at least once), and the topics they arrive on are
+# subscribed at QoS 1. Application publish / subscribe default to QoS 0.
+_CONTROL_QOS = 1
 
 # Issue #13: keys accepted in the optional `holon` config section.
 _HOLON_KEYS = frozenset({
@@ -958,19 +964,21 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def publish(self, topic, data=None):
+    def publish(self, topic, data=None, *, qos=0):
         # Fire-and-forget contract: catch every Exception so callers who
         # ignore the return value never see a broker-side failure. To
         # get the raise-on-failure variant, use publish_sync (which
         # goes through _publish_or_raise) or call _publish_or_raise
-        # directly.
+        # directly. Issue #4: `qos` (0, 1 or 2) is checked up front; an
+        # invalid one is a programming error and raises ValueError.
+        check_qos(qos)
         try:
-            self._publish_or_raise(topic, data)
+            self._publish_or_raise(topic, data, qos=qos)
         except Exception as ex:
             logger.exception(ex)
 
 
-    def _publish_or_raise(self, topic, data=None) -> None:
+    def _publish_or_raise(self, topic, data=None, *, qos=0) -> None:
         """Internal strict publish. Wraps `data` as a Parcel and forwards
         it to the broker. Unlike Agent.publish, propagates every broker
         exception to the caller and raises RuntimeError when no broker
@@ -980,7 +988,7 @@ class Agent(BrokerNotifier):
         pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)
         if self._broker is None:
             raise RuntimeError("Cannot publish: no broker attached")
-        self._broker.publish(topic, pcl.payload())
+        self._broker.publish(topic, pcl.payload(), qos=qos)
 
         
     def __generate_return_topic(self, topic):
@@ -1018,7 +1026,7 @@ class Agent(BrokerNotifier):
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
-            self._publish_or_raise(topic, request)
+            self._publish_or_raise(topic, request, qos=_CONTROL_QOS)
             if data_event.event.wait(timeout):
                 reply = data_event.data
                 # RFC-014: the id served only to match this reply. Clear
@@ -1068,7 +1076,7 @@ class Agent(BrokerNotifier):
                 router.add(correlation_id, waiter)
             if first and self._broker:
                 try:
-                    self._broker.subscribe(reply_topic, "str")
+                    self._broker.subscribe(reply_topic, "str", qos=_CONTROL_QOS)
                 except BaseException:
                     # RFC-006 §7.6: leave the registry clean, re-raise.
                     self.__leave_reply_topic(reply_topic, correlation_id, router)
@@ -1099,11 +1107,12 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def subscribe(self, topic, data_type:str="str", topic_handler=None):
+    def subscribe(self, topic, data_type:str="str", topic_handler=None, *, qos=0):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
 
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
+        check_qos(qos)      # issue #4: before anything is registered
 
         if topic_handler:
             # RFC-007 §7.3: refuse to trample an active publish_sync
@@ -1124,7 +1133,7 @@ class Agent(BrokerNotifier):
                 )
 
         # broker.subscribe outside the lock (RFC-005/006 lock hygiene).
-        return self._broker.subscribe(topic, data_type) if self._broker else None
+        return self._broker.subscribe(topic, data_type, qos=qos) if self._broker else None
 
 
     @final
@@ -1415,7 +1424,7 @@ class Agent(BrokerNotifier):
                     f"Not sending {message.get('subject')!r} to {topic!r}: "
                     f"its data cannot be signed ({ex})."))
                 return None
-        return self.publish(topic, message)
+        return self.publish(topic, message, qos=_CONTROL_QOS)
     
     
     def _notify_child(self, child_id, subject, data=None):
@@ -1531,14 +1540,14 @@ class Agent(BrokerNotifier):
             attr_name = str(event).lower()[len('EventHandler.'):]
             setattr(self, attr_name, self.get_config(str(event), getattr(self, attr_name, None)))
 
-        self.subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children)  # All the parents were notified by the children.
-        self.subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children)  # I was the only parent notified by a child.  
+        self.subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children, qos=_CONTROL_QOS)  # All the parents were notified by the children.
+        self.subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children, qos=_CONTROL_QOS)  # I was the only parent notified by a child.
         
         # logger.verbose(f"self.parent_name: {self.parent_name}")
         if self.parent_name:
-            self.subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents) # All the children were notified by the parents.
-            self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
-            self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
+            self.subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS) # All the children were notified by the parents.
+            self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS)    # All the children with the same name were notified by the parents.
+            self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS)    # Only this child notified by a parent.
             self._notify_parents("register_child")
         # Issue #6: children that started first registered with nobody.
         self._announce_parent_online()
@@ -1638,7 +1647,7 @@ class Agent(BrokerNotifier):
                     data_resp = copy.copy(data_resp)
                     data_resp.topic_return = None
                 data_resp.correlation_id = pcl.correlation_id
-                self.publish(pcl.topic_return, data_resp)
+                self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
             else:
                 try:
                     topic_handler(topic, pcl)
