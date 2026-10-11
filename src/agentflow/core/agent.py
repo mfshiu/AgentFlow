@@ -1,4 +1,5 @@
 import copy
+from collections import OrderedDict
 import inspect
 import logging
 import math
@@ -20,6 +21,7 @@ from agentflow.core.parcel import Parcel, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
+from agentflow.broker.message_broker import check_qos
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
@@ -31,6 +33,14 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
 _CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
+
+# Issue #4: holon control messages and publish_sync requests / replies
+# travel at QoS 1 (at least once), and the topics they arrive on are
+# subscribed at QoS 1. Application publish / subscribe default to QoS 0.
+_CONTROL_QOS = 1
+# Issue #4: how many recently received message ids an agent remembers to
+# drop redeliveries (QoS 1 resends follow a reconnect closely).
+_DEDUP_WINDOW = 4096
 
 # Issue #13: keys accepted in the optional `holon` config section.
 _HOLON_KEYS = frozenset({
@@ -226,6 +236,10 @@ class Agent(BrokerNotifier):
         # before that unsubscribe lands. Reentrant: a failed subscribe
         # leaves while holding it.
         self._reply_topics_lock = threading.RLock()
+        # Issue #4: the message ids received most recently, oldest
+        # first; a redelivered id is dropped (see __seen_before).
+        self._recent_message_ids: OrderedDict = OrderedDict()
+        self._dedup_lock = threading.Lock()
 
         self._broker = None
         self._connected_once = False
@@ -262,6 +276,8 @@ class Agent(BrokerNotifier):
     _RUNTIME_ONLY_FIELDS = frozenset({
         '_handlers_lock',
         '_reply_topics_lock',
+        '_recent_message_ids',
+        '_dedup_lock',
         '_dispatcher_init_lock',
         '_dispatcher',
         '_broker',
@@ -339,6 +355,8 @@ class Agent(BrokerNotifier):
         self.__dict__.update(state)
         self._handlers_lock = threading.RLock()
         self._reply_topics_lock = threading.RLock()
+        self._recent_message_ids = OrderedDict()
+        self._dedup_lock = threading.Lock()
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
         self._broker = None
@@ -958,19 +976,26 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def publish(self, topic, data=None):
+    def publish(self, topic, data=None, *, qos=0) -> bool:
         # Fire-and-forget contract: catch every Exception so callers who
         # ignore the return value never see a broker-side failure. To
         # get the raise-on-failure variant, use publish_sync (which
         # goes through _publish_or_raise) or call _publish_or_raise
-        # directly.
+        # directly. Issue #4: `qos` (0, 1 or 2) is checked up front; an
+        # invalid one is a programming error and raises ValueError.
+        # Returns True when the broker accepted the message and False
+        # when it did not (the failure is logged); it used to return
+        # None either way.
+        check_qos(qos)
         try:
-            self._publish_or_raise(topic, data)
+            self._publish_or_raise(topic, data, qos=qos)
+            return True
         except Exception as ex:
             logger.exception(ex)
+            return False
 
 
-    def _publish_or_raise(self, topic, data=None) -> None:
+    def _publish_or_raise(self, topic, data=None, *, qos=0) -> None:
         """Internal strict publish. Wraps `data` as a Parcel and forwards
         it to the broker. Unlike Agent.publish, propagates every broker
         exception to the caller and raises RuntimeError when no broker
@@ -978,9 +1003,15 @@ class Agent(BrokerNotifier):
         Marked with a single leading underscore to signal that this is
         internal-use only; API stability is not guaranteed."""
         pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)
+        # Issue #4: every message sent carries a fresh id, so that a
+        # receiver can drop a redelivery. Set on a copy: the caller's
+        # Parcel is not modified.
+        if pcl is data:
+            pcl = copy.copy(pcl)
+        pcl.message_id = uuid.uuid4().hex
         if self._broker is None:
             raise RuntimeError("Cannot publish: no broker attached")
-        self._broker.publish(topic, pcl.payload())
+        self._broker.publish(topic, pcl.payload(), qos=qos)
 
         
     def __generate_return_topic(self, topic):
@@ -1018,7 +1049,7 @@ class Agent(BrokerNotifier):
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
-            self._publish_or_raise(topic, request)
+            self._publish_or_raise(topic, request, qos=_CONTROL_QOS)
             if data_event.event.wait(timeout):
                 reply = data_event.data
                 # RFC-014: the id served only to match this reply. Clear
@@ -1068,7 +1099,7 @@ class Agent(BrokerNotifier):
                 router.add(correlation_id, waiter)
             if first and self._broker:
                 try:
-                    self._broker.subscribe(reply_topic, "str")
+                    self._broker.subscribe(reply_topic, "str", qos=_CONTROL_QOS)
                 except BaseException:
                     # RFC-006 §7.6: leave the registry clean, re-raise.
                     self.__leave_reply_topic(reply_topic, correlation_id, router)
@@ -1099,11 +1130,12 @@ class Agent(BrokerNotifier):
 
 
     @final
-    def subscribe(self, topic, data_type:str="str", topic_handler=None):
+    def subscribe(self, topic, data_type:str="str", topic_handler=None, *, qos=0):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
 
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
+        check_qos(qos)      # issue #4: before anything is registered
 
         if topic_handler:
             # RFC-007 §7.3: refuse to trample an active publish_sync
@@ -1124,7 +1156,7 @@ class Agent(BrokerNotifier):
                 )
 
         # broker.subscribe outside the lock (RFC-005/006 lock hygiene).
-        return self._broker.subscribe(topic, data_type) if self._broker else None
+        return self._broker.subscribe(topic, data_type, qos=qos) if self._broker else None
 
 
     @final
@@ -1415,7 +1447,7 @@ class Agent(BrokerNotifier):
                     f"Not sending {message.get('subject')!r} to {topic!r}: "
                     f"its data cannot be signed ({ex})."))
                 return None
-        return self.publish(topic, message)
+        return self.publish(topic, message, qos=_CONTROL_QOS)
     
     
     def _notify_child(self, child_id, subject, data=None):
@@ -1531,14 +1563,14 @@ class Agent(BrokerNotifier):
             attr_name = str(event).lower()[len('EventHandler.'):]
             setattr(self, attr_name, self.get_config(str(event), getattr(self, attr_name, None)))
 
-        self.subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children)  # All the parents were notified by the children.
-        self.subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children)  # I was the only parent notified by a child.  
+        self.subscribe(f'to_parent.{self.name}', topic_handler=self._handle_children, qos=_CONTROL_QOS)  # All the parents were notified by the children.
+        self.subscribe(f'{self.agent_id}.to_parent.{self.name}', topic_handler=self._handle_children, qos=_CONTROL_QOS)  # I was the only parent notified by a child.
         
         # logger.verbose(f"self.parent_name: {self.parent_name}")
         if self.parent_name:
-            self.subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents) # All the children were notified by the parents.
-            self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
-            self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
+            self.subscribe(f'to_child.{self.parent_name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS) # All the children were notified by the parents.
+            self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS)    # All the children with the same name were notified by the parents.
+            self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents, qos=_CONTROL_QOS)    # Only this child notified by a parent.
             self._notify_parents("register_child")
         # Issue #6: children that started first registered with nobody.
         self._announce_parent_online()
@@ -1583,6 +1615,11 @@ class Agent(BrokerNotifier):
     def _on_message(self, topic:str, data):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         pcl = Parcel.from_payload(data, **self._codec_options)
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
+            # whose acknowledgement was lost across a reconnect.
+            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
+            return
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
         # registry under _handlers_lock. is_specific_handler and
@@ -1638,7 +1675,7 @@ class Agent(BrokerNotifier):
                     data_resp = copy.copy(data_resp)
                     data_resp.topic_return = None
                 data_resp.correlation_id = pcl.correlation_id
-                self.publish(pcl.topic_return, data_resp)
+                self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
             else:
                 try:
                     topic_handler(topic, pcl)
@@ -1648,7 +1685,31 @@ class Agent(BrokerNotifier):
         # RFC-004: dispatch via the bounded message dispatcher instead
         # of spawning one Thread per message. enqueue() never raises
         # (broker-callback safety invariant, §7.3).
-        self._get_dispatcher().enqueue(handle_message, topic=topic)
+        if not self._get_dispatcher().enqueue(handle_message, topic=topic) and should_auto_reply:
+            # Issue #4: the dispatcher dropped a request (queue full, or
+            # stopping); the dispatcher has counted and logged it. Tell
+            # the requester now rather than let it wait for its timeout.
+            # publish never raises and does not block on the broker.
+            dropped = Parcel.from_content(None)
+            dropped.error = ("overloaded: the request was dropped before it was handled "
+                             "(dispatcher queue full or stopping)")
+            dropped.correlation_id = pcl.correlation_id
+            self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+
+
+    def __seen_before(self, message_id: str) -> bool:
+        """Issue #4: whether `message_id` arrived recently, recording it
+        if not. Handling each id once keeps QoS 1 redeliveries from
+        causing duplicate side effects (CLAUDE.md invariant 3). Only the
+        last _DEDUP_WINDOW ids are remembered."""
+        with self._dedup_lock:
+            if message_id in self._recent_message_ids:
+                self._recent_message_ids.move_to_end(message_id)
+                return True
+            self._recent_message_ids[message_id] = None
+            if len(self._recent_message_ids) > _DEDUP_WINDOW:
+                self._recent_message_ids.popitem(last=False)
+            return False
 
 
     def __create_dispatcher(self):

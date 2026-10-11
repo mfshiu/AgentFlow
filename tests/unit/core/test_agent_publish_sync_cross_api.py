@@ -338,13 +338,13 @@ def test_cleanup_only_removes_own_publish_sync_entry():
         original_publish = broker.publish
         foreign_handler = lambda t, p: None   # noqa: E731
 
-        def evil_publish(topic, payload):
+        def evil_publish(topic, payload, **options):
             # Simulate a corrupted registry state during publish_sync's
             # wait: overwrite with a NORMAL foreign record.
             _handlers(agent)['T'] = _HandlerRecord(
                 _HandlerOwnerType.NORMAL, foreign_handler,
             )
-            original_publish(topic, payload)
+            original_publish(topic, payload, **options)
 
         broker.publish = evil_publish
 
@@ -591,7 +591,7 @@ def test_handlers_lock_is_reentrant_from_broker_subscribe_callback():
         original_subscribe = broker.subscribe
         observed = []
 
-        def spy_subscribe(topic, data_type):
+        def spy_subscribe(topic, data_type, **options):
             # Try to acquire _handlers_lock during the broker.subscribe
             # call. If _handlers_lock were held by the caller, this
             # would deadlock — RLock reentrancy would only save us if
@@ -603,7 +603,7 @@ def test_handlers_lock_is_reentrant_from_broker_subscribe_callback():
             observed.append(got)
             if got:
                 agent._handlers_lock.release()
-            return original_subscribe(topic, data_type)
+            return original_subscribe(topic, data_type, **options)
 
         broker.subscribe = spy_subscribe
         agent.subscribe('T', topic_handler=lambda t, p: None)

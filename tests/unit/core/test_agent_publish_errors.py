@@ -4,7 +4,9 @@ error handling (Risk R-13 in docs/audit/05-risk-register.md).
 Post-RFC-002:
 
   - Agent.publish keeps its fire-and-forget contract: catches every
-    Exception, returns None, logs via logger.exception.
+    Exception and logs via logger.exception. Issue #4: it returns True
+    when the broker accepted the message and False when it did not
+    (it used to return None either way).
   - Agent._publish_or_raise is the strict internal variant: wraps data
     as a Parcel, forwards to the broker, and lets broker exceptions
     propagate. Raises RuntimeError when no broker is attached.
@@ -52,9 +54,9 @@ def _handlers(agent):
 # 1. Agent.publish success contract  (unchanged by RFC-002)
 # ==========================================================================
 
-def test_publish_returns_none_on_success(agent_with_fake_broker):
+def test_publish_returns_true_on_success(agent_with_fake_broker):
     agent, _broker = agent_with_fake_broker
-    assert agent.publish('topic', 'payload') is None
+    assert agent.publish('topic', 'payload') is True
 
 
 def test_publish_delegates_to_broker_publish(agent_with_fake_broker):
@@ -96,15 +98,15 @@ def test_publish_passes_through_existing_parcel_unchanged(agent_with_fake_broker
     TimeoutError('broker slow'),
     OSError('generic os error'),
 ])
-def test_publish_swallows_broker_exception_and_returns_none(
+def test_publish_swallows_broker_exception_and_returns_false(
     agent_with_fake_broker, exc,
 ):
     """Fire-and-forget: Agent.publish catches every Exception subclass
-    (agent.py) and only logs. Caller receives None with no signal.
-    This contract is preserved by RFC-002."""
+    (agent.py) and only logs. This contract is preserved by RFC-002;
+    since issue #4 the caller gets False rather than None."""
     agent, broker = agent_with_fake_broker
     broker.publish_exception = exc
-    assert agent.publish('t', 'x') is None
+    assert agent.publish('t', 'x') is False
 
 
 def test_publish_records_attempt_before_broker_raises(agent_with_fake_broker):
@@ -260,10 +262,10 @@ def test_publish_sync_subscribe_already_recorded_before_publish_raised(
 # 4. Agent.publish when broker is None  (unchanged by RFC-002)
 # ==========================================================================
 
-def test_publish_returns_none_when_broker_is_none(agent_without_broker):
+def test_publish_returns_false_when_broker_is_none(agent_without_broker):
     """Fire-and-forget: with no broker, publish swallows the
-    RuntimeError from _publish_or_raise and returns None."""
-    assert agent_without_broker.publish('t', 'x') is None
+    RuntimeError from _publish_or_raise and returns False (issue #4)."""
+    assert agent_without_broker.publish('t', 'x') is False
 
 
 def test_publish_does_not_raise_when_broker_is_none(agent_without_broker):
@@ -336,25 +338,25 @@ def test_publish_sync_with_none_broker_does_not_crash_on_cleanup(
 # 7. Return value only in log for Agent.publish (fire-and-forget preserved)
 # ==========================================================================
 
-def test_publish_return_value_is_none_regardless_of_broker_outcome(
+def test_publish_return_value_reports_the_broker_outcome(
     agent_with_fake_broker,
 ):
-    """Fire-and-forget: Agent.publish still returns None whether the
-    broker accepted, rejected, or was uncontactable."""
+    """Issue #4: Agent.publish never raises, and returns True when the
+    broker accepted the message and False when it did not."""
     agent, broker = agent_with_fake_broker
     r_success = agent.publish('t', 'x')
     broker.publish_exception = RuntimeError('bad')
     r_failure = agent.publish('t', 'x')
-    assert r_success is None
-    assert r_failure is None
+    assert r_success is True
+    assert r_failure is False
 
 
-def test_publish_return_value_cannot_distinguish_success_from_failure(
+def test_publish_return_value_distinguishes_success_from_failure(
     agent_with_fake_broker,
 ):
-    """Fire-and-forget: Agent.publish's return value is uniform across
-    all outcomes. Callers who need to distinguish must use the strict
-    variant _publish_or_raise."""
+    """Issue #4 (was: uniform None across all outcomes): the return
+    value tells success from failure; the strict variant
+    _publish_or_raise still gives the exception itself."""
     agent, broker = agent_with_fake_broker
     outcomes = []
     outcomes.append(agent.publish('t', 'ok'))
@@ -363,7 +365,7 @@ def test_publish_return_value_cannot_distinguish_success_from_failure(
         outcomes.append(agent.publish('t', 'x'))
     broker.publish_exception = None
     outcomes.append(agent.publish('t', 'ok-again'))
-    assert outcomes == [None, None, None, None, None]
+    assert outcomes == [True, False, False, False, True]
 
 
 # ==========================================================================

@@ -624,7 +624,10 @@ def test_D33_BaseException_in_helper_marks_STOP_FAILED_not_STOPPED(
     fake_client.disconnect.side_effect = MyKI("simulated interrupt")
     _prime_connected(broker, fake_client)
 
-    result = broker.stop(graceful_timeout_s=2.0)
+    # The helper dies at once; the generous budget only matters when a
+    # loaded CI runner stalls the dying thread (seen once on Windows /
+    # Python 3.11, where 2.0 s ran out and stop() reported STOP_TIMEOUT).
+    result = broker.stop(graceful_timeout_s=10.0)
     assert result is False
     assert broker.state is WorkerState.STOP_FAILED
 

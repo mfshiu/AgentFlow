@@ -448,7 +448,7 @@ def test_identity_guard_preserves_foreign_handler_on_same_topic(
 
     original_publish = broker.publish
 
-    def evil_publish(topic_arg, payload):
+    def evil_publish(topic_arg, payload, **options):
         # Simulate a corrupted registry state: a NORMAL foreign handler
         # is installed between publish_sync's subscribe and its finally.
         # RFC-007: registry values are _HandlerRecord.
@@ -456,7 +456,7 @@ def test_identity_guard_preserves_foreign_handler_on_same_topic(
             _HandlerOwnerType.NORMAL, foreign_handler,
         )
         # Do NOT deliver a response; let publish_sync time out.
-        original_publish(topic_arg, payload)
+        original_publish(topic_arg, payload, **options)
 
     broker.publish = evil_publish
 

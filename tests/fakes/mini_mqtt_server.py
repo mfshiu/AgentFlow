@@ -9,6 +9,9 @@ messages, no sessions).
 Failure injection:
   - drop_all()              abruptly closes every client connection
                             (simulates a broker crash / network cut)
+  - drop(index)             abruptly closes one client connection
+  - withhold_puback         when True, QoS 1 PUBLISHes are routed but
+                            not acknowledged (simulates a lost PUBACK)
   - reject_connections      when True, new TCP connections are closed
                             immediately without a CONNACK
                             (simulates a broker that is down)
@@ -55,6 +58,7 @@ class MiniMqttServer:
     def __init__(self, *, connack_rc: int = 0):
         self.connack_rc = connack_rc
         self.reject_connections = False
+        self.withhold_puback = False
 
         self._lock = threading.Lock()
         self._closed = False
@@ -111,6 +115,14 @@ class MiniMqttServer:
         """Abruptly close every client connection (RST where possible)."""
         with self._lock:
             conns, self._conns = self._conns, []
+        for c in conns:
+            self._hard_close(c.sock)
+
+    def drop(self, index: int) -> None:
+        """Abruptly close the client connection with this index."""
+        with self._lock:
+            conns = [c for c in self._conns if c.index == index]
+            self._conns = [c for c in self._conns if c.index != index]
         for c in conns:
             self._hard_close(c.sock)
 
@@ -291,6 +303,6 @@ class MiniMqttServer:
         payload = body[pos:]
         with self._lock:
             self.publishes.append((conn.index, topic, payload))
-        if qos == 1:
+        if qos == 1 and not self.withhold_puback:
             conn.send(b'\x40\x02' + pid)
         self.publish(topic, payload)

@@ -2,11 +2,11 @@ from paho.mqtt.client import Client
 from paho.mqtt.enums import CallbackAPIVersion
 import logging, math, os, socket, threading, time
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from agentflow.core.agent_worker import WorkerState
-from .message_broker import MessageBroker
+from .message_broker import MessageBroker, check_qos
 from .notifier import BrokerNotifier
 
 
@@ -18,6 +18,9 @@ from .notifier import BrokerNotifier
 # module is insulated from paho version restructuring. paho's own
 # MQTT_ERR_SUCCESS has always been 0 (v1 and v2).
 MQTT_ERR_SUCCESS = 0
+# paho's "no connection" result. For QoS >= 1 paho still keeps the
+# message and sends it after the reconnect (issue #4).
+MQTT_ERR_NO_CONN = 4
 
 
 class MqttPublishReason(Enum):
@@ -188,7 +191,9 @@ class MqttBroker(MessageBroker):
         # / publish / disconnect / loop_stop), across Thread.join,
         # across Event.wait, or across logger I/O.
         self._state_lock = threading.Lock()
-        self._registry: Dict[str, Any] = {}
+        # topic -> (data_type, qos); issue #4 added the QoS so that the
+        # resubscribe after a reconnect keeps it.
+        self._registry: Dict[str, Tuple[Any, int]] = {}
         self._connected: bool = False
         self._ever_connected: bool = False
         self._stopping: bool = False
@@ -334,7 +339,7 @@ class MqttBroker(MessageBroker):
             logger.error(f"MQTT connection failed: {self._connect_err}")
             self._connected_evt.set()
 
-    def _recover_subscriptions(self, snapshot: Dict[str, Any]) -> None:
+    def _recover_subscriptions(self, snapshot: Dict[str, Tuple[Any, int]]) -> None:
         """RFC-005 §6.3 recovery loop. Iterates the snapshot OUTSIDE
         _state_lock. Before each client call, re-checks that the topic
         is still in the live registry and that stop() has not fired.
@@ -345,7 +350,6 @@ class MqttBroker(MessageBroker):
         logger.info(f"recovery: starting for {len(snapshot)} topic(s)")
         successes = failures = 0
         for topic in snapshot:
-            still_in_registry = False
             with self._state_lock:
                 if self._stopping:
                     logger.warning(
@@ -353,13 +357,17 @@ class MqttBroker(MessageBroker):
                         f"{successes + failures}/{len(snapshot)} topics"
                     )
                     break
-                still_in_registry = topic in self._registry
-            if not still_in_registry:
+                # The live entry, not the snapshot's: a subscribe() made
+                # during recovery may have changed the topic's QoS
+                # (issue #4).
+                entry = self._registry.get(topic)
+            if entry is None:
                 # Topic was unsubscribed between snapshot and this
                 # iteration; skip.
                 continue
+            qos = entry[1]
             try:
-                self._client.subscribe(topic=topic)
+                self._client_subscribe(topic, qos)
                 successes += 1
             except Exception as ex:
                 failures += 1
@@ -1183,8 +1191,12 @@ class MqttBroker(MessageBroker):
         self._stop_helper_completed_normally = True
 
 
-    def publish(self, topic: str, payload):
+    def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False):
         """RFC-012 publish with state gate + immediate-result validation.
+
+        Issue #4: `qos` (0, 1 or 2) and `retain` are handed to paho; an
+        invalid QoS raises ValueError before the gate. With the defaults
+        the paho call keeps its pre-#4 shape (paho's own defaults).
 
         Raises MqttPublishError when:
           - the pre-call state gate rejects (state != RUNNING, or
@@ -1213,6 +1225,7 @@ class MqttBroker(MessageBroker):
           is released BEFORE `client.publish()` is called (parity
           with RFC-005 / RFC-010 / RFC-011 lock hygiene).
         """
+        check_qos(qos)
         # -- Pre-call state snapshot (best-effort — NOT linearized
         # with stop; see docstring).
         with self._state_lock:
@@ -1246,12 +1259,24 @@ class MqttBroker(MessageBroker):
         # -- paho call OUTSIDE the state lock.
         # A raise from paho itself propagates unchanged (RFC-002
         # convention preserved for Exception paths).
-        result = self._client.publish(topic=topic, payload=payload)
+        if qos or retain:
+            result = self._client.publish(topic=topic, payload=payload,
+                                          qos=qos, retain=bool(retain))
+        else:
+            result = self._client.publish(topic=topic, payload=payload)
 
         # -- Result normalisation + rc validation (authoritative
         # layer; catches races where stop() started after our
         # snapshot).
         rc, mid = self._normalise_publish_result(topic, result)
+        if rc == MQTT_ERR_NO_CONN and qos > 0:
+            # Issue #4: paho closes the socket before it reports the
+            # disconnect, so the gate above can pass with no socket.
+            # paho has queued this QoS >= 1 message and sends it after
+            # the reconnect; reporting a failure would make callers
+            # retry and the receiver handle the request twice.
+            logger.info(f"publish to {topic!r} queued by paho until the reconnect (QoS {qos})")
+            return result
         if rc != MQTT_ERR_SUCCESS:
             raise MqttPublishError(
                 topic=topic,
@@ -1337,19 +1362,26 @@ class MqttBroker(MessageBroker):
             result_type=type(result).__name__,
         )
 
-    def subscribe(self, topic: str, data_type):
+    def subscribe(self, topic: str, data_type, *, qos: int = 0):
         # RFC-005 §7.3: desired-state first; only forward when currently
         # connected. Disconnected-time subscribes rely on the next
         # _on_connect to run recovery from the registry.
+        check_qos(qos)      # issue #4
         with self._state_lock:
             if self._stopping:
                 logger.info(f"subscribe after stop; dropping topic {topic!r}")
                 return None
-            self._registry[topic] = data_type
+            self._registry[topic] = (data_type, qos)
             connected = self._connected
         if connected:
-            return self._client.subscribe(topic=topic)
+            return self._client_subscribe(topic, qos)
         return None
+
+    def _client_subscribe(self, topic: str, qos: int):
+        # Issue #4: QoS 0 keeps the pre-#4 paho call shape.
+        if qos:
+            return self._client.subscribe(topic=topic, qos=qos)
+        return self._client.subscribe(topic=topic)
 
     def unsubscribe(self, topic: str):
         # RFC-005 §7.4: symmetric with subscribe.
