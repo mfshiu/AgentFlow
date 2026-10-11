@@ -26,7 +26,7 @@ The envelope had only `version`, `content`, `topic_return` and `error`. `publish
 
 ### 2.1 Envelope
 
-`Parcel.correlation_id: Optional[str]`, default `None`.
+`Parcel.correlation_id: Optional[str]`, default `None`. The default is declared on the class too, so a Parcel built without `Parcel.__init__` still encodes. That covers a subclass that skips `super().__init__`, and a Parcel pickled by older code.
 
 - **Encoding**: written to the envelope (JSON object or pickled dict) under the key `correlation_id` **only when it is not `None`**. An uncorrelated parcel therefore encodes byte for byte as before; `tests/unit/core/test_reply_correlation.py` pins golden bytes.
 - **Decoding**: read when present. A value that is not a `str` decodes as `None`.
@@ -37,11 +37,12 @@ The envelope had only `version`, `content`, `topic_return` and `error`. `publish
 - Each call draws a fresh id: `secrets.token_hex(16)`, 32 lowercase hex characters, unpredictable.
 - The id is set on a **copy** of the outgoing Parcel, so the caller's Parcel is not modified. The existing `topic_return` handling is unchanged (#21).
 - The reply handler applies the rules in §2.4.
+- The Parcel returned to the caller has its `correlation_id` cleared. The id served only to match the reply. Without clearing, a gateway that answers in `on_message` (no auto-reply there, RFC-003) by forwarding that Parcel by hand would send its own requester a foreign id, and the requester would ignore it.
 
 ### 2.3 Responder: auto-reply (RFC-003)
 
 - The auto-reply carries the request's `correlation_id`. This covers a content reply, a Parcel reply and the error reply sent when the handler raises.
-- A Parcel returned by the handler is rebuilt, not modified, when its `topic_return` is set (RFC-003) or its correlation id differs.
+- A Parcel returned by the handler is not modified. When its `topic_return` is set (RFC-003) or its correlation id differs, the reply is a shallow copy (`copy.copy`) with `topic_return` cleared and the request's id set. A copy keeps a subclass's own state and never calls its constructor.
 - A request without a correlation id gets a reply without one, encoded exactly as before.
 
 ### 2.4 Matching rules (requester side)
@@ -59,7 +60,7 @@ The envelope had only `version`, `content`, `topic_return` and `error`. `publish
 | **Pre-RFC-014** | unchanged | Request has no id, so the reply has none: unchanged bytes. |
 | **RFC-014** | The responder ignores the id and replies without one; the reply is accepted as before. | Correlated. |
 
-No deployment order is required. The protection against late replies needs the responder to be upgraded.
+No deployment order is required. The protection against late replies needs the responder to be upgraded. Replies forwarded by hand keep working (§2.2).
 
 ## 4. Security notes
 
@@ -88,6 +89,9 @@ No deployment order is required. The protection against late replies needs the r
   - auto-reply echo (content, Parcel, error) with no mutation;
   - fresh ids per request, with the caller's Parcel untouched;
   - a late reply to an earlier call, and a reply to another request, ignored;
+  - a reply forwarded by hand through a gateway;
+  - a handler's Parcel subclass kept intact;
+  - a Parcel built without `__init__`;
   - an uncorrelated reply accepted;
   - a two-agent round trip on a FakeBus.
 - `tests/wire/test_reply_correlation_wire.py` checks a two-agent round trip over real MqttBroker clients: the request carries an id and the reply echoes it.
