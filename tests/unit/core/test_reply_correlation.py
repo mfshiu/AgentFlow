@@ -313,7 +313,6 @@ def test_a_reply_forwarded_by_hand_reaches_the_original_requester():
             a.terminate()
 
 
-@xfail_review
 def test_parcels_built_without_parcel_init_still_encode():
     """E.g. a subclass that does not call super().__init__, or a Parcel
     pickled by code older than RFC-014."""

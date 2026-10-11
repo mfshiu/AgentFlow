@@ -133,6 +133,11 @@ def _require_dict(managed: Any, kind: str) -> Dict[str, Any]:
 
 
 class Parcel(ABC):
+    # RFC-014: class-level default, so a Parcel built without __init__
+    # (a subclass that skips super().__init__, or one pickled by code
+    # older than RFC-014) still encodes.
+    correlation_id: Optional[str] = None
+
     def __init__(self, content: Any = None, topic_return: Any = None):
         self.version: int = VERSION
         self.content: Any = content
