@@ -14,8 +14,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
-
 _SRC = pathlib.Path(__file__).resolve().parents[2] / 'src'
 
 _PROBE = textwrap.dedent("""
@@ -38,7 +36,6 @@ _PROBE = textwrap.dedent("""
 """)
 
 
-@pytest.mark.xfail(strict=True, reason='#47: agent.py still imports tkinter')
 def test_framework_imports_without_tkinter():
     env = dict(os.environ)
     env['PYTHONPATH'] = os.pathsep.join(
