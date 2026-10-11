@@ -1685,7 +1685,16 @@ class Agent(BrokerNotifier):
         # RFC-004: dispatch via the bounded message dispatcher instead
         # of spawning one Thread per message. enqueue() never raises
         # (broker-callback safety invariant, §7.3).
-        self._get_dispatcher().enqueue(handle_message, topic=topic)
+        if not self._get_dispatcher().enqueue(handle_message, topic=topic) and should_auto_reply:
+            # Issue #4: the dispatcher dropped a request (queue full, or
+            # stopping); the dispatcher has counted and logged it. Tell
+            # the requester now rather than let it wait for its timeout.
+            # publish never raises and does not block on the broker.
+            dropped = Parcel.from_content(None)
+            dropped.error = ("overloaded: the request was dropped before it was handled "
+                             "(dispatcher queue full or stopping)")
+            dropped.correlation_id = pcl.correlation_id
+            self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
 
 
     def __seen_before(self, message_id: str) -> bool:

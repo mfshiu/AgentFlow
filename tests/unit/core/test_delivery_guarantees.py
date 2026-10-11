@@ -36,7 +36,6 @@ from agentflow.core.parcel import BinaryParcel, Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_4 = pytest.mark.xfail(strict=True, reason='issue #4: QoS 0 only, no message id')
 
 CONTROL_SUBJECTS = {'terminate', 'register_child', 'register_parent', 'parent_online'}
 SETTLE_S = 0.3
@@ -266,7 +265,6 @@ def _request(content, topic_return, correlation_id):
     return parcel.payload()
 
 
-@xfail_4
 def test_a_request_dropped_by_a_full_dispatcher_gets_an_error_reply():
     agent, broker = _fake_broker_agent(config={'dispatch': {
         'workers': 1, 'queue_capacity': 1, 'shutdown_timeout_s': 1.0}})
@@ -314,7 +312,6 @@ def test_a_dropped_message_without_topic_return_gets_no_reply():
         agent.terminate()
 
 
-@xfail_4
 def test_a_requester_fails_fast_when_the_service_is_overloaded(bus):
     service = _agent(bus, 'svc-agent', {'dispatch': {
         'workers': 1, 'queue_capacity': 1, 'shutdown_timeout_s': 1.0}})
