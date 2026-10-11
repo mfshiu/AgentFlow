@@ -12,6 +12,9 @@ Failure injection:
   - drop(index)             abruptly closes one client connection
   - withhold_puback         when True, QoS 1 PUBLISHes are routed but
                             not acknowledged (simulates a lost PUBACK)
+  - deliver_on_connect      (topic, payload) pairs sent to every client
+                            right after its CONNACK (simulates the queued
+                            messages of a resumed persistent session)
   - reject_connections      when True, new TCP connections are closed
                             immediately without a CONNACK
                             (simulates a broker that is down)
@@ -59,6 +62,7 @@ class MiniMqttServer:
         self.connack_rc = connack_rc
         self.reject_connections = False
         self.withhold_puback = False
+        self.deliver_on_connect: List[Tuple[str, bytes]] = []
 
         self._lock = threading.Lock()
         self._closed = False
@@ -269,6 +273,9 @@ class MiniMqttServer:
             self.connects.append((conn.index, conn.client_id))
             self.clean_sessions.append((conn.index, clean_session))
         conn.send(bytes([0x20, 0x02, 0x00, self.connack_rc]))
+        if self.connack_rc == 0:
+            for topic, payload in list(self.deliver_on_connect):
+                conn.send(self._publish_packet(topic, payload))
 
     def _on_subscribe_packet(self, conn: _Conn, body: bytes) -> None:
         pid = body[:2]
