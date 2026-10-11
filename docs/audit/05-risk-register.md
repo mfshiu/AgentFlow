@@ -1252,6 +1252,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-18 — No unregister / heartbeat / liveness detection between parents and children
 
+- **Status**: **PARTIALLY RESOLVED** (2026-10-11, issue #6). Membership now converges regardless of start order, reconnects and parent restarts; see [Membership convergence](#membership-convergence-2026-10-11-issue-6). Expiry (unregister / LWT / heartbeat) remains **Open**, because a dead child still stays in `_children`.
 - **Severity**: High
 - **Category**: Fault Isolation
 - **File / Function / Line**: `src/agentflow/core/agent.py:367–386` (`__register_child`, `__register_parent`); no counterpart delete methods anywhere in the file (grep-confirmed).
@@ -1259,6 +1260,27 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Parent's `_children` dict never shrinks; subsequent `_notify_child` publishes to a dead topic silently (nothing to detect it). No task reassignment path exists.
 - **Confidence**: High
 - **Recommended verification test**: Start child + parent; kill child; verify `_children` still contains the dead child id, and that `_notify_child` succeeds silently.
+
+### Membership convergence (2026-10-11, issue #6)
+
+**Problem.** `register_child` was sent once, on the first connection only, and a parent never asked for registrations. A parent therefore knew its children only if it was online first. A parent restart (new `agent_id`) or a reconnect lost the membership, and `_notify_children('terminate')` returned early on an empty `_children`, so terminate never reached such a subtree.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- On every (re)connect, an agent re-sends `register_child` if it has a parent, and broadcasts the new internal control subject `parent_online` on `to_child.{name}`.
+- A child that receives `parent_online` on its parent channel `to_child.{parent_name}` from another agent answers that parent only, on `{parent_id}.to_parent.{parent_name}`. It ignores the copies on `to_child.{name}`: its own echo, or a same-name replica's broadcast. `parent_online` never reaches `on_parents_message`.
+- `__register_child` / `__register_parent` are idempotent under `_holon_lock`, which is runtime-only. A repeated registration refreshes the entry, and `on_register_child` / `on_register_parent` fire once per member.
+- While the first `on_register_child` for a child is still running, duplicates get no `register_parent` answer; the first registration answers once its hook returns.
+
+**Compatibility.** The wire format is unchanged apart from the new `parent_online` subject.
+
+- Pre-change agents pass `parent_online` to `on_parents_message` as an unknown subject.
+- A pre-change parent is not idempotent, so it calls `on_register_child` again each time a post-change child reconnects. Upgrade parents (including mid-tier agents) before their children.
+- `on_children_message` / `on_parents_message` still see every `register_child` / `register_parent`, including repeats. Use `on_register_child` / `on_register_parent` for membership events.
+
+**Verification.** `tests/unit/core/test_holon_membership.py` (15 tests on `tests/fakes/fake_bus.py`) and `tests/wire/test_holon_wire.py` (real MqttBroker clients; child first → server drops every connection → parent replaced → terminate cascades).
+
+**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4), QoS 1 for control messages (#4), and the mid-tier terminate echo (#5). The latter now matters more, because mid-tier agents now actually have registered children in every start order.
 
 ---
 
@@ -1375,7 +1397,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
-| R-18 | High | High | Open | No child/parent unregister / heartbeat |
+| R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
