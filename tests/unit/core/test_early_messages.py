@@ -23,6 +23,8 @@ Contracts verified:
   - Agents outside the lifecycle (no _activate) are never gated.
 """
 
+import threading
+
 import pytest
 
 import agentflow.core.agent as agent_module
@@ -33,6 +35,8 @@ from tests.fakes.fake_bus import FakeBus
 
 
 SETTLE_S = 0.3
+
+xfail_review = pytest.mark.xfail(strict=True, reason='gaps found in review of the early-message gate')
 
 
 def _wait_until(predicate, timeout=2.0):
@@ -161,5 +165,58 @@ def test_agents_outside_the_lifecycle_are_never_gated():
         agent.subscribe('stray', 'str')      # no handler: on_message
         bus._route('stray', TextParcel('s1').payload())
         assert _wait_until(lambda: ('stray', 's1') in agent.unhandled, timeout=0.5)
+    finally:
+        agent.terminate()
+
+
+@xfail_review
+@pytest.mark.parametrize('subscription, topic', [('ready', 'ready'), ('ready/#', 'ready/x'), ('a/+/c', 'a/b/c')])
+def test_topics_subscribed_this_session_are_never_held(agent_and_broker, subscription, topic):
+    """Only leftovers of a resumed session (topics nobody subscribed in
+    this process) are held. A topic the agent subscribed without a
+    handler goes to on_message at once, so that a hook can wait for it."""
+    agent, broker = agent_and_broker
+    _await(agent, 'on_activate')
+    agent.subscribe(subscription, 'str')
+    broker.deliver(topic, TextParcel('now').payload())
+    assert _wait_until(lambda: agent.unhandled == [(topic, 'now')], timeout=1.0)
+    _done(agent, 'on_activate')
+
+
+@xfail_review
+def test_a_hook_that_never_returns_releases_held_messages_after_a_deadline(agent_and_broker, monkeypatch):
+    monkeypatch.setattr(agent_module, '_EARLY_MESSAGE_MAX_HOLD_S', 0.3)
+    agent, broker = agent_and_broker
+    _await(agent, 'on_connected')              # e.g. a long-running on_connected loop
+    broker.deliver('stray', TextParcel('s1').payload())
+    assert _wait_until(lambda: agent.unhandled == [('stray', 's1')], timeout=2.0)
+    broker.deliver('stray', TextParcel('s2').payload())     # no longer held
+    assert _wait_until(lambda: ('stray', 's2') in agent.unhandled, timeout=1.0)
+
+
+@xfail_review
+def test_the_release_waits_for_room_in_the_dispatcher_queue():
+    """Releasing many held messages must not burst past the dispatcher's
+    queue and turn them into 'overloaded' drops."""
+    agent = Recorder({'dispatch': {'workers': 1, 'queue_capacity': 4, 'shutdown_timeout_s': 1.0}})
+    broker = FakeBroker(notifier=agent)
+    agent._broker = broker
+    agent._agent_worker = FakeWorker()
+    try:
+        _await(agent, 'on_activate')
+        for i in range(40):
+            request = TextParcel(i, topic_return=f'reply/{i}')
+            broker.deliver('svc', request.payload())
+
+        def slow(topic, pcl):
+            threading.Event().wait(0.01)
+            return pcl.content
+        agent.subscribe('svc', topic_handler=slow)
+        _done(agent, 'on_activate')
+
+        def replies():
+            return [Parcel.from_payload(p) for t, p in broker.publish_calls if t.startswith('reply/')]
+        assert _wait_until(lambda: len(replies()) == 40, timeout=5)
+        assert [r for r in replies() if r.error] == []
     finally:
         agent.terminate()
