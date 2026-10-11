@@ -552,6 +552,7 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 
 ## R-09 — Topic construction from `Agent.name` without sanitization; naming collisions
 
+- **Status**: **PARTIALLY RESOLVED** (2026-10-11, issue #38). Parent-to-child messages no longer reach same-name replicas or grandchildren; see [Parent-to-child addressing](#parent-to-child-addressing-2026-10-11-issue-38). Name validation (`+`, `#`, `$`), an explicit `parent=` and a prefixed, `/`-separated control namespace (holon v2, roadmap P2-7) remain **Open**.
 - **Severity**: High
 - **Category**: Security / Correctness
 - **File / Function / Line**:
@@ -564,6 +565,36 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 - **Impact**: Message cross-delivery to unintended agents; unauthorised message reception if names collide across security domains.
 - **Confidence**: High (collision is by design). For `+ # /` wildcard interpretation, Confidence: Medium — depends on paho behaviour but consistent with the MQTT spec.
 - **Recommended verification test**: Construct two agents with the same name in a shared broker; observe whether both receive `register_child` events. Try a name containing `+` and observe subscription behaviour.
+
+### Parent-to-child addressing (2026-10-11, issue #38)
+
+**Problem.** `to_child.{X}` meant two things: a parent named X broadcasting to its own children, and a message addressed by name to the agents named X (`_notify_children(target_child_name=X)`). Every agent named X listened on it for the second meaning, and every child of an X listened on it for the first. As a result:
+
+- A mid-tier replica `b.a` took its same-name sibling's broadcast to that sibling's children as coming from its own parent, so one replica's `terminate` stopped every other replica.
+- A message addressed by name to `b.a` (from its parent `a`) also reached `b.a`'s children, `c.b.a`, as if `b.a` had sent it.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- Every parent-to-child control message now carries the sender's name, `parent_name`. This covers `_notify_children` broadcasts, `_notify_child` unicasts (including `register_parent`) and `parent_online`.
+- `_handle_parents` drops a message whose `parent_name` differs from the receiver's own `parent_name`. It neither acts on it nor passes it to `on_parents_message`.
+- Messages without the field, from senders that predate this change, are still accepted.
+
+**Compatibility.**
+
+- The control payload gains one optional key; topics and the other keys are unchanged.
+- Pre-change receivers ignore the key, but `on_parents_message` hooks will see it.
+- In a mixed fleet, a pre-change replica's broadcast can still stop a post-change replica. The fix is complete once every agent sharing a name runs the new version.
+- `_notify_children(target_child_name=...)` now reaches only agents whose parent has the sender's name. It can no longer address grandchildren directly; nothing in the repo or downstream does.
+
+**Verification.** `tests/unit/core/test_holon_addressing.py` (FakeBus) covers:
+
+- replica terminate isolation, and the parent's terminate still reaching every replica;
+- no sibling broadcast in `on_parents_message`;
+- no name-addressed message reaching grandchildren;
+- the sender name present on every parent message;
+- legacy messages accepted.
+
+`tests/wire/test_holon_terminate_wire.py` adds replica isolation over real MqttBroker clients.
 
 ---
 
@@ -1303,7 +1334,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Compatibility.** Message shapes are unchanged. `on_parents_message` no longer receives the agent's own broadcasts.
 
-**Still open.** A same-name replica's broadcast on `to_child.{name}` is still accepted, so one mid-tier replica's `terminate` also stops its same-name replicas. The topic is ambiguous (#38), and control messages are unauthenticated (#13). Because `_terminate` now runs once, the replicas can no longer bounce `terminate` back and forth.
+**Still open.** Control messages are unauthenticated (#13). The same-name replica `terminate` that this left open was fixed under #38; see R-09.
 
 ---
 
@@ -1418,7 +1449,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-03 | High | High | **Resolved 2026-10-10 (RFC-005 + issue #2)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
-| R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
+| R-09 | High | High | **Partially resolved 2026-10-11 (#38)**: same-name replica / grandchild addressing fixed; name validation and namespace still open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
