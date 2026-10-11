@@ -122,7 +122,10 @@ def test_the_hold_is_bounded():
         assert len(agent._early_messages) == limit
         _done(agent, 'on_activate')
         assert _wait_until(lambda: len(agent.unhandled) == limit, timeout=5)
-        assert [content for _, content in agent.unhandled[:3]] == [0, 1, 2]
+        # The first `limit` were kept and the overflow dropped. Several
+        # dispatcher workers handle them, so the order is not checked
+        # (RFC-004 §7.8).
+        assert sorted(content for _, content in agent.unhandled) == list(range(limit))
     finally:
         agent.terminate()
 
