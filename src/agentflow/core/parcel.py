@@ -133,11 +133,20 @@ def _require_dict(managed: Any, kind: str) -> Dict[str, Any]:
 
 
 class Parcel(ABC):
+    # RFC-014: class-level default, so a Parcel built without __init__
+    # (a subclass that skips super().__init__, or one pickled by code
+    # older than RFC-014) still encodes.
+    correlation_id: Optional[str] = None
+
     def __init__(self, content: Any = None, topic_return: Any = None):
         self.version: int = VERSION
         self.content: Any = content
         self.topic_return: Any = topic_return
         self.error: Any = None
+        # RFC-014 (issue #36): optional. publish_sync sets it on each
+        # request and an auto-reply echoes it, so a reply can be matched
+        # to its request.
+        self.correlation_id: Optional[str] = None
 
     def __str__(self) -> str:
         def _convert_content(content: Any) -> Union[str, Dict[str, Any], List[Any]]:
@@ -169,6 +178,8 @@ class Parcel(ABC):
             "topic_return": self.topic_return,
             "error": self.error,
         }
+        if self.correlation_id is not None:
+            body["correlation_id"] = self.correlation_id
 
         # Ensure JSON serializable (final safety net)
         try:
@@ -219,18 +230,26 @@ class Parcel(ABC):
         return BinaryParcel.is_payload(payload) or TextParcel.is_payload(payload)
 
     def _get_managed_data(self) -> Dict[str, Any]:
-        return {
+        managed = {
             "version": VERSION,
             "content": self.content,
             "topic_return": self.topic_return,
             "error": self.error,
         }
+        # RFC-014: written only when set, so an uncorrelated parcel
+        # encodes exactly as before. Receivers older than RFC-014 read
+        # only the four keys above and ignore it.
+        if self.correlation_id is not None:
+            managed["correlation_id"] = self.correlation_id
+        return managed
 
     def _set_managed_data(self, managed_data: Dict[str, Any]) -> None:
         self.version = managed_data.get("version", VERSION)
         self.content = managed_data.get("content")
         self.topic_return = managed_data.get("topic_return")
         self.error = managed_data.get("error")
+        correlation_id = managed_data.get("correlation_id")
+        self.correlation_id = correlation_id if isinstance(correlation_id, str) else None
 
     @abstractmethod
     def payload(self) -> bytes:

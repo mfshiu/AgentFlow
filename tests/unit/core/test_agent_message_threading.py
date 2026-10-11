@@ -328,10 +328,14 @@ def test_handler_exception_does_not_kill_consumer(agent_with_fake_broker):
     # Order is not guaranteed: several consumers drain the queue (#48).
     assert sorted(processed) == ['after-boom-1', 'after-boom-2']
     # All three tasks returned normally from the dispatcher's viewpoint
-    # (handle_message caught the RuntimeError internally).
-    snap = agent._dispatcher.metrics_snapshot()
-    assert snap['processed_count'] == 3
-    assert snap['error_count'] == 0
+    # (handle_message caught the RuntimeError internally). The consumer
+    # counts a task only after it returns, i.e. after the handler's side
+    # effect observed above, so wait for the counter instead of racing it.
+    assert _wait_until(
+        lambda: agent._dispatcher.metrics_snapshot()['processed_count'] == 3,
+        timeout=1.0,
+    ), agent._dispatcher.metrics_snapshot()
+    assert agent._dispatcher.metrics_snapshot()['error_count'] == 0
 
 
 def test_dispatcher_counts_task_exceptions_from_direct_enqueue():
@@ -351,8 +355,9 @@ def test_dispatcher_counts_task_exceptions_from_direct_enqueue():
         assert d.enqueue(raising_task, topic='X') is True
         assert d.enqueue(marker_task, topic='X') is True
         assert done.wait(1.0)  # consumer survived and ran the next task
-        assert d.error_count == 1
-        assert d.processed_count == 1  # marker_task
+        assert d.error_count == 1  # counted before marker_task started
+        # marker_task is counted only after it returns, i.e. after done.set().
+        assert _wait_until(lambda: d.processed_count == 1, timeout=1.0)
     finally:
         d.stop(timeout_s=1.0)
 

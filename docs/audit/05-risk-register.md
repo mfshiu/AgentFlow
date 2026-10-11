@@ -116,7 +116,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
   - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
   - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
-  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details.
+  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details. **Superseded 2026-10-12 ([RFC-014 §8](../rfc/RFC-014-request-reply-correlation.md), #36)**: concurrent `publish_sync` calls now share the `topic_wait` and each takes the reply carrying its own correlation id. The fail-fast remains against normal subscribe handlers.
 
 ---
 
@@ -552,6 +552,7 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 
 ## R-09 — Topic construction from `Agent.name` without sanitization; naming collisions
 
+- **Status**: **PARTIALLY RESOLVED** (2026-10-11, issue #38). Parent-to-child messages no longer reach same-name replicas or grandchildren; see [Parent-to-child addressing](#parent-to-child-addressing-2026-10-11-issue-38). Name validation (`+`, `#`, `$`), an explicit `parent=` and a prefixed, `/`-separated control namespace (holon v2, roadmap P2-7) remain **Open**.
 - **Severity**: High
 - **Category**: Security / Correctness
 - **File / Function / Line**:
@@ -564,6 +565,36 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 - **Impact**: Message cross-delivery to unintended agents; unauthorised message reception if names collide across security domains.
 - **Confidence**: High (collision is by design). For `+ # /` wildcard interpretation, Confidence: Medium — depends on paho behaviour but consistent with the MQTT spec.
 - **Recommended verification test**: Construct two agents with the same name in a shared broker; observe whether both receive `register_child` events. Try a name containing `+` and observe subscription behaviour.
+
+### Parent-to-child addressing (2026-10-11, issue #38)
+
+**Problem.** `to_child.{X}` meant two things: a parent named X broadcasting to its own children, and a message addressed by name to the agents named X (`_notify_children(target_child_name=X)`). Every agent named X listened on it for the second meaning, and every child of an X listened on it for the first. As a result:
+
+- A mid-tier replica `b.a` took its same-name sibling's broadcast to that sibling's children as coming from its own parent, so one replica's `terminate` stopped every other replica.
+- A message addressed by name to `b.a` (from its parent `a`) also reached `b.a`'s children, `c.b.a`, as if `b.a` had sent it.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- Every parent-to-child control message now carries the sender's name, `parent_name`. This covers `_notify_children` broadcasts, `_notify_child` unicasts (including `register_parent`) and `parent_online`.
+- `_handle_parents` drops a message whose `parent_name` differs from the receiver's own `parent_name`. It neither acts on it nor passes it to `on_parents_message`.
+- Messages without the field, from senders that predate this change, are still accepted.
+
+**Compatibility.**
+
+- The control payload gains one optional key; topics and the other keys are unchanged.
+- Pre-change receivers ignore the key, but `on_parents_message` hooks will see it.
+- In a mixed fleet, a pre-change replica's broadcast can still stop a post-change replica. The fix is complete once every agent sharing a name runs the new version.
+- `_notify_children(target_child_name=...)` now reaches only agents whose parent has the sender's name. It can no longer address grandchildren directly; nothing in the repo or downstream does.
+
+**Verification.** `tests/unit/core/test_holon_addressing.py` (FakeBus) covers:
+
+- replica terminate isolation, and the parent's terminate still reaching every replica;
+- no sibling broadcast in `on_parents_message`;
+- no name-addressed message reaching grandchildren;
+- the sender name present on every parent message;
+- legacy messages accepted.
+
+`tests/wire/test_holon_terminate_wire.py` adds replica isolation over real MqttBroker clients.
 
 ---
 
@@ -1150,15 +1181,15 @@ The `__topic_handlers` slice of R-14 was upgraded to runtime-confirmed via `test
 - **All registry mutations and reads** now happen inside `with self._handlers_lock:` (the RLock introduced in RFC-006):
   - `Agent.subscribe`: check owner; if PUBLISH_SYNC → raise; else warn (rebind case) + register as NORMAL. `broker.subscribe` outside the lock.
   - `Agent.unsubscribe`: check owner; if PUBLISH_SYNC → raise; else pop. `broker.unsubscribe` outside the lock.
-  - `Agent.publish_sync` register: check any existing record; if PUBLISH_SYNC → raise (`already awaited`); if NORMAL → raise (`would trample it`); else register as PUBLISH_SYNC. `broker.subscribe` outside the lock.
-  - `Agent.publish_sync` finally: **triple check** — record exists AND `owner_type is PUBLISH_SYNC` AND `handler is handle_response` → pop. `broker.unsubscribe` outside the lock.
+  - `Agent.publish_sync` register: check any existing record; if NORMAL → raise (`would trample it`); else register as PUBLISH_SYNC. `broker.subscribe` outside the lock. *Since RFC-014 §8 (2026-10-12): the PUBLISH_SYNC handler is a `_ReplyRouter` shared by concurrent calls, so an existing PUBLISH_SYNC record is joined rather than raising `already awaited`.*
+  - `Agent.publish_sync` finally: **triple check** — record exists AND `owner_type is PUBLISH_SYNC` AND `handler is handle_response` → pop. `broker.unsubscribe` outside the lock. *Since RFC-014 §8: `handler is` the call's router, and only the last call to leave pops it; join + subscribe and leave + unsubscribe run under `_reply_topics_lock`.*
   - `Agent._on_message`: single-snapshot read under the lock decides `is_specific_handler` and `topic_handler` together. Dispatcher enqueue and handler invocation happen outside the lock.
 
-### Collision contract (four scenarios; all raise `TopicWaitCollisionError`)
+### Collision contract (`TopicWaitCollisionError`; the first scenario was lifted by RFC-014 §8)
 
 | Scenario | Message keyword |
 |---|---|
-| publish_sync vs publish_sync (RFC-006) | `"already awaited by another publish_sync"` |
+| ~~publish_sync vs publish_sync (RFC-006)~~ | no longer raised since RFC-014 §8 (2026-10-12): the calls share the topic |
 | publish_sync vs NORMAL (RFC-007) | `"already registered by a normal subscribe handler; publish_sync would trample it"` |
 | direct subscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct subscribe is refused"` |
 | direct unsubscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct unsubscribe is refused"` |
@@ -1205,6 +1236,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Correlation ID** — a Parcel metadata field to distinguish concurrent same-topic requests; would allow multiple publish_sync callers to coexist on the same `topic_wait` and receive their own responses. Requires Parcel schema change (R-20 territory).
 - **Multi-handler fan-out per topic** — `__topic_handlers` value becomes a list; delivery notifies every handler; needed for pub-sub with multiple observers.
 - **Waiter queue** — publish_sync waiters chain rather than collide; needs correlation ID to route responses.
+- *Correlation ID and shared waiters: implemented 2026-10-12 in [RFC-014](../rfc/RFC-014-request-reply-correlation.md) (#36).*
 - **Parcel metadata** — broader schema evolution (R-20).
 - **ProcessWorker** — cross-process registry synchronisation; requires shared-memory / IPC design.
 
@@ -1280,7 +1312,30 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Verification.** `tests/unit/core/test_holon_membership.py` (15 tests on `tests/fakes/fake_bus.py`) and `tests/wire/test_holon_wire.py` (real MqttBroker clients; child first → server drops every connection → parent replaced → terminate cascades).
 
-**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4), QoS 1 for control messages (#4), and the mid-tier terminate echo (#5). The latter now matters more, because mid-tier agents now actually have registered children in every start order.
+**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4) and QoS 1 for control messages (#4).
+
+### Mid-tier terminate echo storm (2026-10-11, issue #5)
+
+**Problem.** A mid-tier agent (e.g. `b.a`) listens on `to_child.b.a`, the channel for messages addressed to agents named `b.a`, and broadcasts to its own children on that same topic. The broker echoes a client's own publishes back (MQTT 3.1.1 has no no-local). So one `terminate` from the root made `b.a` receive its own `terminate`, run `_terminate` again, broadcast again, and start one more delayed-stop thread each round, until the 1 s stop fired. On a capped FakeBus, the mid-tier and leaf bodies each ran 147 times. Membership convergence (#6) made this reachable in every start order.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- `_terminate` runs its body once: a test-and-set under the runtime-only `_terminate_lock`. Later calls, whether from a worker stop, a parent's `terminate` or an echo, return immediately. So one broadcast and one delayed-stop thread per agent. If the body does not finish (e.g. `Thread.start` fails, or a `KeyboardInterrupt` lands), the flag is cleared again, so the next request retries instead of leaving the agent unstoppable.
+- `_handle_parents` drops any message whose `parent_id` is the agent itself (its own broadcast echoed back). It neither acts on it nor passes it to `on_parents_message`.
+
+**Verification.** `tests/unit/core/test_holon_terminate.py` (3-level hierarchy on a FakeBus capped at 300 deliveries):
+
+- Each body runs once.
+- The mid-tier broadcasts once, with no dropped deliveries.
+- The cascade reaches every level.
+- `_terminate` is idempotent, and one that failed part-way can be retried.
+- The agent's own broadcast never reaches its own `on_parents_message`.
+
+`tests/wire/test_holon_terminate_wire.py` checks the same 3-level cascade over real MqttBroker clients, where the mid-tier publishes `terminate` exactly once.
+
+**Compatibility.** Message shapes are unchanged. `on_parents_message` no longer receives the agent's own broadcasts.
+
+**Still open.** Control-message authentication (#13) is tracked under R-26. The same-name replica `terminate` that this left open was fixed under #38; see R-09.
 
 ---
 
@@ -1305,6 +1360,10 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Cannot correlate publish → subscribe → response; cannot deduplicate; cannot detect stale messages.
 - **Confidence**: High
 - **Recommended verification test**: Read the parcel schema.
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #36, [RFC-014](../rfc/RFC-014-request-reply-correlation.md)).
+  - The envelope now carries an optional `correlation_id`. `publish_sync` stamps a fresh one on every request, auto-replies echo it, and `publish_sync` ignores replies to other requests, such as a late reply to an earlier call on the same `topic_wait`.
+  - Uncorrelated parcels encode exactly as before.
+  - Still open: message id and deduplication (#4), timestamp, source, trace context (#65), deadline, attempt, and the per-agent reply inbox (P2-2).
 
 ---
 
@@ -1386,6 +1445,76 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ---
 
+## R-26 — Holon control messages are unauthenticated
+
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #13). The forged terminate, the registration flood and the auto-reply confused deputy are closed or opt-in closable; see [Control-plane authentication](#control-plane-authentication-2026-10-12-issue-13). Reply forgery (`publish_sync` takes the first reply) and transport security remain **Open**.
+- **Severity**: Medium on a trusted single-tenant broker; High on a shared one
+- **Category**: Security
+- **File / Function / Line**: `src/agentflow/core/agent.py` — `_handle_parents` (terminate), `_handle_children` / `__register_child` (registration), `_on_message` (auto-reply to `topic_return`), `__generate_return_topic` (reply topics).
+- **Trigger**: Any client able to publish to the broker. Control topics derive from agent names (R-09).
+- **Impact**:
+  - A `terminate` with no `parent_id`, or from an agent that never registered the child, stopped it.
+  - Forged `register_child` messages grew `_children` without bound, and each one was answered.
+  - A request whose `topic_return` named a control topic made the service publish the requester's content there under its own identity. In the analysis, this terminated another subtree.
+  - Reply topics came from the seedable `random` module.
+- **Confidence**: High (reproduced with mocks and FakeBroker; see the issue).
+
+### Control-plane authentication (2026-10-12, issue #13)
+
+**Change** (`src/agentflow/core/agent.py`, new `src/agentflow/core/holon_auth.py`). A new optional `holon` config section is validated at construction like `codec`: unknown keys and wrong types raise.
+
+- **Registered parents only.**
+  - `terminate` is honoured only when its `parent_id` is a registered parent; one without a `parent_id` is ignored.
+  - `register_parent` counts only on the child's own channel `{agent_id}.to_child.{parent_name}`, where parents send it. Before, one published on a broadcast topic made anyone a parent without knowing any agent id.
+  - The dispatcher does not order messages, so a parent's `terminate` can overtake its `register_parent`. Such a terminate is deferred and runs when that parent registers. At most 8 wait, for 10 s each, oldest dropped first.
+  - A terminating parent first waits, at most 3 s, for `on_register_child` hooks still running, so those children get `register_parent` before its broker stops.
+  - With `holon.control_secret`, an authenticated terminate needs no registration.
+  - `holon.trust_unregistered_parents: True` restores the old behaviour.
+  - Without a secret, this check stops only senders that cannot observe the holon's traffic, because parent ids appear in every parent broadcast.
+- **`holon.max_children`** (default unlimited). A new child beyond the cap is refused under `_holon_lock`: no `register_parent` answer, and no `on_register_child` / `on_children_message`. Known children may still re-register.
+  - The default stays unlimited because members never expire yet (R-18). Leave headroom for children that restart.
+- **`holon.control_secret`** (str or bytes, at least 16 bytes), opt-in.
+  - The control subjects `terminate`, `register_child`, `register_parent` and `parent_online` carry `auth = {v, ts, mac}`. The MAC is HMAC-SHA256 over a canonical JSON of the topic, the millisecond timestamp and the message as the receiver sees it after a JSON round trip.
+  - Control data that cannot be signed (NaN, bytes, ...) is logged and not sent.
+  - Receivers drop control messages that are unsigned, tampered, sent to another topic, malformed, or further than `holon.control_max_age` (default 300 s) from the local clock. Verification never raises.
+  - Application subjects stay unauthenticated, like every other topic.
+  - The `auth` field is stripped before hooks run, and agents without a secret ignore it.
+- **Auto-replies.** An auto-reply is withheld when `topic_return` is a holon control topic (`to_child.*`, `to_parent.*`, or their `{agent_id}.`-prefixed forms). The handler still runs.
+- **Reply topics** come from `secrets`.
+- **Logging.**
+  - Refused messages are logged at WARNING on the 1st, 2nd, 4th, ... occurrence per kind and at DEBUG otherwise, so a flood cannot flood the log.
+  - The three log lines that print the Agent config mask `holon.control_secret`.
+
+**Compatibility.**
+
+- Message shapes are unchanged without a secret.
+- A `terminate` from an unregistered sender is now ignored. Tools that stop agents by publishing on `to_child.{name}` need `trust_unregistered_parents`, or must be a registered parent.
+- `control_secret` must be set on every agent of a holon at once. An agent without it sends unsigned control messages, which secret-holding agents drop.
+- The config log lines still print broker credentials (#14). The redaction proposed in #81 masks every key containing `secret` and would replace the `holon.control_secret` masking.
+
+**Verification.**
+
+- `tests/security/test_holon_control_auth.py` (62 tests) covers:
+  - registered-parent terminate, including the deferred, expiring and bounded cases;
+  - `register_parent` arriving on a broadcast topic;
+  - a parent terminating during a slow registration hook;
+  - `max_children` and config validation;
+  - HMAC binding, both Parcel encodings, and malformed or unsignable input;
+  - the secret never being logged;
+  - a FakeBus holon sharing a secret, and agents with another secret;
+  - auto-reply topics and reply-topic randomness.
+- `tests/wire/test_holon_terminate_wire.py`: a 3-level holon sharing a secret converges and terminates over real MqttBroker clients, and every control message on the wire is signed.
+
+**Still open.**
+
+- `publish_sync` takes the first reply on its topic; correlation ids (#36) and per-agent inboxes (roadmap P2-2) remain.
+- Replays on the same topic within the age window are not detected. The operations are idempotent (#5, #6).
+- The opt-in secret is shared by the whole holon, and any holder can impersonate any member.
+- TLS, per-agent broker accounts and ACLs (#3) remain the primary defence; the holon v2 namespace (P2-7) would let ACLs restrict who writes control topics.
+- `_parents` is not capped; without a secret, a sender who knows a child's id can still add entries on its channel.
+
+---
+
 ## Summary table (sorted by severity, then confidence)
 
 | ID | Severity | Confidence | Status | Title |
@@ -1395,7 +1524,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-03 | High | High | **Resolved 2026-10-10 (RFC-005 + issue #2)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
-| R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
+| R-09 | High | High | **Partially resolved 2026-10-11 (#38)**: same-name replica / grandchild addressing fixed; name validation and namespace still open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
@@ -1407,8 +1536,9 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
-| R-20 | Medium | High | Open | No message metadata for tracing |
+| R-20 | Medium | High | **Partially resolved 2026-10-12 (#36, RFC-014)**: request/reply `correlation_id`; message id, timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
+| R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
