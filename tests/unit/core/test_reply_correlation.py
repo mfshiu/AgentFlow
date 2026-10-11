@@ -17,8 +17,13 @@ Contracts verified (RFC-014):
     are unchanged.
   - publish_sync ignores a reply that carries another correlation id
     and still accepts one without any (a service older than RFC-014).
+    The reply it returns has no correlation id, so forwarding it by
+    hand to another requester works as before.
+  - Auto-replies keep a handler's Parcel subclass and its extra state.
+  - Parcels built without Parcel.__init__ still encode.
 """
 
+import json
 import pickle
 import re
 import threading
@@ -31,6 +36,9 @@ from agentflow.core.parcel import BinaryParcel, Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
+
+
+xfail_review = pytest.mark.xfail(strict=True, reason='issue #36: gaps found in review')
 
 
 def _wait_until(predicate, timeout=2.0):
@@ -238,7 +246,78 @@ def test_round_trip_between_two_agents_is_correlated():
         reply = client.publish_sync('svc', 'ping', timeout=3)
         assert reply.content == {'echo': 'ping'}
         request = [Parcel.from_payload(p) for t, p in client._broker.published if t == 'svc'][0]
-        assert request.correlation_id and reply.correlation_id == request.correlation_id
+        sent = [Parcel.from_payload(p) for t, p in service._broker.published if t == request.topic_return]
+        assert request.correlation_id and sent[0].correlation_id == request.correlation_id
     finally:
         for a in (service, client):
             a.terminate()
+
+
+# ==========================================================================
+# E. Gaps found in review
+# ==========================================================================
+
+class TaggedParcel(TextParcel):
+    """A user Parcel whose constructor is not (content) and whose extra
+    state goes into the envelope."""
+    def __init__(self, content, tag):
+        super().__init__(content)
+        self.tag = tag
+
+    def _get_managed_data(self):
+        managed = super()._get_managed_data()
+        managed['tag'] = self.tag
+        return managed
+
+
+@xfail_review
+def test_auto_reply_keeps_a_handlers_parcel_subclass_intact(agent_and_broker):
+    agent, broker = agent_and_broker
+    returned = TaggedParcel('pong', tag='t1')
+    _serve(agent, lambda topic, pcl: returned)
+    request = _correlated('ping', 'c-1')
+    request.topic_return = 'reply/1'
+    broker.deliver('svc', request.payload())
+
+    assert _wait_until(lambda: [p for t, p in broker.publish_calls if t == 'reply/1'])
+    raw = [p for t, p in broker.publish_calls if t == 'reply/1'][0]
+    body = json.loads(raw.split(b'|', 1)[1])
+    assert (body['content'], body['tag'], body['correlation_id']) == ('pong', 't1', 'c-1')
+    assert returned.correlation_id is None          # the handler's Parcel is not modified
+
+
+class Gateway(Agent):
+    """Answers in on_message, where there is no auto-reply (RFC-003),
+    by forwarding the reply of a downstream publish_sync by hand."""
+    def __init__(self):
+        super().__init__('gateway', {})
+
+    def on_message(self, topic, pcl):
+        reply = self.publish_sync('svc', pcl.content, timeout=2)
+        self.publish(pcl.topic_return, reply)
+
+
+@xfail_review
+def test_a_reply_forwarded_by_hand_reaches_the_original_requester():
+    bus = FakeBus()
+    service, gateway, client = Service(), Gateway(), Agent('client', {})
+    for a in (service, gateway, client):
+        bus.attach(a)
+        bus.connect(a)
+    service.subscribe('svc', topic_handler=service.handle)
+    gateway.subscribe('gw')
+    try:
+        assert client.publish_sync('gw', 'ping', timeout=3).content == {'echo': 'ping'}
+    finally:
+        for a in (service, gateway, client):
+            a.terminate()
+
+
+@xfail_review
+def test_parcels_built_without_parcel_init_still_encode():
+    """E.g. a subclass that does not call super().__init__, or a Parcel
+    pickled by code older than RFC-014."""
+    parcel = TextParcel.__new__(TextParcel)
+    parcel.version, parcel.content, parcel.topic_return, parcel.error = 3, 'x', None, None
+    assert parcel.payload() == TextParcel('x').payload()
+    assert 'correlation_id' not in str(parcel)

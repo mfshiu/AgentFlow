@@ -49,8 +49,8 @@ def test_publish_sync_round_trip_is_correlated():
 
         assert reply.content == {'echo': 'ping'}
         request = [Parcel.from_payload(p) for t, p in server.published() if t == 'svc/echo'][0]
-        assert request.correlation_id
-        assert reply.correlation_id == request.correlation_id
+        sent = [Parcel.from_payload(p) for t, p in server.published() if t == request.topic_return]
+        assert request.correlation_id and sent[0].correlation_id == request.correlation_id
     finally:
         client.terminate()
         service.terminate()
