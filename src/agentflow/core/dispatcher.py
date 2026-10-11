@@ -262,6 +262,10 @@ class MessageDispatcher:
         return self._queue.qsize()
 
     @property
+    def queue_capacity(self) -> int:
+        return self._queue.maxsize
+
+    @property
     def dropped_message_count(self) -> int:
         with self._metrics_lock:
             return self._dropped_message_count

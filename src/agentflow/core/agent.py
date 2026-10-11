@@ -44,6 +44,24 @@ _DEDUP_WINDOW = 4096
 # Follow-up of #17: at most this many messages with no handler are held
 # while the lifecycle hooks are still registering handlers.
 _EARLY_MESSAGE_LIMIT = 4096
+# Follow-up of #17: held messages are released at the latest this long
+# after the gate closed, even if a hook (e.g. a long-running
+# on_connected loop) has not returned.
+_EARLY_MESSAGE_MAX_HOLD_S = 10.0
+
+
+def _topic_matches(subscription: str, topic: str) -> bool:
+    """MQTT-style match of `topic` against a subscription that may use
+    the + (one level) and # (this and every lower level) wildcards."""
+    sub_levels, topic_levels = subscription.split('/'), topic.split('/')
+    for i, level in enumerate(sub_levels):
+        if level == '#':
+            return True
+        if i >= len(topic_levels):
+            return False
+        if level != '+' and level != topic_levels[i]:
+            return False
+    return len(sub_levels) == len(topic_levels)
 
 # Issue #13: keys accepted in the optional `holon` config section.
 _HOLON_KEYS = frozenset({
@@ -252,6 +270,11 @@ class Agent(BrokerNotifier):
         self._awaiting_hooks: set = set()
         self._early_dropped = 0
         self._lifecycle_gating = False
+        self._gate_timer: Optional[threading.Timer] = None
+        # Topics passed to subscribe() in this process (guarded by
+        # _early_lock). A message on one of them is never held: it is
+        # the agent's own traffic, not a resumed session's leftover.
+        self._session_topics: set = set()
 
         self._broker = None
         self._connected_once = False
@@ -293,6 +316,7 @@ class Agent(BrokerNotifier):
         '_early_lock',
         '_early_messages',
         '_awaiting_hooks',
+        '_gate_timer',
         '_dispatcher_init_lock',
         '_dispatcher',
         '_broker',
@@ -375,6 +399,7 @@ class Agent(BrokerNotifier):
         self._early_lock = threading.Lock()
         self._early_messages = deque()
         self._awaiting_hooks = set()
+        self._gate_timer = None
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
         self._broker = None
@@ -1172,6 +1197,8 @@ class Agent(BrokerNotifier):
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
         check_qos(qos)      # issue #4: before anything is registered
+        with self._early_lock:
+            self._session_topics.add(topic)
 
         if topic_handler:
             # RFC-007 §7.3: refuse to trample an active publish_sync
@@ -1216,6 +1243,8 @@ class Agent(BrokerNotifier):
                     f"is refused"
                 )
             self.__topic_handlers.pop(topic, None)
+        with self._early_lock:
+            self._session_topics.discard(topic)
         # broker.unsubscribe outside the lock.
         if self._broker:
             self._broker.unsubscribe(topic)
@@ -1670,10 +1699,12 @@ class Agent(BrokerNotifier):
         """Hand a decoded, deduplicated message to its handler through
         the dispatcher (RFC-003 / RFC-004 / RFC-007). Follow-up of #17:
         while lifecycle hooks are still registering handlers, a message
-        with no handler is held instead, and replayed here once they
-        have returned."""
+        on a topic that has no handler and was not subscribed in this
+        process (a resumed session's leftover) is held instead, and
+        replayed here once they have returned."""
         with self._early_lock:
-            if self._awaiting_hooks and not self.__has_handler(topic):
+            if (self._awaiting_hooks and not self.__has_handler(topic)
+                    and not self.__subscribed_in_session(topic)):
                 self.__hold(topic, pcl)
                 return
 
@@ -1774,29 +1805,98 @@ class Agent(BrokerNotifier):
         self._early_messages.append((topic, pcl))
 
 
+    def __subscribed_in_session(self, topic) -> bool:
+        """Whether `topic` matches a subscribe() made in this process.
+        Called under _early_lock."""
+        if topic in self._session_topics:
+            return True
+        return any(_topic_matches(sub, topic) for sub in self._session_topics
+                   if '+' in sub or '#' in sub)
+
+
     def __await_hook(self, hook: str) -> None:
-        """Follow-up of #17: hold messages with no handler until `hook`
-        (and every other awaited hook) has returned; see __hook_done."""
+        """Follow-up of #17: hold leftover messages (see __route) until
+        `hook`, and every other awaited hook, has returned; see
+        __hook_done. When the gate closes, a timer opens it after
+        _EARLY_MESSAGE_MAX_HOLD_S whatever the hooks are doing."""
+        timer = None
         with self._early_lock:
+            if not self._awaiting_hooks:
+                timer = threading.Timer(_EARLY_MESSAGE_MAX_HOLD_S, self.__release_after_deadline)
+                timer.daemon = True
+                self._gate_timer = timer
             self._awaiting_hooks.add(hook)
+        if timer is not None:
+            timer.start()
 
 
     def __hook_done(self, hook: str) -> None:
         """Follow-up of #17: `hook` has returned. When no awaited hook is
-        left, release the held messages through __route, in arrival
-        order. They skip deduplication, which recorded their ids when
-        they arrived."""
+        left, release the held messages."""
         with self._early_lock:
             self._awaiting_hooks.discard(hook)
             if self._awaiting_hooks:
                 return
             held = list(self._early_messages)
             self._early_messages.clear()
-        if held:
-            logger.info(self.M(
-                f"Releasing {len(held)} message(s) that arrived before the handlers were registered."))
-        for topic, pcl in held:
-            self.__route(topic, pcl)
+            timer, self._gate_timer = self._gate_timer, None
+        if timer is not None:
+            timer.cancel()
+        self.__replay(held)
+
+
+    def __release_after_deadline(self) -> None:
+        """Follow-up of #17: a hook is still running after
+        _EARLY_MESSAGE_MAX_HOLD_S (e.g. a long-running on_connected
+        loop): stop holding and release what is held."""
+        with self._early_lock:
+            if not self._awaiting_hooks:
+                return
+            pending = sorted(self._awaiting_hooks)
+            self._awaiting_hooks.clear()
+            held = list(self._early_messages)
+            self._early_messages.clear()
+            self._gate_timer = None
+        logger.warning(self.M(
+            f"Stopped holding early messages after {_EARLY_MESSAGE_MAX_HOLD_S:g} s although "
+            f"{', '.join(pending)} had not returned; releasing {len(held)} held message(s)."))
+        self.__replay(held)
+
+
+    def __replay(self, held) -> None:
+        """Follow-up of #17: route held messages, in arrival order, on a
+        background thread so that the hook that opened the gate is not
+        delayed. They skip deduplication, which recorded their ids when
+        they arrived. Each one waits for room in the dispatcher queue,
+        so that the release does not burst past it and turn requests
+        into 'overloaded' drops."""
+        if not held:
+            return
+        logger.info(self.M(
+            f"Releasing {len(held)} message(s) that arrived before the handlers were registered."))
+
+        def run():
+            dispatcher = self._get_dispatcher()
+            capacity = getattr(dispatcher, 'queue_capacity', None)
+            throttle = capacity is not None
+            for topic, pcl in held:
+                if throttle:
+                    throttle = self.__wait_for_queue_room(dispatcher, capacity)
+                self.__route(topic, pcl)
+        threading.Thread(target=run, name=f'{self.name_tag}-early-replay', daemon=True).start()
+
+
+    @staticmethod
+    def __wait_for_queue_room(dispatcher, capacity, timeout=1.0) -> bool:
+        """Wait until the dispatcher queue has room. Returns False if it
+        stayed full for `timeout` (its consumers are stuck), so that the
+        caller stops waiting."""
+        deadline = time.monotonic() + timeout
+        while dispatcher.queue_depth >= capacity:
+            if time.monotonic() >= deadline or dispatcher.is_stopped:
+                return False
+            time.sleep(0.002)
+        return True
 
 
     def __seen_before(self, message_id: str) -> bool:

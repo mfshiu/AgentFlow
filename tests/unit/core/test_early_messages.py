@@ -36,8 +36,6 @@ from tests.fakes.fake_bus import FakeBus
 
 SETTLE_S = 0.3
 
-xfail_review = pytest.mark.xfail(strict=True, reason='gaps found in review of the early-message gate')
-
 
 def _wait_until(predicate, timeout=2.0):
     return FakeBus.wait_until(predicate, timeout=timeout)
@@ -169,7 +167,6 @@ def test_agents_outside_the_lifecycle_are_never_gated():
         agent.terminate()
 
 
-@xfail_review
 @pytest.mark.parametrize('subscription, topic', [('ready', 'ready'), ('ready/#', 'ready/x'), ('a/+/c', 'a/b/c')])
 def test_topics_subscribed_this_session_are_never_held(agent_and_broker, subscription, topic):
     """Only leftovers of a resumed session (topics nobody subscribed in
@@ -183,7 +180,6 @@ def test_topics_subscribed_this_session_are_never_held(agent_and_broker, subscri
     _done(agent, 'on_activate')
 
 
-@xfail_review
 def test_a_hook_that_never_returns_releases_held_messages_after_a_deadline(agent_and_broker, monkeypatch):
     monkeypatch.setattr(agent_module, '_EARLY_MESSAGE_MAX_HOLD_S', 0.3)
     agent, broker = agent_and_broker
@@ -194,7 +190,6 @@ def test_a_hook_that_never_returns_releases_held_messages_after_a_deadline(agent
     assert _wait_until(lambda: ('stray', 's2') in agent.unhandled, timeout=1.0)
 
 
-@xfail_review
 def test_the_release_waits_for_room_in_the_dispatcher_queue():
     """Releasing many held messages must not burst past the dispatcher's
     queue and turn them into 'overloaded' drops."""

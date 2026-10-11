@@ -19,8 +19,6 @@ from tests.fakes.mini_mqtt_server import MiniMqttServer
 
 pytestmark = pytest.mark.wire
 
-xfail_review = pytest.mark.xfail(strict=True, reason='gaps found in review of the early-message gate')
-
 
 
 def _config(port):
@@ -108,7 +106,6 @@ class WaitsForItsOwnMessageInOnConnected(Worker):
         self.handshake = self.ready.wait(3)
 
 
-@xfail_review
 def test_a_hook_can_wait_for_a_message_on_a_topic_it_subscribed():
     server, agent = _run(WaitsForItsOwnMessageInOnConnected, [])
     try:
