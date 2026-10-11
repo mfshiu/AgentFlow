@@ -9,7 +9,6 @@ import time
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from tkinter import N
 from typing import Callable, final, Optional
 import uuid
 

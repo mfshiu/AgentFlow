@@ -1183,6 +1183,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-16 — Unused `tkinter` import in Agent
 
+- **Status**: **RESOLVED** (2026-10-11, #47) — the import, which was on `agent.py:12` (not `:8`), was removed. `tests/unit/test_headless_import.py` imports the public entry points in a fresh interpreter that blocks tkinter.
 - **Severity**: Medium
 - **Category**: Correctness / Portability
 - **File / Function / Line**: `src/agentflow/core/agent.py:8` `from tkinter import N`
@@ -1339,7 +1340,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
 | R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
-| R-16 | Medium | Medium | Open | `from tkinter import N` |
+| R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
 | R-20 | Medium | High | Open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
