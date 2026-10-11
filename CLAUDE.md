@@ -54,10 +54,13 @@ Review the code in this order:
 
 ## Commands
 
-Update this section after identifying the actual project commands.
+CI (`.github/workflows/ci.yml`) runs these on ubuntu and windows with
+Python 3.11 and 3.13. Install the tools with
+`python -m pip install -r requirements-dev.txt`.
 
-- Build:
-- Unit tests:
-- Integration tests:
-- Lint:
-- Run:
+- Build: `python -m build` (sdist and wheel in `dist/`)
+- Unit tests: `python -m pytest` (`pyproject.toml` sets `testpaths` and `pythonpath`)
+- Coverage: `python -m pytest --cov=agentflow` (fails below `fail_under` in `pyproject.toml`)
+- Integration tests: none yet (the `integration` marker is reserved for live-broker tests)
+- Lint: `ruff check src tests` and `mypy`
+- Run: no CLI; applications start agents with `Agent.start()` / `start_thread()`

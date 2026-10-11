@@ -325,7 +325,8 @@ def test_handler_exception_does_not_kill_consumer(agent_with_fake_broker):
 
     ok = _wait_until(lambda: len(processed) == 2, timeout=1.0)
     assert ok
-    assert processed == ['after-boom-1', 'after-boom-2']
+    # Order is not guaranteed: several consumers drain the queue (#48).
+    assert sorted(processed) == ['after-boom-1', 'after-boom-2']
     # All three tasks returned normally from the dispatcher's viewpoint
     # (handle_message caught the RuntimeError internally).
     snap = agent._dispatcher.metrics_snapshot()
