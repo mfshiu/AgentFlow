@@ -75,14 +75,12 @@ def test_parcels_without_a_correlation_id_encode_exactly_as_before():
     assert body == {'version': 3, 'content': b'x', 'topic_return': None, 'error': None}
 
 
-@xfail_36
 def test_new_and_legacy_parcels_have_no_correlation_id():
     assert TextParcel('x').correlation_id is None
     legacy = b'text/json|{"version": 3, "content": "x", "topic_return": null, "error": null}'
     assert Parcel.from_payload(legacy).correlation_id is None
 
 
-@xfail_36
 @pytest.mark.parametrize('parcel', [TextParcel({'q': 1}, topic_return='r'), BinaryParcel(b'raw')])
 def test_correlation_id_round_trips_in_both_encodings(parcel):
     parcel.correlation_id = 'c-1'
@@ -91,13 +89,11 @@ def test_correlation_id_round_trips_in_both_encodings(parcel):
     assert (decoded.content, decoded.topic_return) == (parcel.content, parcel.topic_return)
 
 
-@xfail_36
 def test_correlation_id_is_read_from_the_envelope():
     payload = b'text/json|{"version": 3, "content": 1, "topic_return": null, "error": null, "correlation_id": "c-9"}'
     assert Parcel.from_payload(payload).correlation_id == 'c-9'
 
 
-@xfail_36
 @pytest.mark.parametrize('value', ['5', '["c"]', '{"a": 1}', 'true'])
 def test_malformed_correlation_id_decodes_as_none(value):
     payload = ('text/json|{"version": 3, "content": 1, "topic_return": null, '
