@@ -1,0 +1,9 @@
+# Development and CI dependencies (#49). Runtime dependencies are declared
+# in setup.py; requirements.txt pins them for development.
+-r requirements.txt
+pytest>=8.4,<10
+pytest-cov>=6
+# Linters are pinned exactly so a new release cannot turn CI red overnight.
+ruff==0.17.0
+mypy==2.4.0
+build>=1.2
