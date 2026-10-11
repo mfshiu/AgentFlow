@@ -31,7 +31,6 @@ from agentflow.core.parcel import BinaryParcel, Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_36 = pytest.mark.xfail(strict=True, reason='issue #36: replies are not correlated')
 
 
 def _wait_until(predicate, timeout=2.0):
@@ -152,7 +151,6 @@ def test_auto_reply_to_an_uncorrelated_request_is_unchanged(agent_and_broker):
 # C. publish_sync (requester side)
 # ==========================================================================
 
-@xfail_36
 def test_publish_sync_stamps_each_request_with_a_fresh_correlation_id(agent_and_broker):
     agent, broker = agent_and_broker
     broker.auto_respond_with('pong')
@@ -178,7 +176,6 @@ def _spawn_publish_sync(agent, topic_wait, timeout):
     return thread, outcome
 
 
-@xfail_36
 def test_publish_sync_ignores_a_late_reply_to_an_earlier_call(agent_and_broker):
     agent, broker = agent_and_broker
     with pytest.raises(TimeoutError):
@@ -198,7 +195,6 @@ def test_publish_sync_ignores_a_late_reply_to_an_earlier_call(agent_and_broker):
     assert outcome['reply'].content == 'reply to this call'
 
 
-@xfail_36
 def test_publish_sync_ignores_a_reply_to_another_request(agent_and_broker):
     agent, broker = agent_and_broker
     thread, outcome = _spawn_publish_sync(agent, 'T', timeout=3)
@@ -231,7 +227,6 @@ class Service(Agent):
         return {'echo': pcl.content}
 
 
-@xfail_36
 def test_round_trip_between_two_agents_is_correlated():
     bus = FakeBus()
     service, client = Service(), Agent('client', {})

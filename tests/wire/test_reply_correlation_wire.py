@@ -35,7 +35,6 @@ class EchoService(Agent):
         self.subscribe('svc/echo', topic_handler=lambda topic, pcl: {'echo': pcl.content})
 
 
-@pytest.mark.xfail(strict=True, reason='issue #36: replies are not correlated')
 def test_publish_sync_round_trip_is_correlated():
     server = MiniMqttServer()
     service, client = EchoService(server.port), Agent('client', _config(server.port))

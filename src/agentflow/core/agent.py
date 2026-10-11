@@ -1,3 +1,4 @@
+import copy
 import inspect
 import logging
 import math
@@ -927,9 +928,24 @@ class Agent(BrokerNotifier):
             pcl = Parcel.from_content(data)
             pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
 
+        # RFC-014 (issue #36): a fresh, unpredictable id per request, set
+        # on a copy so that the caller's Parcel is not modified.
+        correlation_id = secrets.token_hex(16)
+        request = copy.copy(pcl)
+        request.correlation_id = correlation_id
+
         data_event = Agent.DataEvent(self._get_worker().create_event())
 
         def handle_response(topic_resp, pcl_resp:Parcel):
+            reply_id = pcl_resp.correlation_id
+            if reply_id is not None and reply_id != correlation_id:
+                # RFC-014: the reply to another request on this topic,
+                # e.g. a late reply to an earlier call with the same
+                # topic_wait. A reply without an id comes from a service
+                # older than RFC-014 and is accepted as before.
+                logger.debug(self.M(
+                    f"Ignored a reply on {topic_resp!r} to another request ({reply_id!r})."))
+                return
             # Duplicate arriving before cleanup: keep the first response.
             if data_event.event.is_set():
                 return
@@ -968,7 +984,7 @@ class Agent(BrokerNotifier):
             # _publish_or_raise propagates broker exceptions so that the
             # caller fails fast on publish errors instead of waiting for
             # the full response timeout (RFC-002).
-            self._publish_or_raise(topic, pcl)
+            self._publish_or_raise(topic, request)
             if data_event.event.wait(timeout):
                 return data_event.data
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
