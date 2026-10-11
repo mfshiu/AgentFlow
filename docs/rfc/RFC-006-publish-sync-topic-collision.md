@@ -1,6 +1,6 @@
 # RFC-006 — publish_sync topic_wait collision
 
-- **Status**: Draft
+- **Status**: Draft. **Superseded in part** (2026-10-12) by [RFC-014 §8](RFC-014-request-reply-correlation.md#8-shared-topic_wait-2026-10-12): concurrent `publish_sync` calls now share a `topic_wait`, telling their replies apart by correlation id. The fail-fast below still applies to a topic owned by a normal `subscribe` handler.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R.4 (documented in [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md) §10.R.4 as a pre-existing race); consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md), [RFC-002](RFC-002-publish-error-propagation.md), [RFC-003](RFC-003-auto-reply-contract.md), [RFC-004](RFC-004-bounded-message-dispatch.md), [RFC-005](RFC-005-mqtt-subscription-recovery.md)
 - **Scope**: `Agent.publish_sync`'s handling of an explicit `topic_wait` that is already actively awaited by another `publish_sync` call; `__topic_handlers` registry synchronisation; a new `TopicWaitCollisionError`; register / cleanup linearisation

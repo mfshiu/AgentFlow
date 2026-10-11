@@ -7,6 +7,7 @@
   - An optional `correlation_id` field in the Parcel envelope.
   - `publish_sync` stamps it on each request and matches it on the reply.
   - Auto-replies echo it.
+  - Concurrent `publish_sync` calls sharing one `topic_wait` (§8).
 - **Explicitly out of scope**:
   - A new envelope version or prefix (roadmap P2-1).
   - A per-agent reply inbox (P2-2).
@@ -14,7 +15,6 @@
   - Message ids and deduplication (#4).
   - Trace context (#65).
   - Structured errors (#68).
-  - Lifting RFC-006's fail-fast for concurrent callers that share a `topic_wait` (§6).
 
 ---
 
@@ -77,7 +77,7 @@ No deployment order is required. The protection against late replies needs the r
 
 ## 6. Follow-ups enabled
 
-- **Shared `topic_wait`**: RFC-006 made a second concurrent `publish_sync` on the same `topic_wait` fail fast because replies could not be told apart. With correlation ids they can, so the waiters on one topic could share it, each receiving its own reply. Doing so changes RFC-006's tested contract (8 tests) and needs a rule for uncorrelated replies when several callers wait. Tracked separately.
+- **Shared `topic_wait`**: implemented in §8.
 - **Request deadlines**: let a responder skip requests whose caller has given up (needs a clock-skew policy).
 - **Message ids, deduplication and retries** (#4), **trace context** (#65), **structured errors** (#68).
 
@@ -95,4 +95,51 @@ No deployment order is required. The protection against late replies needs the r
   - an uncorrelated reply accepted;
   - a two-agent round trip on a FakeBus.
 - `tests/wire/test_reply_correlation_wire.py` checks a two-agent round trip over real MqttBroker clients: the request carries an id and the reply echoes it.
-- The existing RFC-001 / RFC-003 / RFC-006 / RFC-007 suites pass unchanged.
+- The existing RFC-001 / RFC-003 / RFC-006 / RFC-007 suites pass unchanged. §8 then rewrote the RFC-006 publish_sync-vs-publish_sync collision tests.
+
+## 8. Shared `topic_wait` (2026-10-12)
+
+RFC-006 made a second concurrent `publish_sync` on an already-awaited `topic_wait` fail fast with `TopicWaitCollisionError`, because the replies could not be told apart (its §5 Option E deferred correlation ids to this RFC). With correlation ids they can, so concurrent calls now share the topic.
+
+### 8.1 Routing
+
+One `_ReplyRouter` per reply topic replaces the per-call reply closure. It is registered as the topic's `PUBLISH_SYNC` handler (RFC-007), so `Agent.subscribe` / `unsubscribe` still refuse to trample it. It maps correlation ids to waiting calls:
+
+| Reply `correlation_id` | Calls waiting | Outcome |
+|---|---|---|
+| a waiting call's id | any | that call takes it (first reply wins) |
+| any other value | any | ignored, DEBUG |
+| `None` | exactly 1 | that call takes it, as before |
+| `None` | 2 or more | nobody takes it; WARNING on the 1st, 2nd, 4th, ... occurrence, DEBUG otherwise |
+
+The last row keeps RFC-006's rejection of Option D (FIFO): handing a caller another's answer would be a silent wrong result, so the calls time out instead.
+
+### 8.2 Subscription lifecycle
+
+- The first call on a topic subscribes it; later calls share that subscription. The last call to leave removes the router and unsubscribes, guarded by RFC-006 §7.5 / RFC-007 §7.8 (only a record that still holds this router is removed).
+- Joining plus subscribing, and leaving plus unsubscribing, run under the runtime-only `_reply_topics_lock` (an `RLock`). The broker is still called outside `_handlers_lock` (RFC-005).
+- Without that lock, a call joining while the last one leaves could subscribe before that unsubscribe landed, and then wait on a topic the broker no longer delivers. The race already existed for sequential reuse of a `topic_wait`; sharing would make it common.
+- A failed subscribe leaves the registry clean and re-raises (RFC-006 §7.6).
+
+### 8.3 Collisions that remain
+
+`publish_sync` on a topic owned by a normal `subscribe` handler still raises `TopicWaitCollisionError` at once, with no broker call (RFC-006 / RFC-007). Direct `subscribe` / `unsubscribe` on a topic that `publish_sync` calls wait on still raise as well.
+
+### 8.4 Compatibility
+
+- A second concurrent `publish_sync` on the same `topic_wait` no longer raises `TopicWaitCollisionError`. Code that caught it to serialise or retry can drop that.
+- With a responder older than RFC-014 (no id in its replies), concurrent callers on one topic now time out when their replies overlap, instead of the second one failing fast. The warning above names the topic. Upgrade the responder, or give each caller its own `topic_wait`, or omit it.
+- Calls that do not overlap behave exactly as before.
+
+### 8.5 Verification
+
+`tests/unit/core/test_agent_publish_sync_concurrency.py` (24 tests):
+
+- two callers, and n = 3 / 10 / 50 callers, each get their own reply when the replies arrive in reverse;
+- a 10-round stress test of 8 callers with a responder answering inline from `broker.publish`, covering every join / leave interleaving;
+- one registry entry and one SUBSCRIBE while any call waits, and one UNSUBSCRIBE at the end;
+- an uncorrelated reply not attributed between two waiters;
+- a call joining during the last caller's unsubscribe stays subscribed (this failed before the lock);
+- the collisions that remain, against normal subscribe handlers.
+
+A stability run of that file and the RFC-007 cross-API file passed 10 times on Python 3.13 and 5 times on 3.11.

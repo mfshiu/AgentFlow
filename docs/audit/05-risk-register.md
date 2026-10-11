@@ -116,7 +116,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
   - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
   - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
-  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details.
+  - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details. **Superseded 2026-10-12 ([RFC-014 §8](../rfc/RFC-014-request-reply-correlation.md), #36)**: concurrent `publish_sync` calls now share the `topic_wait` and each takes the reply carrying its own correlation id. The fail-fast remains against normal subscribe handlers.
 
 ---
 
@@ -1236,6 +1236,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Correlation ID** — a Parcel metadata field to distinguish concurrent same-topic requests; would allow multiple publish_sync callers to coexist on the same `topic_wait` and receive their own responses. Requires Parcel schema change (R-20 territory).
 - **Multi-handler fan-out per topic** — `__topic_handlers` value becomes a list; delivery notifies every handler; needed for pub-sub with multiple observers.
 - **Waiter queue** — publish_sync waiters chain rather than collide; needs correlation ID to route responses.
+- *Correlation ID and shared waiters: implemented 2026-10-12 in [RFC-014](../rfc/RFC-014-request-reply-correlation.md) (#36).*
 - **Parcel metadata** — broader schema evolution (R-20).
 - **ProcessWorker** — cross-process registry synchronisation; requires shared-memory / IPC design.
 
