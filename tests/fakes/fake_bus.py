@@ -62,7 +62,12 @@ class FakeBusBroker:
 
 
 class FakeBus:
-    def __init__(self):
+    def __init__(self, max_deliveries=None):
+        """`max_deliveries` bounds the total number of deliveries; any
+        beyond it are dropped (and counted in `dropped`), so a test that
+        provokes a message storm terminates instead of spinning."""
+        self._max_deliveries = max_deliveries
+        self.dropped = 0
         self._lock = threading.Lock()
         self._subs: Dict[str, Set[FakeBusBroker]] = defaultdict(set)
         # Every delivery as (receiving broker, topic, payload).
@@ -127,6 +132,10 @@ class FakeBus:
     def _route(self, topic: str, payload) -> None:
         with self._lock:
             targets = [b for b in self._subs.get(topic, ()) if b.connected]
+            if self._max_deliveries is not None:
+                room = max(0, self._max_deliveries - len(self.delivered))
+                self.dropped += len(targets) - min(room, len(targets))
+                targets = targets[:room]
             self.delivered.extend((b, topic, payload) for b in targets)
         for b in targets:
             b._notifier._on_message(topic, payload)
