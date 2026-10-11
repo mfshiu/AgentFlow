@@ -174,6 +174,28 @@ def test_an_uncorrelated_reply_is_not_guessed_between_several_waiters():
         agent.terminate()
 
 
+@pytest.mark.xfail(strict=True, reason='issue #36: an uncorrelated reply goes to whoever is left waiting')
+def test_an_uncorrelated_reply_is_not_handed_to_whoever_is_left_waiting():
+    """Once calls have overlapped on a topic, a reply without a
+    correlation id stays unattributable even after all but one have
+    left: it may answer a call that already timed out. Before RFC-014
+    §8 the second call failed fast instead of receiving it."""
+    agent, broker = _make_agent()
+    try:
+        a_thread, a_result, a_error = _spawn_publish_sync(agent, 'T', 'A', timeout=0.5)
+        assert _wait_until(lambda: len(_requests(broker)) == 1, timeout=1.0)
+        b_thread, b_result, b_error = _spawn_publish_sync(agent, 'T', 'B', timeout=2.0)
+        assert _wait_until(lambda: len(_requests(broker)) == 2, timeout=0.4),             'B did not join while A was waiting'
+        a_thread.join(2.0)
+        assert isinstance(a_error[0], TimeoutError)
+
+        broker.deliver('T', TextParcel('late answer to A').payload())
+        b_thread.join(3.0)
+        assert b_result[0] is None and isinstance(b_error[0], TimeoutError),             (b_result[0], b_error[0])
+    finally:
+        agent.terminate()
+
+
 # ==========================================================================
 # B. Exception type + message + isolation
 # ==========================================================================
