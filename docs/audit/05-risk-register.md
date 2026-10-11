@@ -1363,7 +1363,8 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #36, [RFC-014](../rfc/RFC-014-request-reply-correlation.md)).
   - The envelope now carries an optional `correlation_id`. `publish_sync` stamps a fresh one on every request, auto-replies echo it, and `publish_sync` ignores replies to other requests, such as a late reply to an earlier call on the same `topic_wait`.
   - Uncorrelated parcels encode exactly as before.
-  - Still open: message id and deduplication (#4), timestamp, source, trace context (#65), deadline, attempt, and the per-agent reply inbox (P2-2).
+  - Message ids and deduplication followed on 2026-10-12 (#4, [RFC-015](../rfc/RFC-015-delivery-guarantees.md); see R-27).
+  - Still open: timestamp, source, trace context (#65), deadline, attempt, and the per-agent reply inbox (P2-2).
 
 ---
 
@@ -1515,6 +1516,46 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ---
 
+## R-27 — At-most-once delivery (QoS 0) with silent losses and no message id
+
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #4, [RFC-015](../rfc/RFC-015-delivery-guarantees.md)). Persistent sessions (#17) and the outbound buffer bound (#35) remain **Open**.
+- **Severity**: High
+- **Category**: Message reliability
+- **File / Function / Line**:
+  - `src/agentflow/broker/mqtt_broker.py`: `publish`, `subscribe`, `_recover_subscriptions` (QoS 0 only; clean session).
+  - `src/agentflow/core/agent.py`: `publish` (returned `None` and swallowed errors); `_on_message` (ignored the result of `enqueue()`).
+  - `src/agentflow/core/parcel.py`: no message id in the envelope.
+- **Trigger**: a connection drop while a message is in flight; a full dispatcher; a broker error on publish.
+- **Impact**:
+  - Holon control messages and RPC requests / replies vanished without trace.
+  - Requesters waited for their full timeout.
+  - Nothing could deduplicate, so at-least-once delivery was impossible (CLAUDE.md invariant 3).
+- **Confidence**: High (reproduced with FakeBroker; see the issue).
+
+### Delivery guarantees (2026-10-12, issue #4)
+
+**Change**: see RFC-015.
+- `MessageBroker.publish` / `subscribe` take keyword-only `qos` / `retain`. MqttBroker hands them to paho and resubscribes with each topic's QoS.
+- Holon control messages, `publish_sync` requests and auto-replies travel at QoS 1, on topics subscribed at QoS 1. Application traffic defaults to QoS 0 and takes a `qos` keyword.
+- Every message carries a fresh `message_id`, and an agent handles each id once (4096-id window).
+- `Agent.publish` returns `True` / `False`.
+- A request the dispatcher drops is answered at once with an "overloaded" error reply carrying its correlation id.
+
+**Compatibility**:
+- Every message gains an envelope key (`message_id`) that older receivers ignore.
+- `Agent.publish` returns a bool instead of `None`.
+- The broker methods gain keyword-only parameters with the old defaults.
+
+**Verification**: `tests/unit/test_mqtt_broker_qos.py`, `tests/unit/core/test_delivery_guarantees.py`.
+
+**Still open**:
+- Persistent sessions and stable client ids (#17): with a clean session the broker keeps nothing for a disconnected subscriber.
+- Bounding the outbound buffer (#35).
+- Decode-failure observability (#15).
+- Duplicates beyond the window, or from senders without ids, still reach handlers, which should stay idempotent.
+
+---
+
 ## Summary table (sorted by severity, then confidence)
 
 | ID | Severity | Confidence | Status | Title |
@@ -1536,9 +1577,10 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
-| R-20 | Medium | High | **Partially resolved 2026-10-12 (#36, RFC-014)**: request/reply `correlation_id`; message id, timestamp, source, trace context still open | No message metadata for tracing |
+| R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
+| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions (#17) and outbound bound (#35) still open | At-most-once delivery, silent losses |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
