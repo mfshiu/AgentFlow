@@ -18,6 +18,9 @@ from .notifier import BrokerNotifier
 # module is insulated from paho version restructuring. paho's own
 # MQTT_ERR_SUCCESS has always been 0 (v1 and v2).
 MQTT_ERR_SUCCESS = 0
+# paho's "no connection" result. For QoS >= 1 paho still keeps the
+# message and sends it after the reconnect (issue #4).
+MQTT_ERR_NO_CONN = 4
 
 
 class MqttPublishReason(Enum):
@@ -346,8 +349,7 @@ class MqttBroker(MessageBroker):
             self._recovery_run_count += 1
         logger.info(f"recovery: starting for {len(snapshot)} topic(s)")
         successes = failures = 0
-        for topic, (_, qos) in snapshot.items():
-            still_in_registry = False
+        for topic in snapshot:
             with self._state_lock:
                 if self._stopping:
                     logger.warning(
@@ -355,11 +357,15 @@ class MqttBroker(MessageBroker):
                         f"{successes + failures}/{len(snapshot)} topics"
                     )
                     break
-                still_in_registry = topic in self._registry
-            if not still_in_registry:
+                # The live entry, not the snapshot's: a subscribe() made
+                # during recovery may have changed the topic's QoS
+                # (issue #4).
+                entry = self._registry.get(topic)
+            if entry is None:
                 # Topic was unsubscribed between snapshot and this
                 # iteration; skip.
                 continue
+            qos = entry[1]
             try:
                 self._client_subscribe(topic, qos)
                 successes += 1
@@ -1263,6 +1269,14 @@ class MqttBroker(MessageBroker):
         # layer; catches races where stop() started after our
         # snapshot).
         rc, mid = self._normalise_publish_result(topic, result)
+        if rc == MQTT_ERR_NO_CONN and qos > 0:
+            # Issue #4: paho closes the socket before it reports the
+            # disconnect, so the gate above can pass with no socket.
+            # paho has queued this QoS >= 1 message and sends it after
+            # the reconnect; reporting a failure would make callers
+            # retry and the receiver handle the request twice.
+            logger.info(f"publish to {topic!r} queued by paho until the reconnect (QoS {qos})")
+            return result
         if rc != MQTT_ERR_SUCCESS:
             raise MqttPublishError(
                 topic=topic,

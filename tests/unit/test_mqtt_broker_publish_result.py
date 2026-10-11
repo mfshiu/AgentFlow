@@ -527,7 +527,10 @@ def test_E42_publish_or_raise_propagates_MqttPublishError(broker, fake_client):
 def test_E43_publish_sync_rc_failure_fast_fails_within_50ms(broker, fake_client):
     """INVERTED: pre-RFC-012 waited full timeout."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     t0 = time.monotonic()
     with pytest.raises(MqttPublishError):
@@ -590,7 +593,10 @@ def test_E47_publish_sync_finally_registry_cleanup_still_runs_on_MqttPublishErro
     """RFC-006/007 waiter cleanup MUST run even when _publish_or_raise
     raises MqttPublishError."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     handlers_before = dict(agent._Agent__topic_handlers)
     try:
@@ -607,7 +613,10 @@ def test_E48_publish_sync_finally_broker_unsubscribe_still_called_on_MqttPublish
 ):
     """RFC-005 broker.unsubscribe still called in finally."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     fake_client.unsubscribe.reset_mock()
     try:

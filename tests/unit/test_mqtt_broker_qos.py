@@ -36,8 +36,6 @@ class _NoConnInfo:
     mid = 7
 
 
-xfail_review = pytest.mark.xfail(strict=True, reason='issue #4: gaps found in review')
-
 
 def _fire_connect(broker, fake_client, rc: int = 0):
     broker._on_connect(
@@ -104,7 +102,6 @@ def test_every_built_in_broker_accepts_the_qos_keywords(broker_class):
     assert subscribe['qos'].kind is inspect.Parameter.KEYWORD_ONLY and subscribe['qos'].default == 0
 
 
-@xfail_review
 def test_a_qos_1_publish_paho_queued_without_a_socket_counts_as_accepted(broker, fake_client):
     """paho closes the socket before it reports the disconnect. In that
     window a QoS >= 1 publish gets MQTT_ERR_NO_CONN, yet paho keeps the
@@ -118,7 +115,6 @@ def test_a_qos_1_publish_paho_queued_without_a_socket_counts_as_accepted(broker,
         broker.publish('t', b'x')
 
 
-@xfail_review
 def test_the_resubscribe_after_a_reconnect_uses_each_topics_current_qos(broker, fake_client):
     """A subscribe() that changes a topic's QoS while recovery is running
     must not be undone by recovery resubscribing at the snapshot's QoS."""
