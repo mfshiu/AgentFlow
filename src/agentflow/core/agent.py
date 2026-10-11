@@ -80,21 +80,22 @@ class TopicWaitCollisionError(RuntimeError):
     (RFC-006, RFC-007).
 
     Contexts that raise this exception:
-      - publish_sync-vs-publish_sync collision (RFC-006)
       - publish_sync on a topic already held by a normal subscribe
         handler (RFC-007)
       - Agent.subscribe on a topic reserved by an active publish_sync
         waiter (RFC-007)
       - Agent.unsubscribe on a topic reserved by an active
         publish_sync waiter (RFC-007)
-    The exception message distinguishes the context."""
+    The exception message distinguishes the context. Concurrent
+    publish_sync calls on one topic_wait no longer raise it; they
+    share the topic (RFC-014 §8, superseding RFC-006's fail-fast)."""
 
 
 class _HandlerOwnerType(Enum):
     """Internal (RFC-007): owner tag for an Agent handler registry
     entry. NORMAL is registered via Agent.subscribe; PUBLISH_SYNC is
-    the transient closure registered by Agent.publish_sync while it
-    waits for a response."""
+    the _ReplyRouter registered by Agent.publish_sync while calls wait
+    for replies on the topic (RFC-014 §8)."""
     NORMAL = "normal"
     PUBLISH_SYNC = "publish_sync"
 

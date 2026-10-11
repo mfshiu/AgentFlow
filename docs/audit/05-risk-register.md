@@ -1181,15 +1181,15 @@ The `__topic_handlers` slice of R-14 was upgraded to runtime-confirmed via `test
 - **All registry mutations and reads** now happen inside `with self._handlers_lock:` (the RLock introduced in RFC-006):
   - `Agent.subscribe`: check owner; if PUBLISH_SYNC → raise; else warn (rebind case) + register as NORMAL. `broker.subscribe` outside the lock.
   - `Agent.unsubscribe`: check owner; if PUBLISH_SYNC → raise; else pop. `broker.unsubscribe` outside the lock.
-  - `Agent.publish_sync` register: check any existing record; if PUBLISH_SYNC → raise (`already awaited`); if NORMAL → raise (`would trample it`); else register as PUBLISH_SYNC. `broker.subscribe` outside the lock.
-  - `Agent.publish_sync` finally: **triple check** — record exists AND `owner_type is PUBLISH_SYNC` AND `handler is handle_response` → pop. `broker.unsubscribe` outside the lock.
+  - `Agent.publish_sync` register: check any existing record; if NORMAL → raise (`would trample it`); else register as PUBLISH_SYNC. `broker.subscribe` outside the lock. *Since RFC-014 §8 (2026-10-12): the PUBLISH_SYNC handler is a `_ReplyRouter` shared by concurrent calls, so an existing PUBLISH_SYNC record is joined rather than raising `already awaited`.*
+  - `Agent.publish_sync` finally: **triple check** — record exists AND `owner_type is PUBLISH_SYNC` AND `handler is handle_response` → pop. `broker.unsubscribe` outside the lock. *Since RFC-014 §8: `handler is` the call's router, and only the last call to leave pops it; join + subscribe and leave + unsubscribe run under `_reply_topics_lock`.*
   - `Agent._on_message`: single-snapshot read under the lock decides `is_specific_handler` and `topic_handler` together. Dispatcher enqueue and handler invocation happen outside the lock.
 
-### Collision contract (four scenarios; all raise `TopicWaitCollisionError`)
+### Collision contract (`TopicWaitCollisionError`; the first scenario was lifted by RFC-014 §8)
 
 | Scenario | Message keyword |
 |---|---|
-| publish_sync vs publish_sync (RFC-006) | `"already awaited by another publish_sync"` |
+| ~~publish_sync vs publish_sync (RFC-006)~~ | no longer raised since RFC-014 §8 (2026-10-12): the calls share the topic |
 | publish_sync vs NORMAL (RFC-007) | `"already registered by a normal subscribe handler; publish_sync would trample it"` |
 | direct subscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct subscribe is refused"` |
 | direct unsubscribe vs PUBLISH_SYNC (RFC-007) | `"reserved by an active publish_sync waiter; direct unsubscribe is refused"` |

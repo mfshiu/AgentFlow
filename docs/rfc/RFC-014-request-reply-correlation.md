@@ -109,10 +109,10 @@ One `_ReplyRouter` per reply topic replaces the per-call reply closure. It is re
 |---|---|---|
 | a waiting call's id | any | that call takes it (first reply wins) |
 | any other value | any | ignored, DEBUG |
-| `None` | exactly 1 | that call takes it, as before |
-| `None` | 2 or more | nobody takes it; WARNING on the 1st, 2nd, 4th, ... occurrence, DEBUG otherwise |
+| `None` | exactly 1, and no other call has shared the topic since the router was created | that call takes it, as before |
+| `None` | otherwise | nobody takes it; WARNING on the 1st, 2nd, 4th, ... occurrence, DEBUG otherwise |
 
-The last row keeps RFC-006's rejection of Option D (FIFO): handing a caller another's answer would be a silent wrong result, so the calls time out instead.
+The last row keeps RFC-006's rejection of Option D (FIFO): handing a caller another's answer would be a silent wrong result, so the calls time out instead. "Has shared" is sticky until the router is dropped: after A and B overlap and A times out, a late uncorrelated reply may well answer A, so B must not take it. A router is dropped when its last call leaves, so a `topic_wait` reused without overlap accepts uncorrelated replies as before.
 
 ### 8.2 Subscription lifecycle
 
@@ -133,13 +133,13 @@ The last row keeps RFC-006's rejection of Option D (FIFO): handing a caller anot
 
 ### 8.5 Verification
 
-`tests/unit/core/test_agent_publish_sync_concurrency.py` (24 tests):
+`tests/unit/core/test_agent_publish_sync_concurrency.py` (25 tests):
 
 - two callers, and n = 3 / 10 / 50 callers, each get their own reply when the replies arrive in reverse;
-- a 10-round stress test of 8 callers with a responder answering inline from `broker.publish`, covering every join / leave interleaving;
+- a 10-round stress test of 8 callers with a responder answering inline from `broker.publish`, so calls join and leave in varied interleavings; it checks the replies and that subscribes and unsubscribes balance;
 - one registry entry and one SUBSCRIBE while any call waits, and one UNSUBSCRIBE at the end;
-- an uncorrelated reply not attributed between two waiters;
-- a call joining during the last caller's unsubscribe stays subscribed (this failed before the lock);
+- an uncorrelated reply not attributed between two waiters, nor to the one left after the other timed out;
+- a call joining during the last caller's unsubscribe stays subscribed. This failed before the lock, and it is the test that guards the lock: FakeBroker delivers whether or not a topic is subscribed, so the stress test cannot see that race;
 - the collisions that remain, against normal subscribe handlers.
 
 A stability run of that file and the RFC-007 cross-API file passed 10 times on Python 3.13 and 5 times on 3.11.
