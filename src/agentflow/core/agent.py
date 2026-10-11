@@ -1,17 +1,20 @@
 import inspect
 import logging
+import math
 import pickle
 import queue
-import random
+import re
+import secrets
 import string
 import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, final, Optional
 import uuid
 
+from agentflow.core import holon_auth
 from agentflow.core.parcel import Parcel, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
@@ -27,6 +30,47 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
 _CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
+
+# Issue #13: keys accepted in the optional `holon` config section.
+_HOLON_KEYS = frozenset({
+    'control_secret', 'control_max_age', 'max_children', 'trust_unregistered_parents',
+})
+_MIN_CONTROL_SECRET_BYTES = 16
+_DEFAULT_CONTROL_MAX_AGE_S = 300.0
+# Issue #13: a terminate from a parent that has not registered (yet)
+# waits this long for that parent's register_parent; at most
+# _MAX_PENDING_TERMINATES wait at a time.
+_PENDING_TERMINATE_TTL_S = 10.0
+_MAX_PENDING_TERMINATES = 8
+# Issue #13: how long a terminating parent waits for on_register_child
+# hooks that are still running, so those children get register_parent
+# before its terminate.
+_REGISTRATION_DRAIN_S = 3.0
+# Issue #13: holon control topics, to_child.* / to_parent.* and their
+# {agent_id}.-prefixed unicast forms.
+_HOLON_CONTROL_TOPIC = re.compile(r'(?:[0-9a-f]{32}\.)?to_(?:child|parent)\.')
+
+
+def _is_holon_control_topic(topic) -> bool:
+    return isinstance(topic, str) and _HOLON_CONTROL_TOPIC.match(topic) is not None
+
+
+@dataclass(frozen=True)
+class _HolonOptions:
+    """Issue #13: the parsed `holon` config section."""
+    control_key: Optional[bytes] = field(default=None, repr=False)
+    control_max_age: float = _DEFAULT_CONTROL_MAX_AGE_S
+    max_children: Optional[int] = None
+    trust_unregistered_parents: bool = False
+
+
+def _config_for_log(cfg):
+    """Issue #13: `cfg` with holon.control_secret masked, for logging.
+    Other credentials in the config are #14."""
+    holon = cfg.get('holon') if isinstance(cfg, dict) else None
+    if isinstance(holon, dict) and holon.get('control_secret') is not None:
+        return {**cfg, 'holon': {**holon, 'control_secret': '***'}}
+    return cfg
 
 
 class TopicWaitCollisionError(RuntimeError):
@@ -67,7 +111,7 @@ class _HandlerRecord:
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
-        logger.debug(f'name: {name}, agent_config: {agent_config}')
+        logger.debug(f'name: {name}, agent_config: {_config_for_log(agent_config)}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -75,6 +119,8 @@ class Agent(BrokerNotifier):
         # Issue #1: inbound decoding policy, validated up front so a bad
         # `codec` config fails at construction rather than per message.
         self._codec_options = self.__parse_codec_config()
+        # Issue #13: holon control-plane policy, validated the same way.
+        self._holon_options = self.__parse_holon_config()
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
@@ -93,7 +139,12 @@ class Agent(BrokerNotifier):
         # Issue #5: _terminate runs its body once (test-and-set).
         self._terminate_lock = threading.Lock()
         self._terminating = False
-        
+        # Issue #13: terminates from parents that have not registered
+        # yet: parent_id -> (deadline, topic, message).
+        self._pending_terminates: dict = {}
+        # Issue #13: refused holon messages per kind, for logging.
+        self._holon_rejections: dict = {}
+
         self._message_broker = None
         self.__topic_handlers: dict[str, _HandlerRecord] = {}
         # RFC-006: guards atomic collision-check-and-register and
@@ -145,6 +196,8 @@ class Agent(BrokerNotifier):
         '_holon_lock',
         '_children_registering',
         '_terminate_lock',
+        '_pending_terminates',
+        '_holon_rejections',
     })
 
     def __getstate__(self):
@@ -220,6 +273,8 @@ class Agent(BrokerNotifier):
         self._children_registering = set()
         self._terminate_lock = threading.Lock()
         self._terminating = False
+        self._pending_terminates = {}
+        self._holon_rejections = {}
         self._broker_connected = False
         if '_Agent__topic_handlers' not in self.__dict__:
             self._Agent__topic_handlers = {}
@@ -232,7 +287,7 @@ class Agent(BrokerNotifier):
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
-        logger.debug(f'self.config: {self.config}')
+        logger.debug(f'self.config: {_config_for_log(self.config)}')
 
 
     def __parse_codec_config(self):
@@ -284,6 +339,102 @@ class Agent(BrokerNotifier):
             'accept_pickle': accept_pickle,
             'pickle_allowed_globals': parse_pickle_globals(allowed),
         }
+
+
+    def __parse_holon_config(self) -> _HolonOptions:
+        """Issue #13: the optional `holon` config section.
+
+          control_secret             (str or bytes, at least 16 bytes) —
+                                     sign holon control messages
+                                     (terminate, register_child,
+                                     register_parent, parent_online) with
+                                     HMAC-SHA256 and drop unsigned or
+                                     forged ones. Every agent of the holon
+                                     must share it. See holon_auth.
+          control_max_age            (seconds, default 300) — how far a
+                                     signed control message's timestamp
+                                     may be from the local clock.
+          max_children               (int >= 1, default unlimited) —
+                                     refuse new children beyond this many.
+                                     Members never expire yet (#6), so
+                                     leave headroom for children that
+                                     restart.
+          trust_unregistered_parents (bool, default False) — honour a
+                                     terminate from any agent named like
+                                     our parent, as before #13, not only
+                                     from registered parents.
+
+        Read once at construction. Raises TypeError / ValueError on a
+        malformed section, including unknown keys. Error messages never
+        contain the secret."""
+        holon = self.config.get('holon')
+        if holon is None:
+            holon = {}
+        if not isinstance(holon, dict):
+            raise TypeError(
+                f"Agent config 'holon' must be a dict, got {type(holon).__name__}"
+            )
+        unknown = set(holon) - _HOLON_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent config 'holon' keys {sorted(map(str, unknown))}; "
+                f"expected {sorted(_HOLON_KEYS)}"
+            )
+
+        secret = holon.get('control_secret')
+        if isinstance(secret, str):
+            secret = secret.encode('utf-8')
+        elif isinstance(secret, (bytes, bytearray)):
+            secret = bytes(secret)
+        elif secret is not None:
+            raise TypeError(
+                f"Agent config 'holon.control_secret' must be a str or bytes, "
+                f"got {type(secret).__name__}"
+            )
+        if secret is not None and len(secret) < _MIN_CONTROL_SECRET_BYTES:
+            raise ValueError(
+                f"Agent config 'holon.control_secret' must be at least "
+                f"{_MIN_CONTROL_SECRET_BYTES} bytes"
+            )
+
+        max_age = holon.get('control_max_age', _DEFAULT_CONTROL_MAX_AGE_S)
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)):
+            raise TypeError(
+                f"Agent config 'holon.control_max_age' must be a number of "
+                f"seconds, got {max_age!r}"
+            )
+        try:
+            max_age = float(max_age)
+        except OverflowError:
+            raise ValueError(
+                f"Agent config 'holon.control_max_age' is out of range"
+            ) from None
+        if not 0 < max_age < math.inf:
+            raise ValueError(
+                f"Agent config 'holon.control_max_age' must be positive and "
+                f"finite, got {max_age!r}"
+            )
+
+        max_children = holon.get('max_children')
+        if max_children is not None:
+            if isinstance(max_children, bool) or not isinstance(max_children, int):
+                raise TypeError(
+                    f"Agent config 'holon.max_children' must be an int, "
+                    f"got {max_children!r}"
+                )
+            if max_children < 1:
+                raise ValueError(
+                    f"Agent config 'holon.max_children' must be at least 1, "
+                    f"got {max_children!r}"
+                )
+
+        trust = holon.get('trust_unregistered_parents', False)
+        if not isinstance(trust, bool):
+            raise TypeError(
+                f"Agent config 'holon.trust_unregistered_parents' must be a "
+                f"bool, got {trust!r}"
+            )
+        return _HolonOptions(secret, max_age, max_children, trust)
             
             
     def __create_worker(self):
@@ -302,7 +453,7 @@ class Agent(BrokerNotifier):
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
             self.config[config.CONCURRENCY_TYPE] = 'process'
-        logger.info(self.M(f"self.config: {self.config}"))
+        logger.info(self.M(f"self.config: {_config_for_log(self.config)}"))
         self.work_process = self._get_worker().start()
         
         self._on_start()
@@ -614,6 +765,7 @@ class Agent(BrokerNotifier):
         try:
             logger.warning(self.M('Terminating..'))
 
+            self.__await_registrations(_REGISTRATION_DRAIN_S)
             self._notify_children('terminate')
             def stop():
                 time.sleep(1)
@@ -626,6 +778,25 @@ class Agent(BrokerNotifier):
             with self._terminate_lock:
                 self._terminating = False
             raise
+
+
+    def __await_registrations(self, timeout):
+        """Issue #13: wait, at most `timeout` seconds, until no
+        on_register_child hook is running. Such a child has not been
+        sent register_parent yet (#6), so without a control secret it
+        holds our terminate back until register_parent arrives, and our
+        broker stops about 1 s after the terminate."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._holon_lock:
+                running = len(self._children_registering)
+            if not running:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(self.M(
+                    f"Terminating while {running} child registration hook(s) still run."))
+                return
+            time.sleep(0.01)
 
 
     def __deactivating(self):
@@ -737,7 +908,8 @@ class Agent(BrokerNotifier):
         
     def __generate_return_topic(self, topic):
         alphabet = string.digits + string.ascii_lowercase
-        rand = ''.join(random.choice(alphabet) for _ in range(10))
+        # Issue #13: from `secrets`, not the seedable, predictable `random`.
+        rand = ''.join(secrets.choice(alphabet) for _ in range(10))
         return f"{self.tag}-{rand}/{topic}"
 
     @final
@@ -878,9 +1050,10 @@ class Agent(BrokerNotifier):
             self._broker.unsubscribe(topic)
     
     
-    def __register_child(self, child_id:str, child_info:dict) -> bool:
+    def __register_child(self, child_id:str, child_info:dict) -> Optional[bool]:
         """Record a child. Returns whether the caller should answer with
-        register_parent.
+        register_parent, or None if the child was refused: issue #13, a
+        new child beyond holon.max_children.
 
         Issue #6: children re-register on every (re)connect and on a
         parent's parent_online, so registration is idempotent: a known
@@ -889,14 +1062,21 @@ class Agent(BrokerNotifier):
         answer; the first registration answers once its hook returns, so
         register_parent never overtakes on_register_child."""
         child_info['parent_id'] = self.agent_id
+        cap = self._holon_options.max_children
         with self._holon_lock:
             is_new = child_id not in self._children
-            self._children[child_id] = child_info
-            total = len(self._children)
-            if is_new:
-                self._children_registering.add(child_id)
-            elif child_id in self._children_registering:
-                return False
+            refused = is_new and cap is not None and len(self._children) >= cap
+            if not refused:
+                self._children[child_id] = child_info
+                total = len(self._children)
+                if is_new:
+                    self._children_registering.add(child_id)
+                elif child_id in self._children_registering:
+                    return False
+        if refused:
+            self.__log_holon_rejection(
+                'refused children', f"Refused child {child_id!r}: holon.max_children={cap} reached.")
+            return None
         if not is_new:
             logger.debug(self.M(f"Child re-registered: {child_id}"))
             return True
@@ -914,17 +1094,23 @@ class Agent(BrokerNotifier):
     
     
     def __register_parent(self, parent_id:str, parent_info):
-        # Issue #6: idempotent, as for __register_child.
+        """Record a parent. Issue #6: idempotent, as for
+        __register_child. Returns this parent's deferred terminate as
+        (topic, message) if one is waiting (issue #13), else None."""
         parent_info['child_id'] = self.agent_id
         with self._holon_lock:
             is_new = parent_id not in self._parents
             self._parents[parent_id] = parent_info
             total = len(self._parents)
-        if not is_new:
+            pending = self._pending_terminates.pop(parent_id, None)
+        if is_new:
+            logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
+            self.on_register_parent(parent_id, parent_info)
+        else:
             logger.debug(self.M(f"Parent re-registered: {parent_id}"))
-            return
-        logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
-        self.on_register_parent(parent_id, parent_info)
+        if pending is not None and pending[0] >= time.monotonic():
+            return pending[1], pending[2]
+        return None
 
 
     def on_register_parent(self, parent_id, parent_info):
@@ -946,11 +1132,18 @@ class Agent(BrokerNotifier):
             if self.agent_id not in target_parents:
                 return
 
+        if not self.__is_authentic_control(topic, child):
+            return None
+        child.pop(holon_auth.AUTH_FIELD, None)
+
         if child_id:=child.get('child_id'):
-            if "register_child" == child['subject']:
-                if self.__register_child(child_id, child):
+            if "register_child" == child.get('subject'):
+                answer = self.__register_child(child_id, child)
+                if answer is None:
+                    return None     # Issue #13: refused (holon.max_children).
+                if answer:
                     self._notify_child(child_id, 'register_parent')
-            
+
         return self.on_children_message(topic, child)
 
 
@@ -989,12 +1182,30 @@ class Agent(BrokerNotifier):
         if target_children := parent.get('target_children'):
             if not self.agent_id in target_children:
                 return  # Not in the target children.
-        
+
+        if not self.__is_authentic_control(topic, parent):
+            return None
+        parent.pop(holon_auth.AUTH_FIELD, None)
+
         if "terminate" == parent.get('subject'):
+            if not self.__accept_terminate(topic, parent):
+                return None
             self._terminate()
         elif "register_parent" == parent.get('subject'):
+            if topic != f'{self.agent_id}.to_child.{self.parent_name}':
+                # Issue #13: parents answer register_child only on our
+                # own channel. Honouring one on a broadcast topic would
+                # let anyone register as our parent without knowing any
+                # agent id, and then terminate us.
+                self.__log_holon_rejection(
+                    'misdirected register_parent', f"Ignored a register_parent on {topic!r}.")
+                return None
             if parent_id := parent.get('parent_id'):
-                self.__register_parent(parent_id, parent)
+                if deferred := self.__register_parent(parent_id, parent):
+                    # Issue #13: this parent's terminate overtook its
+                    # register_parent; act on it now.
+                    self._terminate()
+                    self.on_parents_message(*deferred)
         elif "parent_online" == parent.get('subject'):
             # Issue #6: a parent (re)connected and asks its children to
             # register. Internal: never forwarded to on_parents_message.
@@ -1012,13 +1223,103 @@ class Agent(BrokerNotifier):
 
     def on_parents_message(self, topic, parent):
         pass
+
+
+    def __is_authentic_control(self, topic, message) -> bool:
+        """Issue #13: with holon.control_secret set, a control message
+        must be signed for the topic it arrived on. Other subjects, and
+        every message when no secret is set, pass."""
+        key = self._holon_options.control_key
+        if key is None or not holon_auth.is_control(message):
+            return True
+        reason = holon_auth.verify(key, topic, message, self._holon_options.control_max_age)
+        if reason is None:
+            return True
+        self.__log_holon_rejection(
+            'unauthenticated control messages',
+            f"Dropped {message.get('subject')!r} on {topic!r}: {reason}.")
+        return False
+
+
+    def __accept_terminate(self, topic, parent) -> bool:
+        """Issue #13: honour a terminate only from a registered parent.
+
+        One from an agent named like our parent that has not registered
+        may have overtaken its register_parent (the dispatcher does not
+        order messages), so it waits for that registration for
+        _PENDING_TERMINATE_TTL_S; at most _MAX_PENDING_TERMINATES wait,
+        the oldest is dropped first. holon.trust_unregistered_parents
+        restores the pre-#13 behaviour.
+
+        With holon.control_secret set, the terminate has already been
+        authenticated: its sender holds the holon's secret and is named
+        like our parent. It is honoured without waiting for a
+        registration that may never come.
+
+        Without a secret, this check stops only senders that cannot
+        observe the holon's traffic: parent ids appear in every parent
+        broadcast."""
+        if self._holon_options.trust_unregistered_parents:
+            return True
+        parent_id = parent.get('parent_id')
+        if not isinstance(parent_id, str) or not parent_id:
+            self.__log_holon_rejection(
+                'unattributed terminates', f"Ignored a terminate without a parent_id on {topic!r}.")
+            return False
+        if self._holon_options.control_key is not None:
+            return True
+        now = time.monotonic()
+        with self._holon_lock:
+            if parent_id in self._parents:
+                return True
+            pending = self._pending_terminates
+            for pid in [p for p, entry in pending.items() if entry[0] < now]:
+                del pending[pid]
+            pending.pop(parent_id, None)
+            if len(pending) >= _MAX_PENDING_TERMINATES:
+                del pending[next(iter(pending))]
+            pending[parent_id] = (now + _PENDING_TERMINATE_TTL_S, topic, parent)
+        self.__log_holon_rejection(
+            'deferred terminates',
+            f"Deferred a terminate from unregistered parent {parent_id!r} until it registers.")
+        return False
+
+
+    def __log_holon_rejection(self, kind, text):
+        """Issue #13: log a refused holon message at WARNING the 1st,
+        2nd, 4th, 8th, ... time per kind and at DEBUG otherwise, so a
+        flood of forged messages cannot flood the log. The count is
+        approximate under concurrent dispatch."""
+        count = self._holon_rejections.get(kind, 0) + 1
+        self._holon_rejections[kind] = count
+        if count & (count - 1) == 0:
+            logger.warning(self.M(f"{text} ({count} {kind} so far)"))
+        else:
+            logger.debug(self.M(text))
+
+
+    def __publish_holon(self, topic, message):
+        """Issue #13: publish a holon message, signed for `topic` when it
+        is a control message and holon.control_secret is set."""
+        key = self._holon_options.control_key
+        if key is not None and holon_auth.is_control(message):
+            try:
+                message = holon_auth.sign(key, topic, message)
+            except (TypeError, ValueError, RecursionError) as ex:
+                # Never raise, like publish. Unsigned, it would be
+                # dropped by every receiver anyway.
+                logger.error(self.M(
+                    f"Not sending {message.get('subject')!r} to {topic!r}: "
+                    f"its data cannot be signed ({ex})."))
+                return None
+        return self.publish(topic, message)
     
     
     def _notify_child(self, child_id, subject, data=None):
         logger.debug(f"child_id: {child_id}, subject: {subject}, data: {data}")
 
         if self._children and child_id in self._children:
-            self.publish(f'{child_id}.to_child.{self.name}', {
+            self.__publish_holon(f'{child_id}.to_child.{self.name}', {
                 'parent_id': self.agent_id,
                 'parent_name': self.name,     # issue #38
                 'subject': subject,
@@ -1050,14 +1351,14 @@ class Agent(BrokerNotifier):
             logger.debug(self.M(f"target_child_name: {target_child_name}"))
             topic = f'to_child.{target_child_name}'
 
-        self.publish(topic, data_send)
+        self.__publish_holon(topic, data_send)
     
     
     def _notify_parent(self, parent_id, subject, data=None):
         logger.debug(self.M(f"parent_id: {parent_id}, subject: {subject}, data: {data}"))
 
         if self._parents and parent_id in self._parents:
-            self.publish(f'{parent_id}.to_parent.{self.parent_name}', {
+            self.__publish_holon(f'{parent_id}.to_parent.{self.parent_name}', {
                 'child_id': self.agent_id,
                 'subject': subject,
                 'data': data
@@ -1070,7 +1371,7 @@ class Agent(BrokerNotifier):
         """Issue #6: answer one parent's parent_online on its own
         channel, so same-name parent replicas are not all delivered (and
         then discard) every child's answer."""
-        self.publish(f'{parent_id}.to_parent.{self.parent_name}', {
+        self.__publish_holon(f'{parent_id}.to_parent.{self.parent_name}', {
             'child_id': self.agent_id,
             'child_name': self.name,
             'subject': 'register_child',
@@ -1083,7 +1384,7 @@ class Agent(BrokerNotifier):
         """Issue #6: ask any children of this agent to (re)register.
         Published directly rather than through _notify_children, which
         returns early while _children is still empty."""
-        self.publish(f'to_child.{self.name}', {
+        self.__publish_holon(f'to_child.{self.name}', {
             'parent_id': self.agent_id,
             'parent_name': self.name,     # issue #38
             'subject': 'parent_online',
@@ -1095,7 +1396,7 @@ class Agent(BrokerNotifier):
         logger.debug(f"subject: {subject}, data: {data}")
         
         if self.parent_name:
-            self.publish(f'to_parent.{self.parent_name}', data={
+            self.__publish_holon(f'to_parent.{self.parent_name}', {
                 'child_id': self.agent_id,
                 'child_name': self.name,
                 'subject': subject,
@@ -1198,6 +1499,15 @@ class Agent(BrokerNotifier):
         # registered handler in __topic_handlers may trigger an
         # auto-reply.
         should_auto_reply = bool(pcl.topic_return) and is_specific_handler
+        if should_auto_reply and _is_holon_control_topic(pcl.topic_return):
+            # Issue #13: a requester must not be able to point our reply
+            # at a holon control topic (confused deputy). The handler
+            # still runs; only the reply is withheld.
+            should_auto_reply = False
+            self.__log_holon_rejection(
+                'replies into control topics',
+                f"Withheld the reply to {topic!r}: topic_return "
+                f"{pcl.topic_return!r} is a holon control topic.")
 
         def handle_message():
             if should_auto_reply:

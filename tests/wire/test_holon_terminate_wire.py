@@ -17,7 +17,7 @@ pytestmark = pytest.mark.wire
 
 
 class WireAgent(Agent):
-    def __init__(self, name, port):
+    def __init__(self, name, port, holon=None):
         super().__init__(name, {
             'broker': {
                 'broker_name': 'local',
@@ -27,6 +27,7 @@ class WireAgent(Agent):
                     'reconnect_min_delay': 1, 'reconnect_max_delay': 1,
                 },
             },
+            'holon': holon,
         })
 
 
@@ -79,6 +80,36 @@ def test_replica_terminate_does_not_stop_its_same_name_sibling():
         assert _wait(lambda: not m1.is_active(), timeout=15)
         assert not _wait(lambda: not m2.is_active(), timeout=3), \
             "a same-name replica's terminate stopped its sibling"
+    finally:
+        for a in agents:
+            a.terminate()
+        server.close()
+
+
+_CONTROL_SUBJECTS = {'terminate', 'register_child', 'register_parent', 'parent_online'}
+
+
+def test_holon_sharing_a_control_secret_converges_and_terminates():
+    """Issue #13: with holon.control_secret, membership and terminate
+    still work over a real MQTT link, and every control message on the
+    wire is signed."""
+    server = MiniMqttServer()
+    holon = {'control_secret': 'wire-test-secret-0123456789'}
+    root, mid, leaf = (WireAgent(n, server.port, holon) for n in ('a', 'b.a', 'c.b.a'))
+    agents = (leaf, mid, root)
+    try:
+        for a in agents:
+            a.start_thread()
+        assert _wait(lambda: set(root._children) == {mid.agent_id}
+                     and set(mid._children) == {leaf.agent_id})
+
+        root.terminate()
+
+        for a in agents:
+            assert _wait(lambda: not a.is_active(), timeout=15), f'{a.name} still active'
+        control = [c for c in (Parcel.from_payload(p).content for _, p in server.published())
+                   if isinstance(c, dict) and c.get('subject') in _CONTROL_SUBJECTS]
+        assert control and all('auth' in c for c in control)
     finally:
         for a in agents:
             a.terminate()
