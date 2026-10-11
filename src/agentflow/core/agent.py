@@ -4,6 +4,7 @@ import math
 import pickle
 import queue
 import random
+import re
 import string
 import threading
 import time
@@ -41,6 +42,13 @@ _DEFAULT_CONTROL_MAX_AGE_S = 300.0
 # _MAX_PENDING_TERMINATES wait at a time.
 _PENDING_TERMINATE_TTL_S = 10.0
 _MAX_PENDING_TERMINATES = 8
+# Issue #13: holon control topics, to_child.* / to_parent.* and their
+# {agent_id}.-prefixed unicast forms.
+_HOLON_CONTROL_TOPIC = re.compile(r'(?:[0-9a-f]{32}\.)?to_(?:child|parent)\.')
+
+
+def _is_holon_control_topic(topic) -> bool:
+    return isinstance(topic, str) and _HOLON_CONTROL_TOPIC.match(topic) is not None
 
 
 @dataclass(frozen=True)
@@ -1424,6 +1432,15 @@ class Agent(BrokerNotifier):
         # registered handler in __topic_handlers may trigger an
         # auto-reply.
         should_auto_reply = bool(pcl.topic_return) and is_specific_handler
+        if should_auto_reply and _is_holon_control_topic(pcl.topic_return):
+            # Issue #13: a requester must not be able to point our reply
+            # at a holon control topic (confused deputy). The handler
+            # still runs; only the reply is withheld.
+            should_auto_reply = False
+            self.__log_holon_rejection(
+                'replies into control topics',
+                f"Withheld the reply to {topic!r}: topic_return "
+                f"{pcl.topic_return!r} is a holon control topic.")
 
         def handle_message():
             if should_auto_reply:

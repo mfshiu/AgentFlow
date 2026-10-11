@@ -397,7 +397,6 @@ def _request(broker, topic_return):
     broker.deliver('echo', TextParcel(_content('terminate', 'P'), topic_return=topic_return).payload())
 
 
-@xfail_13
 @pytest.mark.parametrize('topic_return', [
     'to_child.vp',
     'to_parent.vp',
