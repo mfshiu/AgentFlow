@@ -55,7 +55,7 @@ Serialisation:
 - `TextParcel.payload()` — `b"text/json|" + utf-8 json` (`parcel.py:179–181`)
 - `BinaryParcel.payload()` — `b"application/pickle|" + pickle.dumps(managed_data, HIGHEST_PROTOCOL)` (`parcel.py:155–156`)
 
-The serialized envelope contains `version`, `content`, `topic_return`, `error` (`parcel.py:95–101`).
+The serialized envelope contains `version`, `content`, `topic_return`, `error`, plus `correlation_id` when set ([RFC-014](../rfc/RFC-014-request-reply-correlation.md): `publish_sync` stamps it on requests and auto-replies echo it).
 
 ---
 
