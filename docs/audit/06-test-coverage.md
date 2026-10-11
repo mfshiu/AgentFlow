@@ -14,6 +14,7 @@ The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state
 - R-05 via [RFC-003](../rfc/RFC-003-auto-reply-contract.md)
 - R-04 via [RFC-004](../rfc/RFC-004-bounded-message-dispatch.md)
 - R-03 via [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
+- R-01 (and R-21: `core/wrapper.py` removed) via GitHub issue #1 (2026-10-10) — see the R-01 Resolution in `05-risk-register.md`
 - R.4 (publish_sync-vs-publish_sync collision) via [RFC-006](../rfc/RFC-006-publish-sync-topic-collision.md)
 - R-14 (partially — `__topic_handlers` slice) via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md), which also closed the R.6-1 / R.6-2 / R.6-3 residual risks from the RFC-006 cross-API characterisation
 - R-06 (partially — R-06.1 spawn pickle failure / R-06.2 unbounded `Process.join` / R-06.4 parent-child state divergence) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); R-06.3 heartbeat/watchdog and child-exception IPC remain Deferred / Open
@@ -297,7 +298,7 @@ Cross-referenced with `05-risk-register.md`.
 
 | Risk | Not covered by any test |
 |---|---|
-| R-01 pickle payload | ✓ no malformed payload test |
+| R-01 pickle payload | **Resolved 2026-10-10 (issue #1); covered by `tests/security/test_parcel_pickle_safety.py`.** Restricted unpickler (allowlisted, immutable globals only; guarded `bytearray`); gadget, unsafe-global, mutable-global, malformed-body, compatibility and `codec` config tests. |
 | R-02 `publish_sync` leaks | **Resolved 2026-07-26 (RFC-001); covered by `tests/unit/core/test_agent_publish_sync.py`** |
 | R-03 broker reconnect / re-subscribe | **Resolved 2026-07-27 (RFC-005); covered by `tests/unit/test_mqtt_broker_reconnect.py`.** MqttBroker owns a thread-safe subscription registry; reconnect drives per-topic recovery with per-topic failure isolation; stop / unsubscribe / subscribe races against recovery covered by dedicated tests; `_state_lock` never held across paho client calls (verified). |
 | R-04 unbounded per-message threads | **Resolved 2026-07-26 (RFC-004); covered by `tests/unit/core/test_agent_message_threading.py`.** MessageDispatcher with fixed daemon consumer pool + bounded queue + drop_newest + graceful shutdown. Two race fixes (enqueue check-then-put linearization + concurrent-stop `_stop_complete_event`) verified with deterministic reproductions. |

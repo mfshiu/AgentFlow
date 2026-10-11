@@ -10,6 +10,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-01 — `BinaryParcel.from_payload` executes `pickle.loads` on wire bytes
 
+- **Status**: **RESOLVED** (2026-10-10) — GitHub issue #1; see [Resolution](#resolution-2026-10-10-issue-1) below.
 - **Severity**: Critical
 - **Category**: Security / Message Reliability
 - **File / Function / Line**: `src/agentflow/core/parcel.py:142–149`, `BinaryParcel.from_payload`
@@ -22,6 +23,58 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Impact**: Arbitrary code execution in the receiving agent process.
 - **Confidence**: High
 - **Recommended verification test**: Unit test that constructs a payload using a `__reduce__` gadget that writes a marker file, calls `Parcel.from_payload`, and asserts the marker file exists (in a sandbox).
+
+### Resolution (2026-10-10, issue #1)
+
+**Approach.** Keep the wire format, but replace the unrestricted unpickler with a deny-by-default one. Pickle can only call something it first obtained through `Unpickler.find_class` (REDUCE, INST, OBJ, NEWOBJ and EXT\* all go through it). Refusing every global outside an allowlist therefore closes the code-execution path, and plain data still decodes. Allowlisted globals must also be immutable: otherwise a BUILD opcode applied to the class or function object itself would `setattr` on it, process-wide.
+
+**Scope of change:**
+
+- `src/agentflow/core/parcel.py`
+  - `_RestrictedUnpickler.find_class` resolves only allowlisted `(module, name)` pairs. The default allowlist, `DEFAULT_PICKLE_ALLOWED_GLOBALS`, is `builtins.bytearray`, `builtins.complex`, `builtins.set` and `builtins.frozenset`. These are the only globals pickle protocols 3–5 need for plain data.
+  - A resolved global is refused unless it is immutable, i.e. a type with `Py_TPFLAGS_IMMUTABLETYPE` or a builtin function. Python-defined classes (Enum, dataclass, `fractions.Fraction`), Python functions and modules are refused even when allowlisted.
+  - `builtins.bytearray` resolves to a guard that only rebuilds from bytes. Otherwise `bytearray(<int>)` would let a ~100-byte payload allocate gigabytes.
+  - Persistent IDs stay unsupported.
+  - New `ParcelDecodeError(TypeError)`. It is raised for refused globals, any unpickling or JSON error, and a non-dict body, in both BinaryParcel and TextParcel.
+  - `Parcel.from_payload` / `BinaryParcel.from_payload` take two new keyword-only parameters: `accept_pickle` and `pickle_allowed_globals`.
+  - New `parse_pickle_globals()` accepts entries in the form `'module.name'` / `'module:qualname'`.
+- `src/agentflow/core/agent.py`: a new optional config section `codec`, with `accept_pickle` (default True) and `pickle_allowed_globals` (default empty).
+  - It is read once and validated at construction. A malformed section raises: an unknown key, a non-bool `accept_pickle` (so the string `'false'` cannot silently keep pickle enabled), or a `pickle_allowed_globals` that is not a list.
+  - It is applied in `_on_message`.
+- `src/agentflow/core/wrapper.py` was removed. It was unused (no reference in `src/`, the tests or the downstream projects), broken (`TextWrapper.wrap` raised NameError on the undefined `VERSION`), and contained a second unrestricted `pickle.loads`.
+
+**Compatibility:**
+
+- Unchanged:
+  - Payloads from current senders (`pickle.HIGHEST_PROTOCOL`).
+  - Payloads from the downstream-pinned release (default protocol 4).
+  - Content made of dict / list / tuple / set / frozenset / str / bytes / bytearray / int / float / complex / bool / None.
+- Now refused unless allowlisted:
+  - Any other type, e.g. `datetime`, `Decimal`, `OrderedDict` or numpy arrays.
+  - Protocol ≤ 2 payloads containing bytes (they use `_codecs.encode`).
+- Only immutable types and builtin functions can be allowlisted (e.g. `datetime.datetime`, `decimal.Decimal`, `collections.OrderedDict`). Send values of Python-defined classes as plain data instead.
+- Any publisher can call an allowlisted type's constructor, so allowlist only types whose construction has no side effects.
+
+**Verification:**
+
+- `tests/security/test_parcel_pickle_safety.py` (54 tests) covers:
+  - a harmless `__reduce__` gadget that must never execute, both directly and via `Agent._on_message`;
+  - refusal of unsafe globals such as `os.system`, `subprocess.Popen`, `builtins.eval` / `exec` / `__import__` / `getattr` and the `__builtin__` spelling;
+  - refusal of allowlisted mutable globals (a Python class, a Python function, a module), including a BUILD that tries to rewrite an allowlisted class;
+  - `bytearray(<int>)` refused;
+  - the protocol 0–2 `__builtin__` spelling normalised for set / frozenset / complex, while `__builtin__.reduce` stays refused;
+  - persistent IDs;
+  - plain-data round-trips for protocols 3–5;
+  - the downstream message shapes;
+  - the allowlist, the `accept_pickle` opt-out and strict `codec` validation;
+  - malformed bodies.
+
+**Known residuals (tracked separately):**
+
+- The size gate before decoding and decoding off the network thread: W-36, issue #34.
+- `version` validation, and per-message tracebacks for undecodable traffic: W-37, issue #15.
+- Unpickling plain data can still be made expensive, for example with deep nesting or huge containers. Deployments that do not need BinaryParcel can set `codec.accept_pickle: False`.
+- Long term, the pickle codec is to be replaced by a versioned envelope (roadmap P2-1).
 
 ---
 
@@ -1191,6 +1244,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-21 — `core/wrapper.py` references undefined `VERSION` symbol
 
+- **Status**: **RESOLVED** (2026-10-10) — `src/agentflow/core/wrapper.py` removed with issue #1 (it was unused, and `BinaryWrapper.unwrap` was a second unrestricted `pickle.loads`); see [R-01 Resolution](#resolution-2026-10-10-issue-1).
 - **Severity**: Low
 - **Category**: Correctness / Dead code
 - **File / Function / Line**: `src/agentflow/core/wrapper.py:32` inside `TextWrapper.wrap`
@@ -1270,7 +1324,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 | ID | Severity | Confidence | Status | Title |
 |---|---|---|---|---|
-| R-01 | Critical | High | Open | `pickle.loads` on wire bytes |
+| R-01 | Critical | High | **Resolved 2026-10-10 (issue #1)** | `pickle.loads` on wire bytes |
 | R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
 | R-03 | High | High | **Resolved 2026-07-27 (RFC-005)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
@@ -1291,7 +1345,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
-| R-21 | Low | High | Open | `wrapper.py` `VERSION` undefined |
+| R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
 | R-22 | Low | High | Open | Stub / broken broker implementations |
 | R-23 | Low | High | Open | README / directory drift |
 | R-24 | Low | Medium | Open | Unexplained sleep in `_on_connect` |

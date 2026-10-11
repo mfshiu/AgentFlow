@@ -13,7 +13,7 @@ from tkinter import N
 from typing import Callable, final, Optional
 import uuid
 
-from agentflow.core.parcel import Parcel
+from agentflow.core.parcel import Parcel, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -26,6 +26,8 @@ from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatc
 import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
+# Issue #1: keys accepted in the optional `codec` config section.
+_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
 
 
 class TopicWaitCollisionError(RuntimeError):
@@ -71,6 +73,9 @@ class Agent(BrokerNotifier):
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
         self.__init_config(agent_config)
+        # Issue #1: inbound decoding policy, validated up front so a bad
+        # `codec` config fails at construction rather than per message.
+        self._codec_options = self.__parse_codec_config()
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
@@ -210,6 +215,57 @@ class Agent(BrokerNotifier):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
         logger.debug(f'self.config: {self.config}')
+
+
+    def __parse_codec_config(self):
+        """Issue #1: the optional `codec` config section.
+
+          accept_pickle          (bool, default True) — False refuses
+                                 BinaryParcel (pickle) payloads entirely.
+          pickle_allowed_globals (list of 'module.name' / 'module:qualname')
+                                 — extra globals BinaryParcel payloads may
+                                 reference, e.g. ['datetime.datetime'].
+                                 Only immutable types and builtin functions
+                                 are honoured; Python-defined classes
+                                 (Enum, dataclass, ...) are refused — send
+                                 such values as plain data instead. Each
+                                 allowed type's constructor is callable by
+                                 any publisher, so list only types whose
+                                 construction has no side effects.
+
+        Read once at construction. Raises TypeError / ValueError on a
+        malformed section, including unknown keys."""
+        codec = self.config.get('codec')
+        if codec is None:
+            codec = {}
+        if not isinstance(codec, dict):
+            raise TypeError(
+                f"Agent config 'codec' must be a dict, got {type(codec).__name__}"
+            )
+        unknown = set(codec) - _CODEC_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent config 'codec' keys {sorted(map(str, unknown))}; "
+                f"expected {sorted(_CODEC_KEYS)}"
+            )
+        accept_pickle = codec.get('accept_pickle', True)
+        if not isinstance(accept_pickle, bool):
+            raise TypeError(
+                f"Agent config 'codec.accept_pickle' must be a bool, "
+                f"got {accept_pickle!r}"
+            )
+        allowed = codec.get('pickle_allowed_globals')
+        if allowed is None:
+            allowed = ()
+        if not isinstance(allowed, (list, tuple, set, frozenset)):
+            raise TypeError(
+                f"Agent config 'codec.pickle_allowed_globals' must be a list "
+                f"of 'module.name' strings, got {allowed!r}"
+            )
+        return {
+            'accept_pickle': accept_pickle,
+            'pickle_allowed_globals': parse_pickle_globals(allowed),
+        }
             
             
     def __create_worker(self):
@@ -946,7 +1002,7 @@ class Agent(BrokerNotifier):
     @final
     def _on_message(self, topic:str, data):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
-        pcl = Parcel.from_payload(data)
+        pcl = Parcel.from_payload(data, **self._codec_options)
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
         # registry under _handlers_lock. is_specific_handler and
