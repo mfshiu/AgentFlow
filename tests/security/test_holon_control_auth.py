@@ -16,7 +16,12 @@ Contracts verified:
     overtakes its parent's `register_parent` (the dispatcher does not
     order messages) runs once that parent registers; such deferred
     terminates are few and expire. `holon.trust_unregistered_parents`
-    restores the old behaviour.
+    restores the old behaviour. With a control secret, an authenticated
+    terminate needs no registration.
+  - `register_parent` counts only on the child's own channel
+    `{agent_id}.to_child.{parent_name}`, where parents send it.
+  - A terminating parent first lets running registration hooks finish,
+    so those children get `register_parent` before its broker stops.
   - `holon.max_children` caps `_children`: registrations beyond it are
     refused without an answer. Unlimited by default (members never
     expire yet, #6).
@@ -24,20 +29,24 @@ Contracts verified:
     register_child, register_parent, parent_online) carry an
     HMAC-SHA256 bound to the topic and a timestamp, and unsigned,
     tampered, replayed-elsewhere or stale ones are dropped. Application
-    subjects are unaffected.
+    subjects are unaffected. Control data is signed as the receiver
+    sees it after decoding; data that cannot be signed is not sent.
+    The secret never reaches the log.
   - Auto-replies never publish into a holon control topic.
   - Reply topics come from `secrets`.
   - A malformed `holon` config section fails at construction.
 """
 
+import logging
 import random
 import threading
+import time
 from unittest import mock
 
 import pytest
 
 from agentflow.core.agent import Agent
-from agentflow.core.parcel import Parcel, TextParcel
+from agentflow.core.parcel import BinaryParcel, Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
@@ -47,6 +56,8 @@ SECRET = 'holon-test-secret-0123456789'
 KEY = SECRET.encode()
 OTHER_SECRET = 'another-holon-secret-987654321'
 SETTLE_S = 0.3
+
+xfail_review = pytest.mark.xfail(strict=True, reason='issue #13: gaps found in review')
 
 
 def _holon_auth():
@@ -146,6 +157,53 @@ def test_trust_unregistered_parents_restores_the_old_behaviour():
     term.assert_called_once()
 
 
+@xfail_review
+def test_register_parent_counts_only_on_our_own_channel():
+    """Otherwise anyone could register as our parent on a broadcast
+    topic, without knowing any agent id, and then terminate us."""
+    child = Agent('leaf.root', {})
+    for topic in ('to_child.root', 'to_child.leaf.root', 'someone-else.to_child.root'):
+        child._handle_parents(topic, _msg('register_parent', 'intruder'))
+    assert child._parents == {}
+    with mock.patch.object(child, '_terminate') as term:
+        child._handle_parents('to_child.root', _msg('terminate', 'intruder'))
+    term.assert_not_called()
+
+
+class SlowRegistrationParent(Agent):
+    def __init__(self, name):
+        super().__init__(name=name, agent_config={})
+        self._Agent__terminate_event = threading.Event()
+
+    def on_register_child(self, child_id, child_info):
+        time.sleep(1.5)
+
+    def terminated(self, timeout=0.0):
+        return self._Agent__terminate_event.wait(timeout)
+
+
+@xfail_review
+def test_parent_terminating_during_a_slow_registration_still_stops_that_child(bus):
+    """A parent answers register_child only after on_register_child
+    returns (#6), and its broker stops about 1 s after _terminate. A
+    child whose registration hook was still running held the terminate
+    back for a register_parent that never came."""
+    parent = SlowRegistrationParent('a')
+    bus.attach(parent)
+    bus.agents.append(parent)
+    bus.connect(parent)
+    child = _agent(bus, 'b.a', {})
+    assert bus.wait_until(lambda: child.agent_id in parent._children)
+
+    def stop_parent_link():
+        if parent.terminated(10):
+            bus.remove(parent)          # its broker stops with it
+    threading.Thread(target=stop_parent_link, daemon=True).start()
+    parent._terminate()
+
+    assert child.terminated(10), 'the child kept running after its parent terminated'
+
+
 # ==========================================================================
 # B. holon.max_children
 # ==========================================================================
@@ -200,6 +258,8 @@ def test_children_are_unlimited_by_default():
     ({'control_secret': SECRET, 'control_max_age': float('inf')}, ValueError),
     ({'control_secret': SECRET, 'control_max_age': '300'}, TypeError),
     ({'control_secret': SECRET, 'control_max_age': True}, TypeError),
+    pytest.param({'control_secret': SECRET, 'control_max_age': 10**400}, ValueError,
+                 marks=xfail_review),
 ])
 def test_malformed_holon_config_fails_at_construction(holon, error):
     with pytest.raises(error):
@@ -250,6 +310,20 @@ def test_signature_survives_parcel_encoding():
     assert ha.verify(KEY, 'to_child.root', decoded, max_age=300) is None
 
 
+@pytest.mark.parametrize('data', [
+    pytest.param({2: 'x', 10: 'y'}, marks=xfail_review),
+    pytest.param({1: 'a', 'b': 2}, marks=xfail_review),
+    (1, (2, 3)),
+    {'k': [1, {3: None}]},
+])
+def test_signed_control_data_survives_both_parcel_encodings(data):
+    ha = _holon_auth()
+    signed = ha.sign(KEY, 'to_child.root', _content('terminate', 'P', data=data))
+    for parcel in (TextParcel(signed), BinaryParcel(signed)):
+        decoded = Parcel.from_payload(parcel.payload()).content
+        assert ha.verify(KEY, 'to_child.root', decoded, max_age=300) is None, type(parcel)
+
+
 @pytest.mark.parametrize('auth', [
     'not a dict',
     {'v': 2, 'ts': 1000000, 'mac': '0' * 64},
@@ -258,6 +332,8 @@ def test_signature_survives_parcel_encoding():
     {'v': 1, 'ts': 1000000, 'mac': 'zz' * 32},
     {'v': 1, 'ts': 1000000, 'mac': 'é' * 64},
     {'v': 1, 'ts': 1000000, 'mac': None},
+    pytest.param({'v': 1, 'ts': 10**400, 'mac': '0' * 64}, marks=xfail_review),
+    pytest.param({'v': 1, 'ts': -10**400, 'mac': '0' * 64}, marks=xfail_review),
 ])
 def test_malformed_auth_is_rejected_without_raising(auth):
     ha = _holon_auth()
@@ -307,6 +383,39 @@ def test_with_a_secret_unsigned_membership_messages_are_ignored():
     with mock.patch.object(child, 'publish') as publish:
         child._handle_parents('to_child.root', _msg('parent_online', 'P'))
     publish.assert_not_called()
+
+
+@xfail_review
+def test_with_a_secret_an_authenticated_terminate_needs_no_registration():
+    """The signature already proves the sender holds the holon's
+    secret, so a terminate is not held back for a register_parent that
+    may never come."""
+    ha = _holon_auth()
+    child = Agent('leaf.root', {'holon': {'control_secret': SECRET}})
+    signed = ha.sign(KEY, 'to_child.root', _content('terminate', 'P'))
+    with mock.patch.object(child, '_terminate') as term:
+        child._handle_parents('to_child.root', TextParcel(signed))
+    term.assert_called_once()
+
+
+@xfail_review
+def test_with_a_secret_unsignable_control_data_is_dropped_without_raising():
+    root = Agent('root', {'holon': {'control_secret': SECRET}})
+    root._children['c0'] = {}
+    with mock.patch.object(root, 'publish') as publish:
+        root._notify_children('terminate', data=float('nan'))
+    publish.assert_not_called()
+
+
+@xfail_review
+def test_the_control_secret_is_never_logged(caplog):
+    caplog.set_level(logging.DEBUG)
+    for secret in (SECRET, KEY):
+        agent = Agent('leaf.root', {'holon': {'control_secret': secret}})
+        with mock.patch.object(agent, '_get_worker'):
+            agent.start()
+    assert 'self.config' in caplog.text         # the config is logged, ...
+    assert SECRET not in caplog.text            # ... but not the secret
 
 
 def test_with_a_secret_application_messages_are_not_authenticated():
