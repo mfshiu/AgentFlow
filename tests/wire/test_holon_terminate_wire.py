@@ -60,7 +60,6 @@ def test_terminate_cascades_through_three_levels_without_echo_storm():
         server.close()
 
 
-@pytest.mark.xfail(strict=True, reason='issue #38: to_child.{name} still reaches same-name replicas and grandchildren')
 def test_replica_terminate_does_not_stop_its_same_name_sibling():
     """Issue #38: two mid-tier replicas named b.a share to_child.b.a.
     Stopping one must not stop the other."""

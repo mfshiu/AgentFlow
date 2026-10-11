@@ -28,9 +28,6 @@ from tests.fakes.fake_bus import FakeBus
 
 SETTLE_S = 0.5
 
-# Remove when issue #38 is fixed (strict: an unexpected pass fails).
-_ISSUE38 = pytest.mark.xfail(strict=True, reason='issue #38: to_child.{name} still reaches same-name replicas and grandchildren')
-
 
 class HolonAgent(Agent):
     def __init__(self, name):
@@ -67,7 +64,6 @@ def _settle():
     FakeBus.wait_until(lambda: False, timeout=SETTLE_S)
 
 
-@_ISSUE38
 def test_replica_terminate_does_not_stop_its_same_name_sibling(bus):
     root = _agent(bus, 'a')
     m1, m2 = _agent(bus, 'b.a'), _agent(bus, 'b.a')
@@ -92,7 +88,6 @@ def test_parent_terminate_still_reaches_every_replica(bus):
     assert m1.terminated(5) and m2.terminated(5)
 
 
-@_ISSUE38
 def test_replica_broadcast_never_reaches_sibling_on_parents_message(bus):
     _agent(bus, 'a')
     m1, m2 = _agent(bus, 'b.a'), _agent(bus, 'b.a')
@@ -106,7 +101,6 @@ def test_replica_broadcast_never_reaches_sibling_on_parents_message(bus):
     assert not [m for m in m2.parents_messages if m[1] == 'hello'], m2.parents_messages
 
 
-@_ISSUE38
 def test_message_addressed_by_name_does_not_reach_grandchildren(bus):
     root = _agent(bus, 'a')
     mid = _agent(bus, 'b.a')
@@ -121,7 +115,6 @@ def test_message_addressed_by_name_does_not_reach_grandchildren(bus):
     assert not [m for m in leaf.parents_messages if m[1] == 'hello'], leaf.parents_messages
 
 
-@_ISSUE38
 def test_parent_messages_carry_the_sender_name(bus):
     root = _agent(bus, 'a')
     mid = _agent(bus, 'b.a')

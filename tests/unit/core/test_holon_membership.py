@@ -181,8 +181,8 @@ def test_parent_online_is_broadcast_on_reconnect(bus):
     bus.connect(parent)
     sent = [Parcel.from_payload(p).content for t, p in parent._broker.published[n0:]
             if t == 'to_child.p']
-    assert {'parent_id': parent.agent_id, 'subject': 'parent_online',
-            'data': None} in sent
+    assert {'parent_id': parent.agent_id, 'parent_name': 'p',
+            'subject': 'parent_online', 'data': None} in sent
 
 
 def test_parent_online_never_reaches_on_parents_message(bus):
@@ -243,8 +243,8 @@ def test_parent_online_is_broadcast_on_connect(bus):
     bus.connect(parent)
     sent = [Parcel.from_payload(p).content for t, p in parent._broker.published
             if t == 'to_child.p']
-    assert {'parent_id': parent.agent_id, 'subject': 'parent_online',
-            'data': None} in sent
+    assert {'parent_id': parent.agent_id, 'parent_name': 'p',
+            'subject': 'parent_online', 'data': None} in sent
 
 
 def test_own_parent_online_echo_does_not_trigger_reregistration(bus):
