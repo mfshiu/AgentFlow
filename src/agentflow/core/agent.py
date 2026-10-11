@@ -975,6 +975,17 @@ class Agent(BrokerNotifier):
             # pass it to on_parents_message.
             return None
 
+        sender_name = parent.get('parent_name')
+        if sender_name is not None and sender_name != self.parent_name:
+            # Issue #38: to_child.{X} also carries messages that are not
+            # from our parent: a same-name replica's broadcast to its own
+            # children (on to_child.{self.name}), or a message addressed
+            # by name to agents named like our parent (on
+            # to_child.{self.parent_name}). Only an agent named like our
+            # parent addresses us. Senders older than #38 omit the name;
+            # their messages are still accepted.
+            return None
+
         if target_children := parent.get('target_children'):
             if not self.agent_id in target_children:
                 return  # Not in the target children.
@@ -1009,6 +1020,7 @@ class Agent(BrokerNotifier):
         if self._children and child_id in self._children:
             self.publish(f'{child_id}.to_child.{self.name}', {
                 'parent_id': self.agent_id,
+                'parent_name': self.name,     # issue #38
                 'subject': subject,
                 'data': data
             })
@@ -1025,6 +1037,7 @@ class Agent(BrokerNotifier):
         topic = f'to_child.{self.name}'
         data_send = {
             'parent_id': self.agent_id,
+            'parent_name': self.name,     # issue #38
             'subject': subject,
             'data': data,
             }
@@ -1072,6 +1085,7 @@ class Agent(BrokerNotifier):
         returns early while _children is still empty."""
         self.publish(f'to_child.{self.name}', {
             'parent_id': self.agent_id,
+            'parent_name': self.name,     # issue #38
             'subject': 'parent_online',
             'data': None,
         })
