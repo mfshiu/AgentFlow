@@ -518,9 +518,9 @@ def test_auto_reply_still_runs_on_consumer_thread(agent_with_fake_broker):
 
     original_publish = broker.publish
 
-    def spy_publish(topic, payload):
+    def spy_publish(topic, payload, **options):
         publish_tids.append(real_threading.get_ident())
-        return original_publish(topic, payload)
+        return original_publish(topic, payload, **options)
 
     broker.publish = spy_publish
     agent.subscribe('T', topic_handler=h)

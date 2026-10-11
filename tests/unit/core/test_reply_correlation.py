@@ -149,7 +149,10 @@ def test_auto_reply_to_an_uncorrelated_request_is_unchanged(agent_and_broker):
     _serve(agent, lambda topic, pcl: 'pong')
     broker.deliver('svc', TextParcel('ping', topic_return='reply/1').payload())
     assert _wait_until(lambda: [p for t, p in broker.publish_calls if t == 'reply/1'])
-    assert [p for t, p in broker.publish_calls if t == 'reply/1'] == [TextParcel('pong').payload()]
+    [raw] = [p for t, p in broker.publish_calls if t == 'reply/1']
+    envelope = json.loads(raw.split(b'|', 1)[1])
+    envelope.pop('message_id', None)        # issue #4: every publish carries one
+    assert envelope == {'version': 3, 'content': 'pong', 'topic_return': None, 'error': None}
 
 
 # ==========================================================================

@@ -6,6 +6,8 @@ import types
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 
 VERSION = 3
+# Issue #4: longest message id a decoder accepts; ids are 32 hex chars.
+MAX_MESSAGE_ID_LENGTH = 128
 
 
 class ParcelDecodeError(TypeError):
@@ -135,8 +137,9 @@ def _require_dict(managed: Any, kind: str) -> Dict[str, Any]:
 class Parcel(ABC):
     # RFC-014: class-level default, so a Parcel built without __init__
     # (a subclass that skips super().__init__, or one pickled by code
-    # older than RFC-014) still encodes.
+    # older than RFC-014) still encodes. Likewise message_id (issue #4).
     correlation_id: Optional[str] = None
+    message_id: Optional[str] = None
 
     def __init__(self, content: Any = None, topic_return: Any = None):
         self.version: int = VERSION
@@ -147,6 +150,9 @@ class Parcel(ABC):
         # request and an auto-reply echoes it, so a reply can be matched
         # to its request.
         self.correlation_id: Optional[str] = None
+        # Issue #4: optional. Agent publish stamps a fresh one on every
+        # message it sends; a receiver handles each id once.
+        self.message_id: Optional[str] = None
 
     def __str__(self) -> str:
         def _convert_content(content: Any) -> Union[str, Dict[str, Any], List[Any]]:
@@ -180,6 +186,8 @@ class Parcel(ABC):
         }
         if self.correlation_id is not None:
             body["correlation_id"] = self.correlation_id
+        if self.message_id is not None:
+            body["message_id"] = self.message_id
 
         # Ensure JSON serializable (final safety net)
         try:
@@ -241,6 +249,8 @@ class Parcel(ABC):
         # only the four keys above and ignore it.
         if self.correlation_id is not None:
             managed["correlation_id"] = self.correlation_id
+        if self.message_id is not None:            # issue #4, same rule
+            managed["message_id"] = self.message_id
         return managed
 
     def _set_managed_data(self, managed_data: Dict[str, Any]) -> None:
@@ -250,6 +260,9 @@ class Parcel(ABC):
         self.error = managed_data.get("error")
         correlation_id = managed_data.get("correlation_id")
         self.correlation_id = correlation_id if isinstance(correlation_id, str) else None
+        message_id = managed_data.get("message_id")
+        self.message_id = (message_id if isinstance(message_id, str)
+                           and len(message_id) <= MAX_MESSAGE_ID_LENGTH else None)
 
     @abstractmethod
     def payload(self) -> bytes:

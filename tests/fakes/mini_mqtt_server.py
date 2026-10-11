@@ -9,6 +9,12 @@ messages, no sessions).
 Failure injection:
   - drop_all()              abruptly closes every client connection
                             (simulates a broker crash / network cut)
+  - drop(index)             abruptly closes one client connection
+  - withhold_puback         when True, QoS 1 PUBLISHes are routed but
+                            not acknowledged (simulates a lost PUBACK)
+  - deliver_on_connect      (topic, payload) pairs sent to every client
+                            right after its CONNACK (simulates the queued
+                            messages of a resumed persistent session)
   - reject_connections      when True, new TCP connections are closed
                             immediately without a CONNACK
                             (simulates a broker that is down)
@@ -55,6 +61,8 @@ class MiniMqttServer:
     def __init__(self, *, connack_rc: int = 0):
         self.connack_rc = connack_rc
         self.reject_connections = False
+        self.withhold_puback = False
+        self.deliver_on_connect: List[Tuple[str, bytes]] = []
 
         self._lock = threading.Lock()
         self._closed = False
@@ -62,6 +70,7 @@ class MiniMqttServer:
         # Observations (read via the snapshot helpers below).
         self.tcp_accepts = 0
         self.connects: List[Tuple[int, Optional[str]]] = []   # (conn index, client id)
+        self.clean_sessions: List[Tuple[int, bool]] = []      # (conn index, clean-session flag)
         self.subscriptions: List[Tuple[int, str]] = []        # (conn index, topic)
         self.publishes: List[Tuple[int, str, bytes]] = []     # (conn index, topic, payload)
 
@@ -111,6 +120,14 @@ class MiniMqttServer:
         """Abruptly close every client connection (RST where possible)."""
         with self._lock:
             conns, self._conns = self._conns, []
+        for c in conns:
+            self._hard_close(c.sock)
+
+    def drop(self, index: int) -> None:
+        """Abruptly close the client connection with this index."""
+        with self._lock:
+            conns = [c for c in self._conns if c.index == index]
+            self._conns = [c for c in self._conns if c.index != index]
         for c in conns:
             self._hard_close(c.sock)
 
@@ -248,12 +265,17 @@ class MiniMqttServer:
         # Variable header: protocol name (str), level (1), flags (1),
         # keepalive (2); payload starts with the client id (str).
         name_len = struct.unpack('!H', body[:2])[0]
+        clean_session = bool(body[2 + name_len + 1] & 0x02)
         pos = 2 + name_len + 4
         cid_len = struct.unpack('!H', body[pos:pos + 2])[0]
         conn.client_id = body[pos + 2:pos + 2 + cid_len].decode('utf-8', 'replace')
         with self._lock:
             self.connects.append((conn.index, conn.client_id))
+            self.clean_sessions.append((conn.index, clean_session))
         conn.send(bytes([0x20, 0x02, 0x00, self.connack_rc]))
+        if self.connack_rc == 0:
+            for topic, payload in list(self.deliver_on_connect):
+                conn.send(self._publish_packet(topic, payload))
 
     def _on_subscribe_packet(self, conn: _Conn, body: bytes) -> None:
         pid = body[:2]
@@ -291,6 +313,6 @@ class MiniMqttServer:
         payload = body[pos:]
         with self._lock:
             self.publishes.append((conn.index, topic, payload))
-        if qos == 1:
+        if qos == 1 and not self.withhold_puback:
             conn.send(b'\x40\x02' + pid)
         self.publish(topic, payload)

@@ -28,9 +28,9 @@ class RedisBroker(MessageBroker):
         logger.info(f"Redis broker is stopping...")
 
 
-    def publish(self, topic:str, payload):
+    def publish(self, topic:str, payload, *, qos: int = 0, retain: bool = False):
         log_publish(logger, topic, payload)
         
     
-    def subscribe(self, topic:str, data_type):
+    def subscribe(self, topic:str, data_type, *, qos: int = 0):
         logger.info(f"topic: {topic}")

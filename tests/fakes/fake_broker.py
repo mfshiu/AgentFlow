@@ -9,7 +9,7 @@ threading.Event-setting spy.
 """
 
 import threading
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from agentflow.core.parcel import Parcel, TextParcel
 
@@ -64,6 +64,8 @@ class FakeBroker:
         self.start_calls: List[dict] = []
         self.stop_calls: int = 0
         self.publish_calls: List[Tuple[str, Any]] = []
+        self.publish_qos: List[int] = []             # parallel to publish_calls
+        self.subscribe_qos: Dict[str, int] = {}      # topic -> last requested QoS
         self.subscribe_calls: List[Tuple[str, Any]] = []
         self.unsubscribe_calls: List[str] = []
         # Behaviour switches.
@@ -86,7 +88,7 @@ class FakeBroker:
     def stop(self):
         self.stop_calls += 1
 
-    def publish(self, topic: str, payload):
+    def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False):
         # Bound check first (thread-safe): once max is reached, silently
         # drop further publishes so bounded reply-loop tests terminate.
         with self._publish_lock:
@@ -94,6 +96,7 @@ class FakeBroker:
                     len(self.publish_calls) >= self.max_publish_dispatches):
                 return
             self.publish_calls.append((topic, payload))
+            self.publish_qos.append(qos)
         if self.publish_exception is not None:
             raise self.publish_exception
         if self._auto_response_active:
@@ -115,8 +118,9 @@ class FakeBroker:
             except Exception:
                 pass
 
-    def subscribe(self, topic: str, data_type):
+    def subscribe(self, topic: str, data_type, *, qos: int = 0):
         self.subscribe_calls.append((topic, data_type))
+        self.subscribe_qos[topic] = qos
         self.subscribed_topics.add(topic)
 
     def unsubscribe(self, topic: str) -> None:

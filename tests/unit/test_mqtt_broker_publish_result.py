@@ -506,13 +506,13 @@ def _make_agent_wired_to(broker):
     return a
 
 
-def test_E41_agent_publish_returns_None_and_swallows_MqttPublishError(broker, fake_client):
-    """RFC-012 §E: fire-and-forget preserved."""
+def test_E41_agent_publish_returns_False_and_swallows_MqttPublishError(broker, fake_client):
+    """RFC-012 §E: fire-and-forget preserved; issue #4 reports False."""
     _prime_connected(broker, fake_client)
     _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
     agent = _make_agent_wired_to(broker)
     result = agent.publish("t", "hello")
-    assert result is None   # swallowed by except Exception
+    assert result is False   # swallowed by except Exception
 
 
 def test_E42_publish_or_raise_propagates_MqttPublishError(broker, fake_client):
@@ -527,7 +527,10 @@ def test_E42_publish_or_raise_propagates_MqttPublishError(broker, fake_client):
 def test_E43_publish_sync_rc_failure_fast_fails_within_50ms(broker, fake_client):
     """INVERTED: pre-RFC-012 waited full timeout."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     t0 = time.monotonic()
     with pytest.raises(MqttPublishError):
@@ -567,12 +570,13 @@ def test_E45_rc_failure_and_Exception_both_fast_fail_uniformly(broker, fake_clie
     with pytest.raises(ConnectionError):
         agent._publish_or_raise("t", "x")
 
-    # Both cases: Agent.publish silently swallows (fire-and-forget).
+    # Both cases: Agent.publish swallows (fire-and-forget) and, since
+    # issue #4, reports False.
     fake_client.publish.side_effect = None
     _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
     fake_client.publish.side_effect = ConnectionError("nope")
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
 
 
 def test_E46_agent_publish_source_still_fire_and_forget_shape():
@@ -589,7 +593,10 @@ def test_E47_publish_sync_finally_registry_cleanup_still_runs_on_MqttPublishErro
     """RFC-006/007 waiter cleanup MUST run even when _publish_or_raise
     raises MqttPublishError."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     handlers_before = dict(agent._Agent__topic_handlers)
     try:
@@ -606,7 +613,10 @@ def test_E48_publish_sync_finally_broker_unsubscribe_still_called_on_MqttPublish
 ):
     """RFC-005 broker.unsubscribe still called in finally."""
     _prime_connected(broker, fake_client)
-    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_NO_CONN))
+    # publish_sync sends at QoS 1 (issue #4), where paho keeps a message
+    # it got with MQTT_ERR_NO_CONN and sends it after the reconnect; a
+    # full outgoing queue is a rejection at any QoS.
+    _configure_paho_return(fake_client, _FakeMessageInfo(rc=MQTT_ERR_QUEUE_SIZE))
     agent = _make_agent_wired_to(broker)
     fake_client.unsubscribe.reset_mock()
     try:
@@ -631,13 +641,13 @@ def test_E49_publish_sync_rc_failure_never_enters_event_wait(broker, fake_client
     assert elapsed < 0.5
 
 
-def test_E50_agent_publish_from_STOPPED_broker_silent(broker, fake_client):
+def test_E50_agent_publish_from_STOPPED_broker_reports_False(broker, fake_client):
     """State-gate MqttPublishError caught by Agent.publish's
-    fire-and-forget; caller sees None."""
+    fire-and-forget; caller sees False (issue #4)."""
     _prime_connected(broker, fake_client)
     broker.stop(graceful_timeout_s=2.0)
     agent = _make_agent_wired_to(broker)
-    assert agent.publish("t", "x") is None
+    assert agent.publish("t", "x") is False
 
 
 # ===========================================================================
@@ -803,8 +813,17 @@ def test_G70_MqttBroker_publish_still_no_return_annotation_success_type_paho_dep
 
 
 def test_G71_message_broker_ABC_signature_unchanged(broker):
+    """The positional parameters are unchanged. Issue #4 added the
+    keyword-only `qos` and `retain`, with defaults, so existing callers
+    keep working. Overrides must accept the new keywords: Agent always
+    passes `qos`, even 0 (the brokers are a closed set, BrokerMaker)."""
     sig = inspect.signature(MessageBroker.publish)
-    assert list(sig.parameters) == ['self', 'topic', 'payload']
+    positional = [n for n, p in sig.parameters.items()
+                  if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+    assert positional == ['self', 'topic', 'payload']
+    keyword_only = {n: p.default for n, p in sig.parameters.items()
+                    if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert keyword_only == {'qos': 0, 'retain': False}
 
 
 def test_G72_empty_broker_publish_returns_None_unchanged():
