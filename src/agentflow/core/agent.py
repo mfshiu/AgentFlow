@@ -403,6 +403,12 @@ class Agent(BrokerNotifier):
                 f"Agent config 'holon.control_max_age' must be a number of "
                 f"seconds, got {max_age!r}"
             )
+        try:
+            max_age = float(max_age)
+        except OverflowError:
+            raise ValueError(
+                f"Agent config 'holon.control_max_age' is out of range"
+            ) from None
         if not 0 < max_age < math.inf:
             raise ValueError(
                 f"Agent config 'holon.control_max_age' must be positive and "
@@ -428,7 +434,7 @@ class Agent(BrokerNotifier):
                 f"Agent config 'holon.trust_unregistered_parents' must be a "
                 f"bool, got {trust!r}"
             )
-        return _HolonOptions(secret, float(max_age), max_children, trust)
+        return _HolonOptions(secret, max_age, max_children, trust)
             
             
     def __create_worker(self):
@@ -1297,7 +1303,15 @@ class Agent(BrokerNotifier):
         is a control message and holon.control_secret is set."""
         key = self._holon_options.control_key
         if key is not None and holon_auth.is_control(message):
-            message = holon_auth.sign(key, topic, message)
+            try:
+                message = holon_auth.sign(key, topic, message)
+            except (TypeError, ValueError, RecursionError) as ex:
+                # Never raise, like publish. Unsigned, it would be
+                # dropped by every receiver anyway.
+                logger.error(self.M(
+                    f"Not sending {message.get('subject')!r} to {topic!r}: "
+                    f"its data cannot be signed ({ex})."))
+                return None
         return self.publish(topic, message)
     
     

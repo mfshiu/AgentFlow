@@ -35,6 +35,7 @@ AUTH_FIELD = 'auth'
 _VERSION = 1
 _DOMAIN = 'agentflow.holon.control'
 _MAC_RE = re.compile(r'[0-9a-f]{64}')
+_MAX_TS = 2 ** 53       # milliseconds; far beyond any real clock
 
 
 def is_control(message: dict) -> bool:
@@ -44,6 +45,10 @@ def is_control(message: dict) -> bool:
 
 def _canonical(topic: str, ts: int, message: dict) -> bytes:
     body = {k: v for k, v in message.items() if k != AUTH_FIELD}
+    # Sign what the receiver sees: a TextParcel round trip turns tuples
+    # into lists and non-str keys into str. Normalising on both sides
+    # also covers BinaryParcel payloads, which keep the original types.
+    body = json.loads(json.dumps(body, allow_nan=False))
     return json.dumps(
         {'domain': _DOMAIN, 'v': _VERSION, 'topic': topic, 'ts': ts, 'message': body},
         sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False,
@@ -56,7 +61,8 @@ def _mac(key: bytes, topic: str, ts: int, message: dict) -> str:
 
 def sign(key: bytes, topic: str, message: dict, now: Optional[float] = None) -> dict:
     """Return a copy of `message` carrying an `auth` field for `topic`.
-    Raises TypeError / ValueError if the message is not JSON-encodable."""
+    Raises TypeError / ValueError / RecursionError if the message cannot
+    be encoded as JSON (e.g. bytes or NaN in its data)."""
     ts = int((time.time() if now is None else now) * 1000)
     signed = dict(message)
     signed[AUTH_FIELD] = {'v': _VERSION, 'ts': ts, 'mac': _mac(key, topic, ts, message)}
@@ -74,7 +80,8 @@ def verify(key: bytes, topic: str, message: dict, max_age: float,
     if auth.get('v') != _VERSION:
         return 'unsupported auth version'
     ts, mac = auth.get('ts'), auth.get('mac')
-    if type(ts) is not int or not isinstance(mac, str) or not _MAC_RE.fullmatch(mac):
+    if (type(ts) is not int or not 0 <= ts <= _MAX_TS
+            or not isinstance(mac, str) or not _MAC_RE.fullmatch(mac)):
         return 'malformed auth'
     now_ms = (time.time() if now is None else now) * 1000
     if abs(now_ms - ts) > max_age * 1000:

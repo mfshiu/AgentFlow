@@ -57,8 +57,6 @@ KEY = SECRET.encode()
 OTHER_SECRET = 'another-holon-secret-987654321'
 SETTLE_S = 0.3
 
-xfail_review = pytest.mark.xfail(strict=True, reason='issue #13: gaps found in review')
-
 
 def _holon_auth():
     from agentflow.core import holon_auth   # added by the issue #13 fix
@@ -256,8 +254,7 @@ def test_children_are_unlimited_by_default():
     ({'control_secret': SECRET, 'control_max_age': float('inf')}, ValueError),
     ({'control_secret': SECRET, 'control_max_age': '300'}, TypeError),
     ({'control_secret': SECRET, 'control_max_age': True}, TypeError),
-    pytest.param({'control_secret': SECRET, 'control_max_age': 10**400}, ValueError,
-                 marks=xfail_review),
+    ({'control_secret': SECRET, 'control_max_age': 10**400}, ValueError),
 ])
 def test_malformed_holon_config_fails_at_construction(holon, error):
     with pytest.raises(error):
@@ -309,8 +306,8 @@ def test_signature_survives_parcel_encoding():
 
 
 @pytest.mark.parametrize('data', [
-    pytest.param({2: 'x', 10: 'y'}, marks=xfail_review),
-    pytest.param({1: 'a', 'b': 2}, marks=xfail_review),
+    {2: 'x', 10: 'y'},
+    {1: 'a', 'b': 2},
     (1, (2, 3)),
     {'k': [1, {3: None}]},
 ])
@@ -330,8 +327,8 @@ def test_signed_control_data_survives_both_parcel_encodings(data):
     {'v': 1, 'ts': 1000000, 'mac': 'zz' * 32},
     {'v': 1, 'ts': 1000000, 'mac': 'é' * 64},
     {'v': 1, 'ts': 1000000, 'mac': None},
-    pytest.param({'v': 1, 'ts': 10**400, 'mac': '0' * 64}, marks=xfail_review),
-    pytest.param({'v': 1, 'ts': -10**400, 'mac': '0' * 64}, marks=xfail_review),
+    {'v': 1, 'ts': 10**400, 'mac': '0' * 64},
+    {'v': 1, 'ts': -10**400, 'mac': '0' * 64},
 ])
 def test_malformed_auth_is_rejected_without_raising(auth):
     ha = _holon_auth()
@@ -344,7 +341,7 @@ def test_content_that_cannot_be_encoded_canonically_is_rejected():
     deep = []
     for _ in range(100000):
         deep = [deep]
-    for data in ({1: 'a', 'b': 2}, float('nan'), deep):
+    for data in (b'raw bytes', float('nan'), deep):
         message = {**_content('terminate', 'P'), 'data': data,
                    'auth': {'v': 1, 'ts': 1000000, 'mac': '0' * 64}}
         assert ha.verify(KEY, 'to_child.root', message, max_age=300, now=1000.0) is not None
@@ -395,7 +392,6 @@ def test_with_a_secret_an_authenticated_terminate_needs_no_registration():
     term.assert_called_once()
 
 
-@xfail_review
 def test_with_a_secret_unsignable_control_data_is_dropped_without_raising():
     root = Agent('root', {'holon': {'control_secret': SECRET}})
     root._children['c0'] = {}
