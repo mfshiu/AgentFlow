@@ -803,8 +803,16 @@ def test_G70_MqttBroker_publish_still_no_return_annotation_success_type_paho_dep
 
 
 def test_G71_message_broker_ABC_signature_unchanged(broker):
+    """The positional parameters are unchanged. Issue #4 added the
+    keyword-only `qos` and `retain`, with defaults, so existing calls
+    and overrides keep working."""
     sig = inspect.signature(MessageBroker.publish)
-    assert list(sig.parameters) == ['self', 'topic', 'payload']
+    positional = [n for n, p in sig.parameters.items()
+                  if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+    assert positional == ['self', 'topic', 'payload']
+    keyword_only = {n: p.default for n, p in sig.parameters.items()
+                    if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert keyword_only == {'qos': 0, 'retain': False}
 
 
 def test_G72_empty_broker_publish_returns_None_unchanged():

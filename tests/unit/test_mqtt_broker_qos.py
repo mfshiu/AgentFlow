@@ -22,7 +22,6 @@ from agentflow.broker.mqtt_broker import MqttBroker
 from agentflow.broker.redis_broker import RedisBroker
 from agentflow.broker.ros_broker import RosBroker
 
-xfail_4 = pytest.mark.xfail(strict=True, reason='issue #4: QoS 0 only')
 
 
 class _PublishInfo:
@@ -54,14 +53,12 @@ def test_defaults_keep_the_paho_call_shape(broker, fake_client):
     fake_client.subscribe.assert_called_once_with(topic='s')
 
 
-@xfail_4
 def test_publish_hands_qos_and_retain_to_paho(broker, fake_client):
     _fire_connect(broker, fake_client)
     broker.publish('t', b'x', qos=1, retain=True)
     fake_client.publish.assert_called_once_with(topic='t', payload=b'x', qos=1, retain=True)
 
 
-@xfail_4
 def test_subscribe_hands_qos_to_paho_and_reconnect_keeps_it(broker, fake_client):
     _fire_connect(broker, fake_client)
     broker.subscribe('A', 'str', qos=1)
@@ -78,7 +75,6 @@ def test_subscribe_hands_qos_to_paho_and_reconnect_keeps_it(broker, fake_client)
     assert resubscribed == {'A': 1, 'B': 0}
 
 
-@xfail_4
 @pytest.mark.parametrize('qos', [-1, 3, True, '1', 1.0, None])
 def test_invalid_qos_is_refused_before_paho(broker, fake_client, qos):
     _fire_connect(broker, fake_client)
@@ -90,7 +86,6 @@ def test_invalid_qos_is_refused_before_paho(broker, fake_client, qos):
     fake_client.subscribe.assert_not_called()
 
 
-@xfail_4
 @pytest.mark.parametrize('broker_class', [MqttBroker, EmptyBroker, RedisBroker, RosBroker])
 def test_every_built_in_broker_accepts_the_qos_keywords(broker_class):
     publish = inspect.signature(broker_class.publish).parameters

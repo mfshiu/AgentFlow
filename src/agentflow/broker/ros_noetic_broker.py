@@ -51,7 +51,7 @@ class RosNoeticBroker(MessageBroker):
         return publisher
 
 
-    def publish(self, topic:str, payload):
+    def publish(self, topic:str, payload, *, qos: int = 0, retain: bool = False):
         logger.info(f"topic: {topic}, payload: {payload}")
         
         publisher = self._get_publisher(topic, payload)
@@ -67,7 +67,7 @@ class RosNoeticBroker(MessageBroker):
         return callback
 
 
-    def subscribe(self, topic:str, data_type):
+    def subscribe(self, topic:str, data_type, *, qos: int = 0):
         logger.info(f"topic: {topic}, , data_type: {data_type}")
 
         if "str" == data_type:

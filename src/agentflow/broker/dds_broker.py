@@ -60,9 +60,9 @@ class DdsBroker(MessageBroker):
         self._client.loop_stop()
 
 
-    def publish(self, topic:str, payload):
+    def publish(self, topic:str, payload, *, qos: int = 0, retain: bool = False):
         return self._client.publish(topic=topic, payload=payload)
         
     
-    def subscribe(self, topic:str, data_type):
+    def subscribe(self, topic:str, data_type, *, qos: int = 0):
         return self._client.subscribe(topic=topic)
