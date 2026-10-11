@@ -13,9 +13,7 @@ import pytest
 from agentflow.core.agent import Agent
 from tests.fakes.mini_mqtt_server import MiniMqttServer
 
-# Remove the xfail when issue #6 is fixed (strict: an unexpected pass fails).
-pytestmark = [pytest.mark.wire,
-              pytest.mark.xfail(strict=True, reason='issue #6: holon membership does not converge yet')]
+pytestmark = pytest.mark.wire
 
 
 class WireHolonAgent(Agent):

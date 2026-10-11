@@ -35,9 +35,6 @@ from tests.fakes.fake_bus import FakeBus
 
 SETTLE_S = 0.3
 
-# Remove when issue #6 is fixed (strict: an unexpected pass fails).
-_ISSUE6 = pytest.mark.xfail(strict=True, reason='issue #6: holon membership does not converge yet')
-
 
 class HolonAgent(Agent):
     def __init__(self, name):
@@ -106,7 +103,6 @@ def test_parent_first_then_child_registers_both_sides(bus):
     assert set(child._parents) == {parent.agent_id}
 
 
-@_ISSUE6
 def test_child_first_then_parent_converges(bus):
     parent, child = _agent(bus, 'p'), _agent(bus, 'k.p')
     bus.connect(child)          # its register_child reaches nobody
@@ -116,7 +112,6 @@ def test_child_first_then_parent_converges(bus):
     assert set(child._parents) == {parent.agent_id}
 
 
-@_ISSUE6
 def test_child_reconnect_reregisters_when_it_missed_the_parent(bus):
     parent, child = _agent(bus, 'p'), _agent(bus, 'k.p')
     bus.connect(child)
@@ -127,7 +122,6 @@ def test_child_reconnect_reregisters_when_it_missed_the_parent(bus):
         'a reconnecting child did not re-register'
 
 
-@_ISSUE6
 def test_parent_restart_child_registers_with_new_parent(bus):
     old, child = _agent(bus, 'p'), _agent(bus, 'k.p')
     bus.connect(old)
@@ -159,7 +153,6 @@ def test_repeated_registration_fires_hooks_once(bus):
     assert child.registered_parents == [parent.agent_id]
 
 
-@_ISSUE6
 def test_terminate_reaches_child_that_started_first(bus):
     parent, child = _agent(bus, 'p'), _agent(bus, 'k.p')
     bus.connect(child)
@@ -169,7 +162,6 @@ def test_terminate_reaches_child_that_started_first(bus):
     assert bus.wait_until(lambda: child.terminate_calls >= 1)
 
 
-@_ISSUE6
 def test_parent_reconnect_picks_up_child_started_while_it_was_offline(bus):
     parent, child = _agent(bus, 'p'), _agent(bus, 'k.p')
     bus.connect(parent)
@@ -181,7 +173,6 @@ def test_parent_reconnect_picks_up_child_started_while_it_was_offline(bus):
     assert bus.wait_until(lambda: child.terminate_calls >= 1)
 
 
-@_ISSUE6
 def test_parent_online_is_broadcast_on_reconnect(bus):
     parent = _agent(bus, 'p')
     bus.connect(parent)
@@ -194,7 +185,6 @@ def test_parent_online_is_broadcast_on_reconnect(bus):
             'data': None} in sent
 
 
-@_ISSUE6
 def test_parent_online_never_reaches_on_parents_message(bus):
     # parent_online is internal: neither our own echo, nor a same-name
     # replica's broadcast, nor a real parent's announcement reaches the
@@ -212,7 +202,6 @@ def test_parent_online_never_reaches_on_parents_message(bus):
         assert not [m for m in a.parents_messages if m[1] == 'parent_online'],             a.parents_messages
 
 
-@_ISSUE6
 def test_reregistration_is_sent_only_to_the_announcing_parent(bus):
     # Two replicas of parent 'p': a child's answer to one replica's
     # parent_online must not be delivered to the other replica.
@@ -249,7 +238,6 @@ def test_register_parent_is_not_sent_before_the_first_hook_returns(bus):
     assert child.parent_registered_at >= parent.child_hook_done_at,         'register_parent overtook the first on_register_child'
 
 
-@_ISSUE6
 def test_parent_online_is_broadcast_on_connect(bus):
     parent = _agent(bus, 'p')
     bus.connect(parent)
