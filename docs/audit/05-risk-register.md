@@ -208,8 +208,8 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 - **R-01** — `BinaryParcel.pickle.loads` on wire bytes.
 - **Custom retry / backoff policy**: `reconnect_on_failure=False` is unchanged. Recovery only runs when paho drives an `_on_connect` callback; AgentFlow does not itself reconnect.
 - **Offline publish queue**: `publish()` while disconnected still calls `client.publish` (paho decides).
-- **Stable `client_id`** management: paho auto-generates.
-- **Persistent MQTT session** (`clean_start=False`): not enabled — RFC-005 §Appendix B lists this as a future fast-path optimisation.
+- **Stable `client_id`** management: ~~paho auto-generates~~. *Corrected 2026-10-12 (#17): paho 2.x generates an id at construction only for MQTT 3.1; with MQTT 3.1.1 it sent a zero-length id, and replaced it only when a broker refused it (CONNACK 2) and reconnect_on_failure was on. Resolved by #17: the `client_id` option (default `'{name}-{agent_id:.12}'`).*
+- **Persistent MQTT session** (`clean_start=False`): not enabled — RFC-005 §Appendix B lists this as a future fast-path optimisation. *Available since #17 as the opt-in `clean_session: false` option; see RFC-015 §6.*
 - **Broker-cluster failover**: not implemented.
 - **Connection generation / epoch counter** (RFC-005 Option E): not implemented; `_ever_connected` boolean suffices for first-vs-reconnect classification.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process `recovery_metrics()` snapshot.
@@ -1549,7 +1549,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 **Verification**: `tests/unit/test_mqtt_broker_qos.py`, `tests/unit/core/test_delivery_guarantees.py`.
 
 **Still open**:
-- Persistent sessions and stable client ids (#17): with a clean session the broker keeps nothing for a disconnected subscriber.
+- Persistent sessions and stable client ids: available since #17 (RFC-015 §6), opt-in. With the default clean session the broker still keeps nothing for a disconnected subscriber.
 - Bounding the outbound buffer (#35).
 - Decode-failure observability (#15).
 - Duplicates beyond the window, or from senders without ids, still reach handlers, which should stay idempotent.

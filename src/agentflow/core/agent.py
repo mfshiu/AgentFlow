@@ -801,6 +801,13 @@ class Agent(BrokerNotifier):
                 logger.info(self.M("Broker started successfully."))
                 return True
             except (TimeoutError, ConnectionError) as e:
+                if getattr(e, 'retryable', True) is False:
+                    # Issue #17: the broker refused the connection for a
+                    # reason the same configuration cannot overcome
+                    # (client id rejected, bad credentials, not
+                    # authorised): retrying only delays the failure.
+                    logger.error(self.M(f"Broker refused the connection; not retrying: {e}"))
+                    return False
                 retry += 1
                 logger.error(self.M(f"Broker start failed ({retry}/{max_retries}): {e}"))
                 if retry >= max_retries: break

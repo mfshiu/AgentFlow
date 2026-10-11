@@ -1,6 +1,6 @@
-from paho.mqtt.client import Client
+from paho.mqtt.client import Client, MQTTv311
 from paho.mqtt.enums import CallbackAPIVersion
-import logging, math, os, socket, threading, time
+import logging, math, os, socket, threading, time, uuid
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -104,6 +104,26 @@ class MqttPublishError(RuntimeError):
         super().__init__("MQTT publish failed: " + ", ".join(parts))
 
 
+# Issue #17: CONNACK refusals that connecting again with the same
+# configuration cannot fix. MQTT 3.1.1 return codes 1 / 2 / 4 / 5 and
+# the MQTT 5 reason codes paho 2 reports for them (132 / 133 / 134 / 135),
+# plus MQTT 5's banned (138) and bad authentication method (140).
+_NON_RETRYABLE_CONNACK = frozenset({1, 2, 4, 5, 132, 133, 134, 135, 138, 140})
+
+
+class MqttConnectRefused(ConnectionError):
+    """Issue #17: the broker refused the connection (CONNACK reason
+    code != 0). `retryable` is False when connecting again with the same
+    configuration cannot succeed (unsupported protocol version, client
+    id rejected, bad user name or password, not authorised), so that
+    the Agent gives up at once instead of retrying."""
+
+    def __init__(self, message: str, reason_code: Optional[int]):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.retryable = reason_code not in _NON_RETRYABLE_CONNACK
+
+
 class MqttBroker(MessageBroker):
     """RFC-010 bounded-shutdown MqttBroker.
 
@@ -157,6 +177,10 @@ class MqttBroker(MessageBroker):
     _DEFAULT_RECONNECT_MIN_DELAY_S = 1
     _DEFAULT_RECONNECT_MAX_DELAY_S = 30
     _DEFAULT_CONNECT_TIMEOUT_S = 2.0
+    # Issue #17: the client id template's default, and MQTT's limit on a
+    # UTF-8 string.
+    _DEFAULT_CLIENT_ID = "{name}-{agent_id:.12}"
+    _MAX_CLIENT_ID_BYTES = 65535
 
     def __init__(self, notifier: BrokerNotifier, *, wait: bool = True, timeout: float = 10.0):
         """建立 MQTT Broker 包裝類別
@@ -164,8 +188,12 @@ class MqttBroker(MessageBroker):
         :param wait: 是否等待連線完成才返回 start()
         :param timeout: 最長等待秒數
         """
+        # Replaced in start() once the options (client id, clean
+        # session) are known (issue #17); this one serves only calls
+        # made before start().
         self._client = Client(callback_api_version=CallbackAPIVersion.VERSION2,
                               reconnect_on_failure=True)
+        self.client_id = ""
         # Issue #2: set from the `reconnect` start() option; read by
         # _on_disconnect on the paho network thread.
         self._reconnect_enabled = True
@@ -177,6 +205,14 @@ class MqttBroker(MessageBroker):
         self._connected_evt = threading.Event()
         self._connect_ok = False
         self._connect_err = None
+        # Issue #17: the CONNACK reason code of the last refusal.
+        self._connect_rc: Optional[int] = None
+        # Issue #17: what start() waits for. Set by _on_connect on every
+        # CONNACK, accepted or refused, and reset only when start()
+        # begins. _on_disconnect clears _connected_evt and _connect_ok,
+        # so a refusal followed at once by its disconnect went unseen.
+        self._connack_evt = threading.Event()
+        self._connack_ok = False
 
         # 等待連線的行為設定
         self._wait = wait
@@ -290,6 +326,7 @@ class MqttBroker(MessageBroker):
                     skip = True
                 else:
                     self._connect_ok = True
+                    self._connack_ok = True
                     self._connect_err = None
                     is_first = not self._ever_connected
                     self._ever_connected = True
@@ -309,7 +346,8 @@ class MqttBroker(MessageBroker):
                 )
                 return
             try:
-                logger.info(f"MQTT broker connected: {self.host}:{self.port}, keepalive={self.keepalive}")
+                logger.info(f"MQTT broker connected: {self.host}:{self.port}, "
+                            f"keepalive={self.keepalive}, client_id={self.client_id!r}")
                 if snapshot:
                     self._recover_subscriptions(snapshot)
                 try:
@@ -324,6 +362,7 @@ class MqttBroker(MessageBroker):
                     )
             finally:
                 self._connected_evt.set()
+                self._connack_evt.set()
         else:
             # Failure branch also fences post-stop.
             with self._state_lock:
@@ -333,11 +372,18 @@ class MqttBroker(MessageBroker):
                     )
                     return
                 self._connect_ok = False
+                self._connack_ok = False
                 self._connected = False
             name = getattr(reasonCode, "getName", lambda: str(reasonCode))()
-            self._connect_err = f"{reasonCode} ({name})"
+            try:
+                # paho 2 reports an MQTT 5 ReasonCode even for 3.1.1.
+                self._connect_rc = int(getattr(reasonCode, "value", reasonCode))
+            except (TypeError, ValueError):
+                self._connect_rc = None
+            self._connect_err = f"{self._connect_rc} ({name})"
             logger.error(f"MQTT connection failed: {self._connect_err}")
             self._connected_evt.set()
+            self._connack_evt.set()
 
     def _recover_subscriptions(self, snapshot: Dict[str, Tuple[Any, int]]) -> None:
         """RFC-005 §6.3 recovery loop. Iterates the snapshot OUTSIDE
@@ -484,6 +530,10 @@ class MqttBroker(MessageBroker):
 
         is_waiter = False
 
+        # Issue #17: parsed before any state change, so that a malformed
+        # option raises ValueError and leaves the broker NEW.
+        client_id, clean_session = self._session_options(options)
+
         # -- Phase 0: linearization under _state_lock.
         # RFC-011 modification 5: check state BEFORE modifying flags.
         # Only reset lifecycle flags in the NEW branch.
@@ -496,7 +546,21 @@ class MqttBroker(MessageBroker):
                 self._connected = False
                 self._connect_ok = False
                 self._connect_err = None
+                self._connect_rc = None
+                # Issue #17: the paho Client is built once per broker,
+                # here in the NEW -> STARTING transition, now that its
+                # client id and clean session are known. Construction
+                # does no I/O. A later start() raises below (RFC-011
+                # §7.5) and builds nothing.
+                self._client = Client(
+                    callback_api_version=CallbackAPIVersion.VERSION2,
+                    client_id=client_id, clean_session=clean_session,
+                    protocol=MQTTv311, reconnect_on_failure=True,
+                )
+                self.client_id = client_id
                 self._connected_evt.clear()
+                self._connack_evt.clear()
+                self._connack_ok = False
                 self._start_complete_event.clear()
                 self._start_generation += 1
                 self._last_start_result = False
@@ -601,6 +665,10 @@ class MqttBroker(MessageBroker):
                 self._transition_to_start_failure(
                     WorkerState.START_TIMEOUT, exc,
                 )
+                if not helper.is_alive():
+                    # Issue #17: the helper finished just now and may
+                    # have missed the transition; roll back here.
+                    self._rollback_after_start_timeout()
                 raise exc
 
             # Helper finished. Check outcome.
@@ -650,7 +718,7 @@ class MqttBroker(MessageBroker):
 
             # wait=True: await callback within the SAME remaining budget.
             remaining = max(0.0, deadline - time.monotonic())
-            if not self._connected_evt.wait(remaining):
+            if not self._connack_evt.wait(remaining):
                 # Callback wait timeout. Startup helper has finished;
                 # safe to run rollback.
                 exc = TimeoutError(
@@ -664,9 +732,10 @@ class MqttBroker(MessageBroker):
                 self._run_client_shutdown_primitive_and_cache()
                 raise exc
 
-            if not self._connect_ok:
-                exc = ConnectionError(
-                    f"MQTT connect failed: {self._connect_err}"
+            if not self._connack_ok:
+                exc = MqttConnectRefused(
+                    f"MQTT connect failed: {self._connect_err}",
+                    self._connect_rc,
                 )
                 self._transition_to_start_failure(
                     WorkerState.START_FAILED, exc,
@@ -689,6 +758,51 @@ class MqttBroker(MessageBroker):
             # ALWAYS release concurrent waiters, even if we raised.
             self._start_complete_event.set()
 
+
+    def _client_identity(self) -> Dict[str, str]:
+        """Issue #17: {name} and {agent_id} for the client id template,
+        taken from the notifier (the Agent)."""
+        name = getattr(self._notifier, "name", None)
+        agent_id = getattr(self._notifier, "agent_id", None)
+        return {
+            "name": name if isinstance(name, str) and name else "agentflow",
+            "agent_id": agent_id if isinstance(agent_id, str) and agent_id else uuid.uuid4().hex,
+        }
+
+    def _session_options(self, options: dict) -> Tuple[str, bool]:
+        """Issue #17: the MQTT client id and clean-session flag.
+
+          client_id      template formatted with {name} and {agent_id}
+                         (the Agent's); default '{name}-{agent_id:.12}',
+                         unique per Agent instance. A fixed id must be
+                         unique across all clients of the broker: MQTT
+                         disconnects the older of two connections that
+                         share an id. Write literal braces as {{ }}.
+          clean_session  default True. False keeps the broker-side
+                         session (subscriptions, and QoS >= 1 messages
+                         that arrive while disconnected) across
+                         reconnects with the same client id; across
+                         process restarts only if the id is stable,
+                         e.g. '{name}'.
+
+        Raises ValueError on a malformed value."""
+        template = options.get("client_id", self._DEFAULT_CLIENT_ID)
+        if not isinstance(template, str):
+            raise ValueError(f"MQTT option 'client_id' must be a str, got {template!r}")
+        try:
+            client_id = template.format(**self._client_identity())
+        except (KeyError, IndexError, ValueError, AttributeError) as ex:
+            raise ValueError(
+                f"MQTT option 'client_id' {template!r} is not a valid template "
+                f"(placeholders: {{name}}, {{agent_id}}): {ex!r}") from None
+        if not client_id or len(client_id.encode("utf-8")) > self._MAX_CLIENT_ID_BYTES:
+            raise ValueError(
+                f"MQTT client id must be 1 to {self._MAX_CLIENT_ID_BYTES} bytes, "
+                f"got {len(client_id.encode('utf-8'))}")
+        clean_session = options.get("clean_session", True)
+        if isinstance(clean_session, str):
+            clean_session = clean_session.strip().lower() not in ("false", "0", "no", "off")
+        return client_id, bool(clean_session)
 
     @classmethod
     def _reconnect_delays(cls, options: dict):
@@ -804,6 +918,34 @@ class MqttBroker(MessageBroker):
                 pass
         # Reached iff no BaseException propagated.
         self._start_helper_completed_normally = True
+        # Issue #17: if start() gave up while connect() was blocked
+        # (START_TIMEOUT), it deferred the rollback to a stop() that the
+        # Agent never calls: it retries with a fresh broker. Left
+        # running, this client would reconnect under the same client id
+        # as its replacement, and the two would keep taking over each
+        # other's session. Roll it back now.
+        with self._state_lock:
+            timed_out = self._state == WorkerState.START_TIMEOUT
+        if timed_out:
+            self._rollback_after_start_timeout()
+
+
+    def _rollback_after_start_timeout(self) -> None:
+        """Issue #17: run the client-shutdown primitive once a start
+        that ended in START_TIMEOUT has no helper left touching the
+        client. Called from the startup helper itself when it finishes,
+        or from start() if the helper finished just as start() gave up.
+        At most once, serialised with stop()'s START_TIMEOUT recovery by
+        `_start_timeout_recovery_lock` and the cached cleanup result."""
+        if not self._start_timeout_recovery_lock.acquire(timeout=5.0):
+            return
+        try:
+            with self._state_lock:
+                if self._last_start_cleanup_result is not None:
+                    return
+            self._run_client_shutdown_primitive_and_cache()
+        finally:
+            self._start_timeout_recovery_lock.release()
 
 
     def _run_client_shutdown_primitive(self, *,
@@ -908,6 +1050,29 @@ class MqttBroker(MessageBroker):
         if cached is not None:
             return cached
 
+        # Bounded-wait for the startup helper BEFORE taking the lock.
+        # RFC-011 modification 2: MUST NOT run the primitive while the
+        # startup helper is still alive (would race on same paho
+        # client). Since issue #17 the helper takes the lock itself to
+        # roll back once it finishes, so joining it while holding the
+        # lock would stall both until the join timed out.
+        startup_helper = self._start_helper_thread
+        if startup_helper is not None and startup_helper.is_alive():
+            startup_helper.join(graceful_timeout_s)
+            if startup_helper.is_alive():
+                try:
+                    logger.warning(
+                        f"MqttBroker.stop from START_TIMEOUT: "
+                        f"startup helper still alive after "
+                        f"{graceful_timeout_s:.1f}s bounded wait; "
+                        f"deferring cleanup (would race on paho client)"
+                    )
+                except Exception:
+                    pass
+                # Do NOT cache False permanently — a later stop()
+                # retry can try again once the helper finishes.
+                return False
+
         # Serialise so concurrent callers do not double-run the primitive.
         # Bounded acquire — return False if we cannot acquire in time.
         acquired = self._start_timeout_recovery_lock.acquire(
@@ -936,26 +1101,6 @@ class MqttBroker(MessageBroker):
                 cached = self._last_start_cleanup_result
             if cached is not None:
                 return cached
-
-            # Bounded-wait for startup helper to finish. RFC-011
-            # modification 2: MUST NOT run the primitive while startup
-            # helper is still alive (would race on same paho client).
-            startup_helper = self._start_helper_thread
-            if startup_helper is not None and startup_helper.is_alive():
-                startup_helper.join(graceful_timeout_s)
-                if startup_helper.is_alive():
-                    try:
-                        logger.warning(
-                            f"MqttBroker.stop from START_TIMEOUT: "
-                            f"startup helper still alive after "
-                            f"{graceful_timeout_s:.1f}s bounded wait; "
-                            f"deferring cleanup (would race on paho client)"
-                        )
-                    except Exception:
-                        pass
-                    # Do NOT cache False permanently — a later stop()
-                    # retry can try again once the helper finishes.
-                    return False
 
             # Startup helper has finished. Safe to run cleanup once.
             result = self._run_client_shutdown_primitive_and_cache(
