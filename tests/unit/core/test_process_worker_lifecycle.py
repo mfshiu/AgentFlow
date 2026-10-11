@@ -31,6 +31,7 @@ import multiprocessing as mp
 import os
 import pickle
 import signal
+import sys
 import threading
 import time
 
@@ -580,6 +581,48 @@ def test_start_lambda_handler_failure_reaches_start_time():
     assert pw.state is WorkerState.START_FAILED
 
 
+def _windows_process_has_exited(pid):
+    import _winapi
+    SYNCHRONIZE = 0x00100000
+    try:
+        handle = _winapi.OpenProcess(SYNCHRONIZE, False, pid)
+    except OSError:
+        return True     # no such process any more
+    try:
+        return _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_OBJECT_0
+    finally:
+        _winapi.CloseHandle(handle)
+
+
+@pytest.mark.skipif(sys.platform != 'win32',
+                    reason='POSIX spawn pickles before starting the child')
+def test_start_pickle_failure_leaves_no_orphan_child_on_windows(monkeypatch):
+    """#48: on Windows, multiprocessing creates the child (CreateProcess)
+    BEFORE pickling the Agent into it. When that pickling fails, the
+    child already exists but Process.start() never records it; left
+    alive, it later duplicates a recycled parent handle and breaks the
+    next spawn. ProcessWorker.start must terminate it before raising."""
+    from multiprocessing import popen_spawn_win32
+    pids = []
+    real_create = popen_spawn_win32._winapi.CreateProcess
+
+    def recording_create(*args, **kwargs):
+        result = real_create(*args, **kwargs)
+        pids.append(result[2])      # (hProcess, hThread, pid, tid)
+        return result
+
+    monkeypatch.setattr(popen_spawn_win32._winapi, 'CreateProcess',
+                        recording_create)
+    agent = Agent(name='pw-orphan', agent_config=_minimal_empty_broker_config())
+    agent.subscribe('some/topic', topic_handler=lambda t, p: None)
+    pw = ProcessWorker(agent)
+    with pytest.raises(TypeError):
+        pw.start()
+    assert len(pids) == 1, 'the child is created before the Agent is pickled'
+    assert _windows_process_has_exited(pids[0]),         'the child of a failed start is still running (orphan)'
+    assert pw.state is WorkerState.START_FAILED
+
+
 # ==========================================================================
 # H. Observability + orphan sanity (RFC-008 §7.14 + acceptance #9)
 # ==========================================================================
@@ -611,8 +654,9 @@ def test_no_orphan_process_after_stop():
         # completion; use it as authoritative.
         assert not proc.is_alive()
         # Also verify via OS: sending signal 0 to a dead PID raises.
-        # Note: on POSIX only. Skip on other platforms.
-        if hasattr(os, 'kill'):
+        # POSIX only: on Windows os.kill exists but signal 0 is
+        # CTRL_C_EVENT, not an existence check (#48).
+        if os.name == 'posix':
             with pytest.raises((ProcessLookupError, PermissionError)):
                 os.kill(pid, 0)
     finally:

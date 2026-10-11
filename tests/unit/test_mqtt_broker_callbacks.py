@@ -48,16 +48,16 @@ def test_on_connect_does_not_notify_when_reason_code_is_nonzero(
 def test_on_connect_sets_event_even_if_notifier_raises(
     broker, fake_client, notifier
 ):
+    # Issue #2 / W-43: the notifier exception is contained (it would
+    # otherwise kill paho's network thread) and the event still fires.
     notifier._on_connect.side_effect = RuntimeError("notifier explode")
-    with pytest.raises(RuntimeError):
-        broker._on_connect(
-            client=fake_client,
-            userdata=None,
-            flags={},
-            reasonCode=0,
-            properties=None,
-        )
-    # The `finally:` clause at mqtt_broker.py:42-43 must still fire.
+    broker._on_connect(
+        client=fake_client,
+        userdata=None,
+        flags={},
+        reasonCode=0,
+        properties=None,
+    )
     assert broker._connected_evt.is_set()
     # _connect_ok is set BEFORE the notifier call and must remain True.
     assert broker._connect_ok is True
@@ -111,7 +111,7 @@ def test_on_disconnect_does_not_raise(broker, fake_client):
     )
 
 
-def test_on_disconnect_does_not_notify_notifier(broker, fake_client, notifier):
+def test_on_disconnect_notifies_only_on_disconnect(broker, fake_client, notifier):
     broker._on_disconnect(
         client=fake_client,
         userdata=None,
@@ -121,3 +121,4 @@ def test_on_disconnect_does_not_notify_notifier(broker, fake_client, notifier):
     )
     notifier._on_connect.assert_not_called()
     notifier._on_message.assert_not_called()
+    notifier._on_disconnect.assert_called_once_with(planned=True)

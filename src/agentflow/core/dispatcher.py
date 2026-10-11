@@ -67,7 +67,7 @@ class MessageDispatcher:
             )
 
         self._workers_count = workers
-        self._queue: queue.Queue = queue.Queue(maxsize=queue_capacity)
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
         self._shutdown_timeout_s = shutdown_timeout_s
         self._name = name
 

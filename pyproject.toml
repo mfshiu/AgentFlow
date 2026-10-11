@@ -16,6 +16,7 @@ markers = [
     "integration: requires live external services (e.g. MQTT broker)",
     "security: security-relevant test; may include known-failing forcing functions",
     "manual: manual demonstration script; not an automated test",
+    "wire: real paho client against the in-process loopback MQTT server (127.0.0.1 only; no external services)",
 ]
 norecursedirs = [
     "unit_test",
@@ -28,3 +29,56 @@ norecursedirs = [
     "_bak",
     "_log",
 ]
+
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["unit_test", "exe_test", "_bak", "_log"]
+
+[tool.ruff.lint]
+# First CI gate (#49): only problems that break code at runtime: syntax
+# errors, invalid comparisons and undefined names. Widen the rule set
+# once the open PRs touching the same files (#80, #82) have landed.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.ruff.lint.per-file-ignores]
+# Deleted by #82 (issue #1); drop this entry once that has merged.
+"src/agentflow/core/wrapper.py" = ["F821"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["agentflow"]
+ignore_missing_imports = true
+warn_unused_configs = true
+exclude = [
+    # Broken optional backends, tracked in #42.
+    '^src/agentflow/broker/dds_broker\.py$',
+    '^src/agentflow/broker/ros_noetic_broker\.py$',
+    # Deleted by #82 (issue #1).
+    '^src/agentflow/core/wrapper\.py$',
+]
+
+# Strict checking, module by module (#49). mqtt_broker.py follows once
+# #80 has landed.
+[[tool.mypy.overrides]]
+module = ["agentflow.core.dispatcher"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+check_untyped_defs = true
+warn_return_any = true
+no_implicit_reexport = true
+strict_equality = true
+
+[tool.coverage.run]
+source = ["agentflow"]
+branch = true
+
+[tool.coverage.report]
+# Measured 72% on 2026-10-11; the margin absorbs platform differences.
+# Raise it as coverage grows.
+fail_under = 70
+skip_covered = true

@@ -50,8 +50,9 @@ python -m pytest -v
 - Live broker round-trips (require a running MQTT broker).
 - Multi-agent parent/child flows (needs process/thread orchestration).
 - Process-mode Agent lifecycle (R-06 in the audit register).
-- Pickle payload security (R-01 forcing test lives in `tests/security/`
-  once added in a later step).
+
+Pickle payload security (R-01, issue #1) is covered by
+`tests/security/test_parcel_pickle_safety.py` (`security` marker).
 
 ## Markers
 

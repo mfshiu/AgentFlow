@@ -10,6 +10,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-01 — `BinaryParcel.from_payload` executes `pickle.loads` on wire bytes
 
+- **Status**: **RESOLVED** (2026-10-10) — GitHub issue #1; see [Resolution](#resolution-2026-10-10-issue-1) below.
 - **Severity**: Critical
 - **Category**: Security / Message Reliability
 - **File / Function / Line**: `src/agentflow/core/parcel.py:142–149`, `BinaryParcel.from_payload`
@@ -22,6 +23,58 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Impact**: Arbitrary code execution in the receiving agent process.
 - **Confidence**: High
 - **Recommended verification test**: Unit test that constructs a payload using a `__reduce__` gadget that writes a marker file, calls `Parcel.from_payload`, and asserts the marker file exists (in a sandbox).
+
+### Resolution (2026-10-10, issue #1)
+
+**Approach.** Keep the wire format, but replace the unrestricted unpickler with a deny-by-default one. Pickle can only call something it first obtained through `Unpickler.find_class` (REDUCE, INST, OBJ, NEWOBJ and EXT\* all go through it). Refusing every global outside an allowlist therefore closes the code-execution path, and plain data still decodes. Allowlisted globals must also be immutable: otherwise a BUILD opcode applied to the class or function object itself would `setattr` on it, process-wide.
+
+**Scope of change:**
+
+- `src/agentflow/core/parcel.py`
+  - `_RestrictedUnpickler.find_class` resolves only allowlisted `(module, name)` pairs. The default allowlist, `DEFAULT_PICKLE_ALLOWED_GLOBALS`, is `builtins.bytearray`, `builtins.complex`, `builtins.set` and `builtins.frozenset`. These are the only globals pickle protocols 3–5 need for plain data.
+  - A resolved global is refused unless it is immutable, i.e. a type with `Py_TPFLAGS_IMMUTABLETYPE` or a builtin function. Python-defined classes (Enum, dataclass, `fractions.Fraction`), Python functions and modules are refused even when allowlisted.
+  - `builtins.bytearray` resolves to a guard that only rebuilds from bytes. Otherwise `bytearray(<int>)` would let a ~100-byte payload allocate gigabytes.
+  - Persistent IDs stay unsupported.
+  - New `ParcelDecodeError(TypeError)`. It is raised for refused globals, any unpickling or JSON error, and a non-dict body, in both BinaryParcel and TextParcel.
+  - `Parcel.from_payload` / `BinaryParcel.from_payload` take two new keyword-only parameters: `accept_pickle` and `pickle_allowed_globals`.
+  - New `parse_pickle_globals()` accepts entries in the form `'module.name'` / `'module:qualname'`.
+- `src/agentflow/core/agent.py`: a new optional config section `codec`, with `accept_pickle` (default True) and `pickle_allowed_globals` (default empty).
+  - It is read once and validated at construction. A malformed section raises: an unknown key, a non-bool `accept_pickle` (so the string `'false'` cannot silently keep pickle enabled), or a `pickle_allowed_globals` that is not a list.
+  - It is applied in `_on_message`.
+- `src/agentflow/core/wrapper.py` was removed. It was unused (no reference in `src/`, the tests or the downstream projects), broken (`TextWrapper.wrap` raised NameError on the undefined `VERSION`), and contained a second unrestricted `pickle.loads`.
+
+**Compatibility:**
+
+- Unchanged:
+  - Payloads from current senders (`pickle.HIGHEST_PROTOCOL`).
+  - Payloads from the downstream-pinned release (default protocol 4).
+  - Content made of dict / list / tuple / set / frozenset / str / bytes / bytearray / int / float / complex / bool / None.
+- Now refused unless allowlisted:
+  - Any other type, e.g. `datetime`, `Decimal`, `OrderedDict` or numpy arrays.
+  - Protocol ≤ 2 payloads containing bytes (they use `_codecs.encode`).
+- Only immutable types and builtin functions can be allowlisted (e.g. `datetime.datetime`, `decimal.Decimal`, `collections.OrderedDict`). Send values of Python-defined classes as plain data instead.
+- Any publisher can call an allowlisted type's constructor, so allowlist only types whose construction has no side effects.
+
+**Verification:**
+
+- `tests/security/test_parcel_pickle_safety.py` (54 tests) covers:
+  - a harmless `__reduce__` gadget that must never execute, both directly and via `Agent._on_message`;
+  - refusal of unsafe globals such as `os.system`, `subprocess.Popen`, `builtins.eval` / `exec` / `__import__` / `getattr` and the `__builtin__` spelling;
+  - refusal of allowlisted mutable globals (a Python class, a Python function, a module), including a BUILD that tries to rewrite an allowlisted class;
+  - `bytearray(<int>)` refused;
+  - the protocol 0–2 `__builtin__` spelling normalised for set / frozenset / complex, while `__builtin__.reduce` stays refused;
+  - persistent IDs;
+  - plain-data round-trips for protocols 3–5;
+  - the downstream message shapes;
+  - the allowlist, the `accept_pickle` opt-out and strict `codec` validation;
+  - malformed bodies.
+
+**Known residuals (tracked separately):**
+
+- The size gate before decoding and decoding off the network thread: W-36, issue #34.
+- `version` validation, and per-message tracebacks for undecodable traffic: W-37, issue #15.
+- Unpickling plain data can still be made expensive, for example with deep nesting or huge containers. Deployments that do not need BinaryParcel can set `codec.accept_pickle: False`.
+- Long term, the pickle codec is to be replaced by a versioned envelope (roadmap P2-1).
 
 ---
 
@@ -69,7 +122,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-03 — MQTT reconnect and subscription recovery are not implemented
 
-- **Status**: **RESOLVED** (2026-07-27) — see [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
+- **Status**: **RESOLVED** (2026-10-10) — [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md) (2026-07-27) added the subscription registry, but recovery never ran in production: the paho client was built with `reconnect_on_failure=False`, so paho's network loop ended on the first connection loss. Re-opened 2026-10-09 as GitHub issue #2; automatic reconnect added 2026-10-10 — see [Follow-up resolution](#follow-up-resolution-2026-10-10-issue-2).
 - **Severity**: High
 - **Category**: Fault Isolation / Message Reliability
 - **File / Function / Line** (historical): `src/agentflow/broker/mqtt_broker.py:17-18` (`reconnect_on_failure=False`); `mqtt_broker.py:52-53` (`_on_disconnect` only logs); `src/agentflow/core/agent.py:509-512` (`_on_connect` early-return via `_connected_once`)
@@ -160,6 +213,49 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 - **Broker-cluster failover**: not implemented.
 - **Connection generation / epoch counter** (RFC-005 Option E): not implemented; `_ever_connected` boolean suffices for first-vs-reconnect classification.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process `recovery_metrics()` snapshot.
+
+### Follow-up resolution (2026-10-10, issue #2)
+
+**Why RFC-005 was not enough.** The bullet above ("`reconnect_on_failure=False` is unchanged … AgentFlow does not itself reconnect") was the whole defect. In paho 2.1.0, `loop_forever()` (the `loop_start()` thread) exits on the first connection loss when `reconnect_on_failure` is False. No further CONNACK arrives, so `_recover_subscriptions` never ran outside the mocked unit tests. Meanwhile `state` stayed RUNNING and `Agent.is_active()` stayed True, while every publish failed with `BROKER_DISCONNECTED`. The 48 RFC-005 tests drive `_on_connect` / `_on_disconnect` by hand on a MagicMock client, so they could not observe this.
+
+**Scope of change:**
+
+- `src/agentflow/broker/mqtt_broker.py`
+  - The client is built with `reconnect_on_failure=True`.
+  - `start()` calls `reconnect_delay_set()` from the new options `reconnect_min_delay` / `reconnect_max_delay` (default 1 s … 30 s). Invalid values fall back to the defaults with a WARNING instead of raising.
+  - `reconnect: False` restores the legacy behaviour: `_on_disconnect` calls `loop_stop()` from the network thread. `disconnect()` would not work there, because paho resets the state to CONNECTION_LOST after the callback returns.
+  - The same `loop_stop()` ends the loop when a `wait=False` broker's FIRST connection is refused or dropped. Nobody awaits that connection, and stop() refuses STARTING, so the retries could otherwise never be ended.
+  - New `connect_timeout` option (default 2 s; paho's own default is 5 s) bounds each reconnect TCP connect. A reconnect blocked by a network partition therefore fits inside the 5 s worker/broker stop budgets. Not bounded: DNS resolution, and hosts that resolve to N addresses (up to N × `connect_timeout`).
+  - After `loop_stop()`, the stop helper and the start-rollback primitive close any socket left by a reconnect that completed after `disconnect()` had already run.
+  - `_on_disconnect` reports `notifier._on_disconnect(planned)` unless stop() has fenced callbacks.
+  - Exceptions from `notifier._on_connect` / `_on_disconnect` are contained (W-43). Before this, an `_on_connect` exception propagated into paho and killed the network thread, and with it every later reconnect.
+- `src/agentflow/broker/notifier.py`: new non-abstract `BrokerNotifier._on_disconnect(planned)`, a default no-op, so existing subclasses stay valid.
+- `src/agentflow/core/agent.py` (additive public API):
+  - `Agent.is_connected()`.
+  - Hooks `on_disconnected()`, called once per unexpected loss of an established connection, and `on_reconnected()`, called after every reconnect. Both run on a short-lived daemon thread, never on the paho thread.
+  - `on_connected()` still runs once. The one-time holon setup is not repeated on reconnect, because the broker registry restores the subscriptions.
+  - `__deactivating` clears the link state after `broker.stop()`, so `is_connected()` is False once the agent has stopped.
+
+**Verification:**
+
+- `tests/wire/` (new `wire` marker) drives a REAL paho client against `tests/fakes/mini_mqtt_server.py`, an in-process loopback MQTT 3.1.1 server. It covers:
+  - reconnect plus re-subscribe after a server-side drop;
+  - publish recovery;
+  - disconnect reporting;
+  - notifier exception containment;
+  - the `reconnect: False` opt-out;
+  - stop() during back-off (bounded, no retries afterwards);
+  - stop() and Agent.terminate() during a partition-blocked reconnect (simulated black-holed connect), staying within budget;
+  - a refused CONNACK at start() leaving no background retries, for both `wait=True` and `wait=False`;
+  - an end-to-end Agent in thread mode.
+- Mock-based contracts are in `tests/unit/test_mqtt_broker_auto_reconnect.py` and `tests/unit/core/test_agent_connection_state.py`.
+
+**Known residuals (tracked separately):**
+
+- **W-24 / issue #60.** If start() hits START_TIMEOUT while the startup helper is still wedged in `connect()`, and that helper later succeeds, the orphaned client now keeps reconnecting in the background. Previously it died at its first connection loss. Its callbacks stay fenced.
+- `register_child` is still sent only on the first connection (issue #6).
+- Subscriptions made before the first CONNACK are still not sent (issue #54).
+- Publishes made while disconnected are still dropped by `Agent.publish` (issue #4).
 
 ---
 
@@ -330,7 +426,15 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 | **R-06.2** | Unbounded `Process.join()` in `stop()` (wedged child blocks the caller forever; no `terminate` / `kill` fallback; no `Optional[int]` exitcode return) | **RESOLVED** (RFC-008) |
 | **R-06.3** | No heartbeat / liveness / automatic restart on child crash (parent has no watchdog; a dead child is only observable via post-hoc `stop()` + `exitcode`) | **DEFERRED / OPEN** (out of RFC-008 scope) |
 | **R-06.4** | Parent-side Agent state divergence (parent-side `_broker` / `_dispatcher` / `__topic_handlers` never populate because `_activate` runs in the child; parent-side `publish` / `subscribe` do not proxy) | **DOCUMENTED architectural constraint** (RFC-008 §6.5, §7.16, §7.17) |
+| **R-06.5** | Windows orphan child on a start-time pickle failure (CreateProcess runs before the Agent is pickled into the child; on failure the child exists but `Process.start()` never records it, and it later duplicates a recycled parent handle, corrupting the next spawn) | **RESOLVED** (2026-10-11, #48) |
 | Child exception forwarding | No IPC surface for child-side handler exceptions; parent observes only exit code | **DEFERRED / OPEN** (out of RFC-008 scope) |
+
+### Resolution (R-06.5, 2026-10-11, #48)
+
+- **Found by**: the intermittent Windows failures of the ProcessWorker spawn tests (WinError 5/6, EOFError, exitcode 1). They always followed a start-pickle-failure test.
+- **Cause**: `multiprocessing.popen_spawn_win32.Popen` calls `CreateProcess` first and pickles the Process object afterwards. When `Agent.__getstate__` raised, the child already existed, but `Process.start()` never stored the Popen. Its finalizer then closed the parent's pipe handle while the orphaned child was still starting; the child later duplicated whatever handle reused that number. POSIX spawn pickles first and is unaffected.
+- **Fix**: on Windows, `ProcessWorker` starts its child through `_WorkerProcess`, whose `_OrphanSafePopen` terminates the just-created child, and waits for it to exit, before re-raising. Agents that carry multiprocessing primitives (Queue, Event) still start, because nothing is pre-pickled.
+- **Verification**: `test_start_pickle_failure_leaves_no_orphan_child_on_windows` records the child pid at `CreateProcess` and asserts that the child has exited when `start()` raises; it failed 5/5 before the fix. The two spawn tests previously marked as known-flaky on Windows now run unmarked.
 
 ### Resolution (R-06.1 / R-06.2 / R-06.4)
 
@@ -1122,6 +1226,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-16 — Unused `tkinter` import in Agent
 
+- **Status**: **RESOLVED** (2026-10-11, #47) — the import, which was on `agent.py:12` (not `:8`), was removed. `tests/unit/test_headless_import.py` imports the public entry points in a fresh interpreter that blocks tkinter.
 - **Severity**: Medium
 - **Category**: Correctness / Portability
 - **File / Function / Line**: `src/agentflow/core/agent.py:8` `from tkinter import N`
@@ -1147,6 +1252,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-18 — No unregister / heartbeat / liveness detection between parents and children
 
+- **Status**: **PARTIALLY RESOLVED** (2026-10-11, issue #6). Membership now converges regardless of start order, reconnects and parent restarts; see [Membership convergence](#membership-convergence-2026-10-11-issue-6). Expiry (unregister / LWT / heartbeat) remains **Open**, because a dead child still stays in `_children`.
 - **Severity**: High
 - **Category**: Fault Isolation
 - **File / Function / Line**: `src/agentflow/core/agent.py:367–386` (`__register_child`, `__register_parent`); no counterpart delete methods anywhere in the file (grep-confirmed).
@@ -1154,6 +1260,27 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Parent's `_children` dict never shrinks; subsequent `_notify_child` publishes to a dead topic silently (nothing to detect it). No task reassignment path exists.
 - **Confidence**: High
 - **Recommended verification test**: Start child + parent; kill child; verify `_children` still contains the dead child id, and that `_notify_child` succeeds silently.
+
+### Membership convergence (2026-10-11, issue #6)
+
+**Problem.** `register_child` was sent once, on the first connection only, and a parent never asked for registrations. A parent therefore knew its children only if it was online first. A parent restart (new `agent_id`) or a reconnect lost the membership, and `_notify_children('terminate')` returned early on an empty `_children`, so terminate never reached such a subtree.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- On every (re)connect, an agent re-sends `register_child` if it has a parent, and broadcasts the new internal control subject `parent_online` on `to_child.{name}`.
+- A child that receives `parent_online` on its parent channel `to_child.{parent_name}` from another agent answers that parent only, on `{parent_id}.to_parent.{parent_name}`. It ignores the copies on `to_child.{name}`: its own echo, or a same-name replica's broadcast. `parent_online` never reaches `on_parents_message`.
+- `__register_child` / `__register_parent` are idempotent under `_holon_lock`, which is runtime-only. A repeated registration refreshes the entry, and `on_register_child` / `on_register_parent` fire once per member.
+- While the first `on_register_child` for a child is still running, duplicates get no `register_parent` answer; the first registration answers once its hook returns.
+
+**Compatibility.** The wire format is unchanged apart from the new `parent_online` subject.
+
+- Pre-change agents pass `parent_online` to `on_parents_message` as an unknown subject.
+- A pre-change parent is not idempotent, so it calls `on_register_child` again each time a post-change child reconnects. Upgrade parents (including mid-tier agents) before their children.
+- `on_children_message` / `on_parents_message` still see every `register_child` / `register_parent`, including repeats. Use `on_register_child` / `on_register_parent` for membership events.
+
+**Verification.** `tests/unit/core/test_holon_membership.py` (15 tests on `tests/fakes/fake_bus.py`) and `tests/wire/test_holon_wire.py` (real MqttBroker clients; child first → server drops every connection → parent replaced → terminate cascades).
+
+**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4), QoS 1 for control messages (#4), and the mid-tier terminate echo (#5). The latter now matters more, because mid-tier agents now actually have registered children in every start order.
 
 ---
 
@@ -1183,6 +1310,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-21 — `core/wrapper.py` references undefined `VERSION` symbol
 
+- **Status**: **RESOLVED** (2026-10-10) — `src/agentflow/core/wrapper.py` removed with issue #1 (it was unused, and `BinaryWrapper.unwrap` was a second unrestricted `pickle.loads`); see [R-01 Resolution](#resolution-2026-10-10-issue-1).
 - **Severity**: Low
 - **Category**: Correctness / Dead code
 - **File / Function / Line**: `src/agentflow/core/wrapper.py:32` inside `TextWrapper.wrap`
@@ -1262,14 +1390,14 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 | ID | Severity | Confidence | Status | Title |
 |---|---|---|---|---|
-| R-01 | Critical | High | Open | `pickle.loads` on wire bytes |
+| R-01 | Critical | High | **Resolved 2026-10-10 (issue #1)** | `pickle.loads` on wire bytes |
 | R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
-| R-03 | High | High | **Resolved 2026-07-27 (RFC-005)** | No MQTT reconnect / no re-subscribe |
+| R-03 | High | High | **Resolved 2026-10-10 (RFC-005 + issue #2)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
-| R-18 | High | High | Open | No child/parent unregister / heartbeat |
+| R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
@@ -1277,13 +1405,13 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
 | R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
-| R-16 | Medium | Medium | Open | `from tkinter import N` |
+| R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | Open | Parcel `version` never validated |
 | R-20 | Medium | High | Open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
-| R-21 | Low | High | Open | `wrapper.py` `VERSION` undefined |
+| R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
 | R-22 | Low | High | Open | Stub / broken broker implementations |
 | R-23 | Low | High | Open | README / directory drift |
 | R-24 | Low | Medium | Open | Unexplained sleep in `_on_connect` |

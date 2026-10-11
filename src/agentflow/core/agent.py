@@ -9,11 +9,10 @@ import time
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from tkinter import N
 from typing import Callable, final, Optional
 import uuid
 
-from agentflow.core.parcel import Parcel
+from agentflow.core.parcel import Parcel, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -27,6 +26,8 @@ from agentflow.logging import redact_config
 import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
+# Issue #1: keys accepted in the optional `codec` config section.
+_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
 
 
 class TopicWaitCollisionError(RuntimeError):
@@ -72,6 +73,9 @@ class Agent(BrokerNotifier):
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
         self.__init_config(agent_config)
+        # Issue #1: inbound decoding policy, validated up front so a bad
+        # `codec` config fails at construction rather than per message.
+        self._codec_options = self.__parse_codec_config()
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
@@ -82,9 +86,14 @@ class Agent(BrokerNotifier):
 
         self._children: dict = {}
         self._parents: dict = {}
+        # Issue #6: makes "is this a new member?" + insert atomic, so a
+        # repeated registration never fires the hooks twice.
+        self._holon_lock = threading.Lock()
+        # Children whose first on_register_child is still running.
+        self._children_registering: set = set()
         
         self._message_broker = None
-        self.__topic_handlers: dict[str, function] = {}
+        self.__topic_handlers: dict[str, _HandlerRecord] = {}
         # RFC-006: guards atomic collision-check-and-register and
         # atomic identity-check-and-pop for publish_sync. Uses RLock
         # for future-proofing (RFC-006 Appendix B).
@@ -92,6 +101,9 @@ class Agent(BrokerNotifier):
 
         self._broker = None
         self._connected_once = False
+        # Issue #2: current broker link state, maintained by the
+        # BrokerNotifier callbacks (_on_connect / _on_disconnect).
+        self._broker_connected = False
 
         # RFC-004: bounded message dispatch. Dispatcher is created
         # lazily on first _on_message so that tests / lifecycles that
@@ -128,6 +140,8 @@ class Agent(BrokerNotifier):
         '_message_broker',
         '_children',
         '_parents',
+        '_holon_lock',
+        '_children_registering',
     })
 
     def __getstate__(self):
@@ -199,6 +213,9 @@ class Agent(BrokerNotifier):
         self._message_broker = None
         self._children = {}
         self._parents = {}
+        self._holon_lock = threading.Lock()
+        self._children_registering = set()
+        self._broker_connected = False
         if '_Agent__topic_handlers' not in self.__dict__:
             self._Agent__topic_handlers = {}
 
@@ -211,6 +228,57 @@ class Agent(BrokerNotifier):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
         logger.debug('self.config: %s', redact_config(self.config))
+
+
+    def __parse_codec_config(self):
+        """Issue #1: the optional `codec` config section.
+
+          accept_pickle          (bool, default True) — False refuses
+                                 BinaryParcel (pickle) payloads entirely.
+          pickle_allowed_globals (list of 'module.name' / 'module:qualname')
+                                 — extra globals BinaryParcel payloads may
+                                 reference, e.g. ['datetime.datetime'].
+                                 Only immutable types and builtin functions
+                                 are honoured; Python-defined classes
+                                 (Enum, dataclass, ...) are refused — send
+                                 such values as plain data instead. Each
+                                 allowed type's constructor is callable by
+                                 any publisher, so list only types whose
+                                 construction has no side effects.
+
+        Read once at construction. Raises TypeError / ValueError on a
+        malformed section, including unknown keys."""
+        codec = self.config.get('codec')
+        if codec is None:
+            codec = {}
+        if not isinstance(codec, dict):
+            raise TypeError(
+                f"Agent config 'codec' must be a dict, got {type(codec).__name__}"
+            )
+        unknown = set(codec) - _CODEC_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent config 'codec' keys {sorted(map(str, unknown))}; "
+                f"expected {sorted(_CODEC_KEYS)}"
+            )
+        accept_pickle = codec.get('accept_pickle', True)
+        if not isinstance(accept_pickle, bool):
+            raise TypeError(
+                f"Agent config 'codec.accept_pickle' must be a bool, "
+                f"got {accept_pickle!r}"
+            )
+        allowed = codec.get('pickle_allowed_globals')
+        if allowed is None:
+            allowed = ()
+        if not isinstance(allowed, (list, tuple, set, frozenset)):
+            raise TypeError(
+                f"Agent config 'codec.pickle_allowed_globals' must be a list "
+                f"of 'module.name' strings, got {allowed!r}"
+            )
+        return {
+            'accept_pickle': accept_pickle,
+            'pickle_allowed_globals': parse_pickle_globals(allowed),
+        }
             
             
     def __create_worker(self):
@@ -406,6 +474,18 @@ class Agent(BrokerNotifier):
         return self._agent_worker is not None and self._agent_worker.is_working()
 
 
+    def is_connected(self) -> bool:
+        """True while this agent's broker link is up (issue #2).
+
+        After an unexpected loss the broker reconnects automatically;
+        meanwhile this returns False and publishes fail. The state is
+        per process: in process mode (the default) the caller-side
+        Agent object never connects, so query it from inside the agent
+        (handlers / hooks) instead. Brokers that never report a
+        connection (e.g. EmptyBroker) always yield False."""
+        return self._broker_connected
+
+
     def on_activating(self):
         pass
     
@@ -567,6 +647,9 @@ class Agent(BrokerNotifier):
                         f"network thread may still be alive. See "
                         f"RFC-010 Appendix A / RFC-009 §H."
                     ))
+            # Issue #2: the broker fences notifier callbacks once stop()
+            # has begun (RFC-010 §F), so no _on_disconnect will arrive.
+            self._broker_connected = False
 
         self.on_terminated()
         
@@ -776,11 +859,35 @@ class Agent(BrokerNotifier):
             self._broker.unsubscribe(topic)
     
     
-    def __register_child(self, child_id:str, child_info:dict):
+    def __register_child(self, child_id:str, child_info:dict) -> bool:
+        """Record a child. Returns whether the caller should answer with
+        register_parent.
+
+        Issue #6: children re-register on every (re)connect and on a
+        parent's parent_online, so registration is idempotent: a known
+        child only refreshes its entry and the hook fires once. While the
+        first registration's hook is still running, a duplicate gets no
+        answer; the first registration answers once its hook returns, so
+        register_parent never overtakes on_register_child."""
         child_info['parent_id'] = self.agent_id
-        self._children[child_id] = child_info
-        logger.info(self.M(f"Add a child: {child_id}, total: {len(self._children)}"))
-        self.on_register_child(child_id, child_info)
+        with self._holon_lock:
+            is_new = child_id not in self._children
+            self._children[child_id] = child_info
+            total = len(self._children)
+            if is_new:
+                self._children_registering.add(child_id)
+            elif child_id in self._children_registering:
+                return False
+        if not is_new:
+            logger.debug(self.M(f"Child re-registered: {child_id}"))
+            return True
+        try:
+            logger.info(self.M(f"Add a child: {child_id}, total: {total}"))
+            self.on_register_child(child_id, child_info)
+        finally:
+            with self._holon_lock:
+                self._children_registering.discard(child_id)
+        return True
 
 
     def on_register_child(self, child_id, child_info:dict):
@@ -788,9 +895,16 @@ class Agent(BrokerNotifier):
     
     
     def __register_parent(self, parent_id:str, parent_info):
+        # Issue #6: idempotent, as for __register_child.
         parent_info['child_id'] = self.agent_id
-        self._parents[parent_id] = parent_info
-        logger.info(self.M(f"Add a parent: {parent_id}, total: {len(self._parents)}"))
+        with self._holon_lock:
+            is_new = parent_id not in self._parents
+            self._parents[parent_id] = parent_info
+            total = len(self._parents)
+        if not is_new:
+            logger.debug(self.M(f"Parent re-registered: {parent_id}"))
+            return
+        logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
         self.on_register_parent(parent_id, parent_info)
 
 
@@ -815,8 +929,8 @@ class Agent(BrokerNotifier):
 
         if child_id:=child.get('child_id'):
             if "register_child" == child['subject']:
-                self.__register_child(child_id, child)
-                self._notify_child(child_id, 'register_parent')
+                if self.__register_child(child_id, child):
+                    self._notify_child(child_id, 'register_parent')
             
         return self.on_children_message(topic, child)
 
@@ -844,6 +958,17 @@ class Agent(BrokerNotifier):
         elif "register_parent" == parent.get('subject'):
             if parent_id := parent.get('parent_id'):
                 self.__register_parent(parent_id, parent)
+        elif "parent_online" == parent.get('subject'):
+            # Issue #6: a parent (re)connected and asks its children to
+            # register. Internal: never forwarded to on_parents_message.
+            # Only honoured on the parent channel: the same message also
+            # arrives on to_child.{self.name}, as our own broadcast
+            # echoed back or a same-name replica's.
+            parent_id = parent.get('parent_id')
+            if (parent_id and parent_id != self.agent_id
+                    and topic == f'to_child.{self.parent_name}'):
+                self.__register_with_parent(parent_id)
+            return None
             
         return self.on_parents_message(topic, parent)
 
@@ -902,6 +1027,30 @@ class Agent(BrokerNotifier):
             logger.error("The parent does not exist.")
     
     
+    def __register_with_parent(self, parent_id):
+        """Issue #6: answer one parent's parent_online on its own
+        channel, so same-name parent replicas are not all delivered (and
+        then discard) every child's answer."""
+        self.publish(f'{parent_id}.to_parent.{self.parent_name}', {
+            'child_id': self.agent_id,
+            'child_name': self.name,
+            'subject': 'register_child',
+            'data': None,
+            'target_parents': [parent_id],
+        })
+
+
+    def _announce_parent_online(self):
+        """Issue #6: ask any children of this agent to (re)register.
+        Published directly rather than through _notify_children, which
+        returns early while _children is still empty."""
+        self.publish(f'to_child.{self.name}', {
+            'parent_id': self.agent_id,
+            'subject': 'parent_online',
+            'data': None,
+        })
+
+
     def _notify_parents(self, subject, data=None, target_parents=None):
         logger.debug(f"subject: {subject}, data: {data}")
         
@@ -918,8 +1067,18 @@ class Agent(BrokerNotifier):
         
         
     def _on_connect(self):
+        self._broker_connected = True
         if self._connected_once:
-            logger.warning(self.M("Already connected to the broker."))
+            # Issue #2: reconnected. The broker has already re-subscribed
+            # every topic from its registry, so the one-time setup below
+            # (holon subscriptions, on_connected) is not repeated.
+            logger.info(self.M("Reconnected to the broker."))
+            # Issue #6: membership messages may have been missed while
+            # offline; re-register and ask children to do the same.
+            if self.parent_name:
+                self._notify_parents("register_child")
+            self._announce_parent_online()
+            self._run_connection_hook(self.on_reconnected)
             return
         self._connected_once = True
         logger.info(self.M("Connected to the broker."))
@@ -937,6 +1096,8 @@ class Agent(BrokerNotifier):
             self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
             self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
+        # Issue #6: children that started first registered with nobody.
+        self._announce_parent_online()
 
         def handle_connected():
             time.sleep(1)
@@ -945,10 +1106,39 @@ class Agent(BrokerNotifier):
         threading.Thread(target=handle_connected).start()
 
 
+    def _on_disconnect(self, planned: bool = False):
+        """BrokerNotifier callback (issue #2): the broker link was lost.
+        Calls on_disconnected() once per unexpected loss of an
+        established connection."""
+        was_connected = self._broker_connected
+        self._broker_connected = False
+        if not was_connected or planned:
+            return
+        logger.warning(self.M(
+            "Disconnected from the broker; waiting for automatic reconnect."
+        ))
+        self._run_connection_hook(self.on_disconnected)
+
+
+    def _run_connection_hook(self, hook):
+        """Run a connection hook off the broker's network thread, so a
+        slow or failing hook can neither delay nor kill reconnects."""
+        hook_name = getattr(hook, '__name__', None) or type(hook).__name__
+
+        def run():
+            try:
+                hook()
+            except Exception as ex:
+                logger.exception(self.M(f"{hook_name} raised: {ex!r}"))
+        threading.Thread(
+            target=run, name=f'{self.name_tag}-{hook_name}', daemon=True,
+        ).start()
+
+
     @final
     def _on_message(self, topic:str, data):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
-        pcl = Parcel.from_payload(data)
+        pcl = Parcel.from_payload(data, **self._codec_options)
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
         # registry under _handlers_lock. is_specific_handler and
@@ -1035,6 +1225,21 @@ class Agent(BrokerNotifier):
 
     def on_connected(self):
         logger.debug(self.M('on_connected'))
+
+
+    def on_disconnected(self):
+        """Hook (issue #2): the broker link was lost unexpectedly. The
+        broker keeps reconnecting; publishes fail until on_reconnected().
+        Runs on a short-lived daemon thread."""
+        pass
+
+
+    def on_reconnected(self):
+        """Hook (issue #2): the broker link is back after an unexpected
+        loss and every subscription has been restored. Unlike
+        on_connected(), which runs once, this runs after every
+        reconnect. Runs on a short-lived daemon thread."""
+        pass
 
 
     def on_message(self, topic:str, data):

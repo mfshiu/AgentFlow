@@ -14,12 +14,23 @@ The original Phase-1 baseline captured in §6.1–6.7 (below) reflects the state
 - R-05 via [RFC-003](../rfc/RFC-003-auto-reply-contract.md)
 - R-04 via [RFC-004](../rfc/RFC-004-bounded-message-dispatch.md)
 - R-03 via [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
+- R-01 (and R-21: `core/wrapper.py` removed) via GitHub issue #1 (2026-10-10) — see the R-01 Resolution in `05-risk-register.md`
 - R.4 (publish_sync-vs-publish_sync collision) via [RFC-006](../rfc/RFC-006-publish-sync-topic-collision.md)
 - R-14 (partially — `__topic_handlers` slice) via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md), which also closed the R.6-1 / R.6-2 / R.6-3 residual risks from the RFC-006 cross-API characterisation
 - R-06 (partially — R-06.1 spawn pickle failure / R-06.2 unbounded `Process.join` / R-06.4 parent-child state divergence) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md); R-06.3 heartbeat/watchdog and child-exception IPC remain Deferred / Open
 - R-10 (fully — R-10.1 ProcessWorker + R-10.2 ThreadWorker + R-10.3 Agent.terminate + R-10.4 MqttBroker.stop + R-10.6 MqttBroker.start + **R-10.7 MqttBroker.publish result contract** all resolved) via [RFC-008](../rfc/RFC-008-process-worker-lifecycle.md) + [RFC-009](../rfc/RFC-009-thread-worker-lifecycle.md) + [RFC-010](../rfc/RFC-010-broker-bounded-shutdown.md) + [RFC-011](../rfc/RFC-011-mqtt-broker-bounded-startup.md) + [RFC-012](../rfc/RFC-012-mqtt-publish-result-contract.md); **R-10.5 non-daemon interpreter-exit blocking Partially Resolved / Operationally Mitigated** via [RFC-013](../rfc/RFC-013-thread-worker-process-exit-policy.md) (2026-08-03 — detection + diagnostics + operator guidance; in-process forced thread termination not supported by design; containment via ProcessWorker or external supervisor); remaining residual: publish-vs-stop full linearisation barrier (Open / Documented — RFC-012 §B modification 2 acknowledges the race)
 
-Current authoritative pytest command:
+Current authoritative pytest command (2026-10-11, #49): the GitHub Actions
+workflow `.github/workflows/ci.yml` runs the whole suite on ubuntu and windows
+with Python 3.11 and 3.13, plus ruff, mypy, a coverage floor and a wheel
+install smoke test. Locally:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Historical command (single Linux conda environment):
 
 ```bash
 PYTHONPATH=src /home/eric/anaconda3/envs/actbot/bin/python -m pytest tests/unit -v
@@ -66,13 +77,17 @@ The two remaining xfails (`test_both_callers_should_receive_own_response_with_sh
 > **RFC-006's ownership guard was never at fault**; the atomic check+register
 > (`agent.py:669-685`) and identity-check+pop (`705-710`) both held throughout.
 >
-> **Fix** — the test now *enforces* the overlap it was written to observe: a
-> second barrier (`overlap_gate`) holds the owner inside `broker.publish`,
-> after it has registered ownership and before it can receive its response
-> and release it, until all 7 other callers have passed their ownership
-> check. `completed == 1` / `collisions == 7` are now deterministic. No
-> production code changed. Verified 40/40 sequential runs plus 4 concurrent
-> runs under CPU contention, against the ~7% pre-fix rate.
+> **Fix (actually committed 2026-10-11, #48).** The fix described here on
+> 2026-08-03 was never committed; the flake persisted (14/200 runs failed
+> before the fix). The test now *enforces* the overlap it was written to
+> observe. `overlap_gate`, a one-way `threading.Condition` gate, holds the
+> owner inside `broker.publish`. At that point it has registered ownership
+> but not yet received its response, and it stays there until all 7 other
+> callers have raised `TopicWaitCollisionError`. `completed == 1` /
+> `collisions == 7` are now deterministic, and a non-atomic ownership
+> check fails the gate's bounded wait instead of hanging. No production
+> code changed. Verified with 0 failures in 1000 in-process + 200 pytest
+> runs on Python 3.13, 1000 + 50 on 3.11, and 500 under CPU saturation.
 
 Historical intermediate results:
 - Pre-RFC-006/007: 216 passed / 0 xfailed.
@@ -283,7 +298,7 @@ Cross-referenced with `05-risk-register.md`.
 
 | Risk | Not covered by any test |
 |---|---|
-| R-01 pickle payload | ✓ no malformed payload test |
+| R-01 pickle payload | **Resolved 2026-10-10 (issue #1); covered by `tests/security/test_parcel_pickle_safety.py`.** Restricted unpickler (allowlisted, immutable globals only; guarded `bytearray`); gadget, unsafe-global, mutable-global, malformed-body, compatibility and `codec` config tests. |
 | R-02 `publish_sync` leaks | **Resolved 2026-07-26 (RFC-001); covered by `tests/unit/core/test_agent_publish_sync.py`** |
 | R-03 broker reconnect / re-subscribe | **Resolved 2026-07-27 (RFC-005); covered by `tests/unit/test_mqtt_broker_reconnect.py`.** MqttBroker owns a thread-safe subscription registry; reconnect drives per-topic recovery with per-topic failure isolation; stop / unsubscribe / subscribe races against recovery covered by dedicated tests; `_state_lock` never held across paho client calls (verified). |
 | R-04 unbounded per-message threads | **Resolved 2026-07-26 (RFC-004); covered by `tests/unit/core/test_agent_message_threading.py`.** MessageDispatcher with fixed daemon consumer pool + bounded queue + drop_newest + graceful shutdown. Two race fixes (enqueue check-then-put linearization + concurrent-stop `_stop_complete_event`) verified with deterministic reproductions. |
