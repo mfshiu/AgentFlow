@@ -1,4 +1,5 @@
 import copy
+from collections import OrderedDict
 import inspect
 import logging
 import math
@@ -37,6 +38,9 @@ _CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
 # travel at QoS 1 (at least once), and the topics they arrive on are
 # subscribed at QoS 1. Application publish / subscribe default to QoS 0.
 _CONTROL_QOS = 1
+# Issue #4: how many recently received message ids an agent remembers to
+# drop redeliveries (QoS 1 resends follow a reconnect closely).
+_DEDUP_WINDOW = 4096
 
 # Issue #13: keys accepted in the optional `holon` config section.
 _HOLON_KEYS = frozenset({
@@ -232,6 +236,10 @@ class Agent(BrokerNotifier):
         # before that unsubscribe lands. Reentrant: a failed subscribe
         # leaves while holding it.
         self._reply_topics_lock = threading.RLock()
+        # Issue #4: the message ids received most recently, oldest
+        # first; a redelivered id is dropped (see __seen_before).
+        self._recent_message_ids: OrderedDict = OrderedDict()
+        self._dedup_lock = threading.Lock()
 
         self._broker = None
         self._connected_once = False
@@ -268,6 +276,8 @@ class Agent(BrokerNotifier):
     _RUNTIME_ONLY_FIELDS = frozenset({
         '_handlers_lock',
         '_reply_topics_lock',
+        '_recent_message_ids',
+        '_dedup_lock',
         '_dispatcher_init_lock',
         '_dispatcher',
         '_broker',
@@ -345,6 +355,8 @@ class Agent(BrokerNotifier):
         self.__dict__.update(state)
         self._handlers_lock = threading.RLock()
         self._reply_topics_lock = threading.RLock()
+        self._recent_message_ids = OrderedDict()
+        self._dedup_lock = threading.Lock()
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
         self._broker = None
@@ -986,6 +998,12 @@ class Agent(BrokerNotifier):
         Marked with a single leading underscore to signal that this is
         internal-use only; API stability is not guaranteed."""
         pcl = data if isinstance(data, Parcel) else Parcel.from_content(data)
+        # Issue #4: every message sent carries a fresh id, so that a
+        # receiver can drop a redelivery. Set on a copy: the caller's
+        # Parcel is not modified.
+        if pcl is data:
+            pcl = copy.copy(pcl)
+        pcl.message_id = uuid.uuid4().hex
         if self._broker is None:
             raise RuntimeError("Cannot publish: no broker attached")
         self._broker.publish(topic, pcl.payload(), qos=qos)
@@ -1592,6 +1610,11 @@ class Agent(BrokerNotifier):
     def _on_message(self, topic:str, data):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         pcl = Parcel.from_payload(data, **self._codec_options)
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
+            # whose acknowledgement was lost across a reconnect.
+            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
+            return
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
         # registry under _handlers_lock. is_specific_handler and
@@ -1658,6 +1681,21 @@ class Agent(BrokerNotifier):
         # of spawning one Thread per message. enqueue() never raises
         # (broker-callback safety invariant, §7.3).
         self._get_dispatcher().enqueue(handle_message, topic=topic)
+
+
+    def __seen_before(self, message_id: str) -> bool:
+        """Issue #4: whether `message_id` arrived recently, recording it
+        if not. Handling each id once keeps QoS 1 redeliveries from
+        causing duplicate side effects (CLAUDE.md invariant 3). Only the
+        last _DEDUP_WINDOW ids are remembered."""
+        with self._dedup_lock:
+            if message_id in self._recent_message_ids:
+                self._recent_message_ids.move_to_end(message_id)
+                return True
+            self._recent_message_ids[message_id] = None
+            if len(self._recent_message_ids) > _DEDUP_WINDOW:
+                self._recent_message_ids.popitem(last=False)
+            return False
 
 
     def __create_dispatcher(self):

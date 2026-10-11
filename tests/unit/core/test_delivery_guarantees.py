@@ -131,7 +131,6 @@ def test_holon_control_messages_travel_at_qos_1(bus):
         assert holon and all(q == 1 for q in holon.values()), holon
 
 
-@xfail_4
 def test_publish_sync_requests_and_replies_travel_at_qos_1(bus):
     service, client = _agent(bus, 'svc-agent'), _agent(bus, 'client')
     service.subscribe('svc', topic_handler=lambda topic, pcl: 'pong')
@@ -175,7 +174,6 @@ def test_invalid_qos_is_refused_up_front(agent_and_broker, qos):
 # B. Message ids
 # ==========================================================================
 
-@xfail_4
 def test_every_publish_stamps_a_fresh_message_id(agent_and_broker):
     agent, broker = agent_and_broker
     caller_parcel = TextParcel('x')
@@ -188,7 +186,6 @@ def test_every_publish_stamps_a_fresh_message_id(agent_and_broker):
     assert caller_parcel.message_id is None             # the caller's Parcel is not modified
 
 
-@xfail_4
 @pytest.mark.parametrize('parcel', [TextParcel({'q': 1}, topic_return='r'), BinaryParcel(b'raw')])
 def test_message_id_round_trips_in_both_encodings(parcel):
     parcel.message_id = 'm-1'
@@ -197,14 +194,12 @@ def test_message_id_round_trips_in_both_encodings(parcel):
     assert (decoded.content, decoded.topic_return) == (parcel.content, parcel.topic_return)
 
 
-@xfail_4
 def test_new_and_legacy_parcels_have_no_message_id():
     assert TextParcel('x').message_id is None
     legacy = b'text/json|{"version": 3, "content": "x", "topic_return": null, "error": null}'
     assert Parcel.from_payload(legacy).message_id is None
 
 
-@xfail_4
 @pytest.mark.parametrize('value', ['5', '["m"]', '{"a": 1}', '"' + 'a' * 129 + '"'])
 def test_malformed_message_id_decodes_as_none(value):
     payload = ('text/json|{"version": 3, "content": 1, "topic_return": null, '
@@ -222,7 +217,6 @@ def _collect(agent, topic):
     return seen
 
 
-@xfail_4
 def test_a_redelivered_message_is_handled_once(agent_and_broker):
     agent, broker = agent_and_broker
     seen = _collect(agent, 't')
@@ -242,7 +236,6 @@ def test_messages_without_a_message_id_are_never_deduplicated(agent_and_broker):
     assert _wait_until(lambda: len(seen) == 2)
 
 
-@xfail_4
 def test_the_deduplication_window_is_bounded():
     import agentflow.core.agent as agent_module
     window = agent_module._DEDUP_WINDOW
