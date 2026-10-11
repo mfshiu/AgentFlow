@@ -86,7 +86,6 @@ def _settle(seconds=SETTLE_S):
 # A. terminate only from registered parents
 # ==========================================================================
 
-@xfail_13
 def test_terminate_without_parent_id_is_ignored():
     child = Agent('leaf.root', {})
     with mock.patch.object(child, '_terminate') as term:
@@ -94,7 +93,6 @@ def test_terminate_without_parent_id_is_ignored():
     term.assert_not_called()
 
 
-@xfail_13
 def test_terminate_from_an_unregistered_parent_is_ignored():
     child = Agent('leaf.root', {})
     with mock.patch.object(child, '_terminate') as term:
@@ -111,7 +109,6 @@ def test_terminate_from_a_registered_parent_is_honoured():
     term.assert_called_once()
 
 
-@xfail_13
 def test_terminate_that_overtook_register_parent_runs_once_registered():
     child = Agent('leaf.root', {})
     seen = []
@@ -126,7 +123,6 @@ def test_terminate_that_overtook_register_parent_runs_once_registered():
     assert seen.count('terminate') == 1
 
 
-@xfail_13
 def test_deferred_terminate_expires(monkeypatch):
     import agentflow.core.agent as agent_module
     monkeypatch.setattr(agent_module, '_PENDING_TERMINATE_TTL_S', -1.0)
@@ -137,7 +133,6 @@ def test_deferred_terminate_expires(monkeypatch):
     term.assert_not_called()
 
 
-@xfail_13
 def test_deferred_terminates_are_bounded():
     child = Agent('leaf.root', {})
     with mock.patch.object(child, '_terminate'):
@@ -157,7 +152,6 @@ def test_trust_unregistered_parents_restores_the_old_behaviour():
 # B. holon.max_children
 # ==========================================================================
 
-@xfail_13
 def test_registrations_beyond_max_children_are_refused_without_reply():
     root = Agent('root', {'holon': {'max_children': 10}})
     registered, forwarded = [], []
@@ -173,7 +167,6 @@ def test_registrations_beyond_max_children_are_refused_without_reply():
     assert forwarded == first_ten
 
 
-@xfail_13
 def test_known_children_can_reregister_at_the_cap():
     root = Agent('root', {'holon': {'max_children': 2}})
     with mock.patch.object(root, '_notify_child') as reply:
@@ -195,7 +188,6 @@ def test_children_are_unlimited_by_default():
 # C. holon config validation
 # ==========================================================================
 
-@xfail_13
 @pytest.mark.parametrize('holon, error', [
     ('not a dict', TypeError),
     ({'bogus': 1}, ValueError),
@@ -231,7 +223,6 @@ def test_valid_holon_config_is_accepted(holon):
 # D. holon.control_secret
 # ==========================================================================
 
-@xfail_13
 def test_signature_binds_content_topic_key_and_time():
     ha = _holon_auth()
     msg = _content('terminate', 'P')
@@ -253,7 +244,6 @@ def test_signature_binds_content_topic_key_and_time():
     assert verify(signed, now=1000.0 + 299) is None
 
 
-@xfail_13
 def test_signature_survives_parcel_encoding():
     ha = _holon_auth()
     signed = ha.sign(KEY, 'to_child.root',
@@ -262,7 +252,6 @@ def test_signature_survives_parcel_encoding():
     assert ha.verify(KEY, 'to_child.root', decoded, max_age=300) is None
 
 
-@xfail_13
 @pytest.mark.parametrize('auth', [
     'not a dict',
     {'v': 2, 'ts': 1000000, 'mac': '0' * 64},
@@ -278,7 +267,6 @@ def test_malformed_auth_is_rejected_without_raising(auth):
     assert ha.verify(KEY, 'to_child.root', message, max_age=300, now=1000.0) is not None
 
 
-@xfail_13
 def test_content_that_cannot_be_encoded_canonically_is_rejected():
     ha = _holon_auth()
     deep = []
@@ -290,7 +278,6 @@ def test_content_that_cannot_be_encoded_canonically_is_rejected():
         assert ha.verify(KEY, 'to_child.root', message, max_age=300, now=1000.0) is not None
 
 
-@xfail_13
 def test_with_a_secret_unsigned_terminate_is_ignored_even_from_a_registered_parent():
     ha = _holon_auth()
     child = Agent('leaf.root', {'holon': {'control_secret': SECRET}})
@@ -308,7 +295,6 @@ def test_with_a_secret_unsigned_terminate_is_ignored_even_from_a_registered_pare
         term.assert_called_once()
 
 
-@xfail_13
 def test_with_a_secret_unsigned_membership_messages_are_ignored():
     config = {'holon': {'control_secret': SECRET}}
     root = Agent('root', config)
@@ -362,7 +348,6 @@ def _agent(bus, name, config):
 _CONTROL_SUBJECTS = {'terminate', 'register_child', 'register_parent', 'parent_online'}
 
 
-@xfail_13
 def test_holon_sharing_a_secret_converges_and_terminates(bus):
     config = {'holon': {'control_secret': SECRET}}
     root, mid, leaf = (_agent(bus, n, config) for n in ('a', 'b.a', 'c.b.a'))
@@ -380,7 +365,6 @@ def test_holon_sharing_a_secret_converges_and_terminates(bus):
     assert control and all('auth' in c for c in control)
 
 
-@xfail_13
 def test_agents_with_another_secret_do_not_join_the_holon(bus):
     root = _agent(bus, 'a', {'holon': {'control_secret': SECRET}})
     outsider = _agent(bus, 'b.a', {'holon': {'control_secret': OTHER_SECRET}})

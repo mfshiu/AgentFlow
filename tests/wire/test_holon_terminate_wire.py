@@ -89,7 +89,6 @@ def test_replica_terminate_does_not_stop_its_same_name_sibling():
 _CONTROL_SUBJECTS = {'terminate', 'register_child', 'register_parent', 'parent_online'}
 
 
-@pytest.mark.xfail(strict=True, reason='issue #13: holon control messages are not authenticated')
 def test_holon_sharing_a_control_secret_converges_and_terminates():
     """Issue #13: with holon.control_secret, membership and terminate
     still work over a real MQTT link, and every control message on the
