@@ -1,18 +1,26 @@
-"""Tests for RFC-006 publish_sync topic_wait collision (fail-fast).
+"""Tests for publish_sync topic_wait sharing and collisions.
 
-Post-RFC-006:
+RFC-006 made a second concurrent publish_sync on an already-awaited
+topic_wait fail fast, because replies could not be told apart.
+RFC-014 §8 (issue #36) lifts that: replies carry the request's
+correlation id, so concurrent calls share the topic_wait.
 
-  - publish_sync detects an already-awaited topic_wait under a lock
-    and raises TopicWaitCollisionError(RuntimeError) immediately —
-    no subscribe, no publish, no wait.
-  - The register + collision check is atomic under _handlers_lock.
-  - The finally identity-check-and-pop is atomic under the same lock.
-  - Agent.subscribe's warn-then-overwrite is unchanged (RFC-006 §7.11
-    scope limitation).
+  - Every caller on a shared topic_wait gets the reply that carries
+    its own correlation id, in whatever order the replies arrive.
+  - The topic has one registry entry and one broker subscription while
+    any caller waits. The last caller to leave removes both.
+  - A reply without a correlation id (a responder older than RFC-014)
+    is taken when exactly one caller waits. With several waiting it
+    cannot be attributed, so nobody takes it (RFC-006 Option D, FIFO,
+    stays rejected).
+  - A caller arriving while the last one unsubscribes does not end up
+    waiting on an unsubscribed topic.
+  - publish_sync on a topic owned by a normal subscribe handler still
+    raises TopicWaitCollisionError at once: no subscribe, no publish.
+  - Agent.subscribe's warn-then-overwrite is unchanged (RFC-006 §7.11).
   - Distinct topic_wait or omitted topic_wait continues to work.
 
-Two aspirational xfails remain, tracking correlation-ID / multi-
-handler fan-out (deferred to a future RFC).
+One aspirational xfail remains: multi-handler fan-out for subscribe.
 """
 
 import threading
@@ -67,6 +75,22 @@ def _count_published(broker, topic: str) -> int:
     return sum(1 for t, _ in broker.publish_calls if t == topic)
 
 
+def _requests(broker):
+    """The requests publish_sync has published on 'req', decoded."""
+    return [Parcel.from_payload(p) for t, p in broker.publish_calls if t == 'req']
+
+
+def _reply_to(broker, request, content):
+    """Answer `request` as an RFC-014 responder: echo its correlation id."""
+    reply = TextParcel(content)
+    reply.correlation_id = getattr(request, 'correlation_id', None)
+    broker.deliver(request.topic_return, reply.payload())
+
+
+xfail_shared = pytest.mark.xfail(
+    strict=True, reason='issue #36: concurrent publish_sync calls cannot share a topic_wait')
+
+
 def _spawn_publish_sync(agent, topic_wait, content, timeout):
     """Start publish_sync on a daemon background thread. Returns
     (thread, result, error) where result[0] and error[0] are set
@@ -113,59 +137,44 @@ def test_second_subscribe_overwrites_first_handler_in_registry():
         agent.terminate()
 
 
-def test_second_publish_sync_with_same_topic_wait_fails_fast():
-    """Was xfail(strict). Post-RFC-006: passes.
-    Second publish_sync with an already-awaited topic_wait raises
-    TopicWaitCollisionError within milliseconds (no timeout wait)."""
+@xfail_shared
+def test_shared_topic_wait_keeps_one_registry_entry_and_one_subscription():
+    """RFC-014 §8 (was RFC-006 fail-fast): a second publish_sync on an
+    already-awaited topic_wait joins the first instead of raising."""
     agent, broker = _make_agent()
     try:
-        a_thread, _, _ = _spawn_publish_sync(agent, 'T', 'A', timeout=2.0)
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
-        )
+        spawned = [_spawn_publish_sync(agent, 'T', body, timeout=3.0) for body in ('A', 'B')]
+        assert _wait_until(lambda: len(_requests(broker)) == 2, timeout=1.0)
+        record = _handlers(agent).get('T')
+        assert record is not None
+        assert record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+        assert _count_subscribed(broker, 'T') == 1
 
-        start = time.monotonic()
-        with pytest.raises(TopicWaitCollisionError):
-            agent.publish_sync('req', 'B', topic_wait='T', timeout=1.0)
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.1, (
-            f'collision should raise immediately; elapsed={elapsed:.3f}s'
-        )
-
-        a_thread.join(3.0)
+        for request in _requests(broker):
+            _reply_to(broker, request, 'r')
+        for thread, _, error in spawned:
+            thread.join(3.0)
+            assert error[0] is None, error[0]
+        assert 'T' not in _handlers(agent)
+        assert broker.unsubscribe_calls.count('T') == 1
     finally:
         agent.terminate()
 
 
-def test_publish_sync_two_threads_second_raises_collision():
-    """Two threads with the same topic_wait: first owns; second
-    raises TopicWaitCollisionError. First handler is not overwritten."""
+@xfail_shared
+def test_an_uncorrelated_reply_is_not_guessed_between_several_waiters():
+    """A responder older than RFC-014 sends no correlation id. With one
+    caller waiting the reply is taken as before; with several it cannot
+    be attributed, so nobody takes it rather than risk handing one
+    caller another's answer (RFC-006 Option D stays rejected)."""
     agent, broker = _make_agent()
     try:
-        a_thread, a_result, a_error = _spawn_publish_sync(
-            agent, 'T', 'A-body', timeout=1.0,
-        )
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
-        )
-        first_handler = _handlers(agent).get('T')
-        assert first_handler is not None
-
-        # Second call raises immediately.
-        with pytest.raises(TopicWaitCollisionError):
-            agent.publish_sync('req', 'B-body', topic_wait='T', timeout=1.0)
-
-        # First handler is still the same (not overwritten).
-        assert _handlers(agent).get('T') is first_handler
-
-        # Only one broker.subscribe for 'T'.
-        assert _count_subscribed(broker, 'T') == 1
-
-        # Deliver response — A completes normally.
-        broker.deliver('T', TextParcel('reply-for-A').payload())
-        a_thread.join(2.0)
-        assert a_result[0].content == 'reply-for-A'
-        assert a_error[0] is None
+        spawned = [_spawn_publish_sync(agent, 'T', body, timeout=1.0) for body in ('A', 'B')]
+        assert _wait_until(lambda: len(_requests(broker)) == 2, timeout=1.0)
+        broker.deliver('T', TextParcel('whose?').payload())
+        for thread, result, error in spawned:
+            thread.join(3.0)
+            assert result[0] is None and isinstance(error[0], TimeoutError), (result[0], error[0])
     finally:
         agent.terminate()
 
@@ -181,64 +190,42 @@ def test_TopicWaitCollisionError_is_RuntimeError_subclass():
 def test_collision_error_message_contains_offending_topic():
     agent, broker = _make_agent()
     try:
-        a_thread, _, _ = _spawn_publish_sync(
-            agent, 'my/topic/here', 'A', timeout=1.0,
-        )
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'my/topic/here') == 1,
-            timeout=1.0,
-        )
-
+        agent.subscribe('my/topic/here', topic_handler=lambda t, p: None)
         with pytest.raises(TopicWaitCollisionError) as exc_info:
             agent.publish_sync(
                 'req', 'B', topic_wait='my/topic/here', timeout=1.0,
             )
         assert 'my/topic/here' in str(exc_info.value)
-
-        a_thread.join(3.0)
     finally:
         agent.terminate()
 
 
-def test_collision_does_not_call_broker_subscribe_for_second_caller():
+def test_collision_does_not_call_broker_subscribe():
+    """A topic owned by a normal subscribe handler is refused before
+    any broker call."""
     agent, broker = _make_agent()
     try:
-        a_thread, _, _ = _spawn_publish_sync(agent, 'T', 'A', timeout=1.0)
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
-        )
+        agent.subscribe('T', topic_handler=lambda t, p: None)
         subscribes_before = len(broker.subscribe_calls)
 
         with pytest.raises(TopicWaitCollisionError):
             agent.publish_sync('req', 'B', topic_wait='T', timeout=1.0)
 
-        # No new broker.subscribe call.
         assert len(broker.subscribe_calls) == subscribes_before
-
-        a_thread.join(2.0)
     finally:
         agent.terminate()
 
 
-def test_collision_does_not_call_broker_publish_for_second_caller():
+def test_collision_does_not_call_broker_publish():
     agent, broker = _make_agent()
     try:
-        a_thread, _, _ = _spawn_publish_sync(agent, 'T', 'A', timeout=1.0)
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
-        )
-        assert _wait_until(
-            lambda: _count_published(broker, 'req') == 1, timeout=1.0,
-        )
+        agent.subscribe('T', topic_handler=lambda t, p: None)
         publishes_before = len(broker.publish_calls)
 
         with pytest.raises(TopicWaitCollisionError):
             agent.publish_sync('req', 'B', topic_wait='T', timeout=1.0)
 
-        # No new broker.publish call.
         assert len(broker.publish_calls) == publishes_before
-
-        a_thread.join(2.0)
     finally:
         agent.terminate()
 
@@ -246,27 +233,22 @@ def test_collision_does_not_call_broker_publish_for_second_caller():
 def test_collision_does_not_touch_registry_for_other_topics():
     agent, broker = _make_agent()
     try:
-        # Register an unrelated handler directly.
         def unrelated(topic, pcl):
             pass
-        agent.subscribe('other/topic', topic_handler=unrelated)
 
-        a_thread, _, _ = _spawn_publish_sync(agent, 'T', 'A', timeout=1.0)
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
-        )
+        def owner(topic, pcl):
+            pass
+        agent.subscribe('other/topic', topic_handler=unrelated)
+        agent.subscribe('T', topic_handler=owner)
         handlers_snapshot_before = dict(_handlers(agent))
 
         with pytest.raises(TopicWaitCollisionError):
             agent.publish_sync('req', 'B', topic_wait='T', timeout=1.0)
 
-        # Registry is unchanged (only 'T' matters; 'other/topic' still
-        # bound to unrelated).
         assert _handlers(agent) == handlers_snapshot_before
         assert _handlers(agent)['other/topic'].handler is unrelated
-        assert _handlers(agent)['other/topic'].owner_type is _HandlerOwnerType.NORMAL
-
-        a_thread.join(2.0)
+        assert _handlers(agent)['T'].handler is owner
+        assert _handlers(agent)['T'].owner_type is _HandlerOwnerType.NORMAL
     finally:
         agent.terminate()
 
@@ -469,62 +451,32 @@ def test_agent_terminate_during_concurrent_publish_sync_does_not_hang_waiters():
 
 
 # ==========================================================================
-# E. Stress: N callers, same topic_wait — exactly 1 owns, N-1 collide
+# E. Stress: N callers share one topic_wait
 # ==========================================================================
 
+@xfail_shared
 @pytest.mark.parametrize('n', [3, 10, 50])
-def test_N_callers_same_topic_wait_first_owns_rest_collide(n):
-    """Post-RFC-006: exactly one caller acquires ownership; every
-    other caller raises TopicWaitCollisionError immediately (does
-    NOT time out)."""
+def test_N_callers_share_one_topic_wait(n):
+    """n concurrent callers on one topic_wait: one subscription, and
+    each gets its own reply although the replies arrive in reverse."""
     agent, broker = _make_agent()
     try:
-        threads = []
-        results = []
-        errors = []
-        for i in range(n):
-            t, r, e = _spawn_publish_sync(
-                agent, 'T', f'body-{i}', timeout=2.0,
-            )
-            threads.append(t)
-            results.append(r)
-            errors.append(e)
+        spawned = [
+            _spawn_publish_sync(agent, 'T', f'body-{i}', timeout=5.0)
+            for i in range(n)
+        ]
+        assert _wait_until(lambda: len(_requests(broker)) == n, timeout=3.0), \
+            f'{len(_requests(broker))} of {n} requests published'
+        assert _count_subscribed(broker, 'T') == 1
 
-        # Wait until every thread has either acquired ownership
-        # (subscribed) or collided (raised). At most one subscribe
-        # will land on 'T'; the rest raise immediately.
-        assert _wait_until(
-            lambda: (
-                _count_subscribed(broker, 'T') == 1
-                and sum(1 for e in errors if e[0] is not None) == n - 1
-            ),
-            timeout=3.0,
-        ), (
-            f'expected 1 subscribe + {n-1} collisions; '
-            f'got subs={_count_subscribed(broker, "T")}, '
-            f'errors={sum(1 for e in errors if e[0] is not None)}'
-        )
-
-        # Every error is TopicWaitCollisionError; nobody timed out.
-        collision_count = sum(
-            1 for e in errors if isinstance(e[0], TopicWaitCollisionError)
-        )
-        timeout_count = sum(
-            1 for e in errors if isinstance(e[0], TimeoutError)
-        )
-        assert collision_count == n - 1
-        assert timeout_count == 0
-
-        # The one owner receives a response.
-        broker.deliver('T', TextParcel('for-owner').payload())
-        for t in threads:
-            t.join(3.0)
-
-        completed = sum(1 for r in results if r[0] is not None)
-        assert completed == 1
-        # Owner's response content is what we delivered.
-        owner_result = [r[0] for r in results if r[0] is not None][0]
-        assert owner_result.content == 'for-owner'
+        for request in reversed(_requests(broker)):
+            _reply_to(broker, request, f'reply-{request.content}')
+        for i, (thread, result, error) in enumerate(spawned):
+            thread.join(5.0)
+            assert error[0] is None, error[0]
+            assert result[0].content == f'reply-body-{i}'
+        assert 'T' not in _handlers(agent)
+        assert broker.unsubscribe_calls.count('T') == 1
     finally:
         agent.terminate()
 
@@ -533,100 +485,53 @@ def test_N_callers_same_topic_wait_first_owns_rest_collide(n):
 # F. Atomicity stress (register / cleanup race)
 # ==========================================================================
 
-def test_atomic_ownership_under_concurrent_race_stress():
-    """Many concurrent publish_sync calls compete for ownership of
-    the same topic_wait. Exactly one wins per round; there is no
-    torn state (no partial registration, no orphan handler).
-
-    `barrier` only synchronises entry to publish_sync; it does not
-    keep the callers overlapping. FakeBroker auto-responds inline in
-    publish(), so an unhindered owner can finish and release the topic
-    before a late thread reaches the ownership check, which then
-    legitimately becomes the next owner (sequential transfer, see
-    test_check_and_pop_atomicity_prevents_torn_state). `overlap_gate`
-    holds the owner inside broker.publish -- ownership registered,
-    response not yet delivered -- until every other caller has passed
-    the ownership check, so every round is a genuine race."""
+@xfail_shared
+def test_concurrent_callers_on_one_topic_wait_race_stress():
+    """Rounds of 8 concurrent publish_sync calls on one topic_wait,
+    answered inline from broker.publish by an RFC-014 responder, so
+    callers join and leave the topic in every interleaving. Every
+    caller gets its own reply, and no registry entry or subscription is
+    left behind."""
     agent, broker = _make_agent()
     original_publish = broker.publish
     try:
-        trials = 10
-        threads_per_trial = 8
-        for trial in range(trials):
+        def respond(pub_topic, payload):
+            original_publish(pub_topic, payload)
+            request = Parcel.from_payload(payload)
+            if request.topic_return:
+                _reply_to(broker, request, f'reply-{request.content}')
+        broker.publish = respond
+
+        callers = 8
+        for trial in range(10):
             topic = f'T-{trial}'
-            broker.auto_respond_with(f'r-{trial}')
+            barrier = threading.Barrier(callers, timeout=3.0)
+            outcomes: List[dict] = [{} for _ in range(callers)]
 
-            threads = []
-            errors = []
-            results = []
-            barrier = threading.Barrier(threads_per_trial, timeout=3.0)
-            overlap_gate = threading.Condition()
-            collided = [0]
-
-            def gated_publish(pub_topic, payload):
-                # Only the owner publishes. A second owner can never see
-                # all N-1 collisions, so it fails the round here (bounded)
-                # instead of hanging.
-                with overlap_gate:
-                    if not overlap_gate.wait_for(
-                        lambda: collided[0] >= threads_per_trial - 1,
-                        timeout=3.0,
-                    ):
-                        raise AssertionError(
-                            f'overlap_gate: {collided[0]} of '
-                            f'{threads_per_trial - 1} other callers collided'
-                        )
-                return original_publish(pub_topic, payload)
-
-            broker.publish = gated_publish
-
-            def target(r, e):
+            def target(i):
                 try:
                     barrier.wait()
-                    r[0] = agent.publish_sync(
-                        'req', 'x', topic_wait=topic, timeout=2.0,
+                    outcomes[i]['reply'] = agent.publish_sync(
+                        'req', f'{trial}-{i}', topic_wait=topic, timeout=3.0,
                     )
-                except TopicWaitCollisionError as ex:
-                    e[0] = ex
-                    with overlap_gate:
-                        collided[0] += 1
-                        overlap_gate.notify_all()
                 except BaseException as ex:
-                    e[0] = ex
+                    outcomes[i]['error'] = ex
 
-            for _ in range(threads_per_trial):
-                r = [None]
-                e = [None]
-                results.append(r)
-                errors.append(e)
-                th = threading.Thread(target=target, args=(r, e), daemon=True)
-                threads.append(th)
-                th.start()
-
+            threads = [threading.Thread(target=target, args=(i,), daemon=True)
+                       for i in range(callers)]
             for th in threads:
-                th.join(4.0)
+                th.start()
+            for th in threads:
+                th.join(5.0)
 
-            completed = sum(1 for r in results if r[0] is not None)
-            collisions = sum(
-                1 for e in errors if isinstance(e[0], TopicWaitCollisionError)
-            )
-            other = sum(
-                1 for e in errors
-                if e[0] is not None
-                and not isinstance(e[0], TopicWaitCollisionError)
-            )
-            assert other == 0, (
-                f'trial {trial}: unexpected errors '
-                f'{[e[0] for e in errors if e[0] is not None and not isinstance(e[0], TopicWaitCollisionError)]}'
-            )
-            assert completed == 1, f'trial {trial}: completed={completed}'
-            assert collisions == threads_per_trial - 1, (
-                f'trial {trial}: collisions={collisions}'
-            )
-            # After every trial, no orphan handler remains.
+            errors = [o['error'] for o in outcomes if 'error' in o]
+            assert not errors, f'trial {trial}: {errors}'
+            assert [o['reply'].content for o in outcomes] == \
+                [f'reply-{trial}-{i}' for i in range(callers)]
             assert topic not in _handlers(agent)
-
-            broker.stop_auto_responding()
+            subscribes = _count_subscribed(broker, topic)
+            assert subscribes >= 1
+            assert broker.unsubscribe_calls.count(topic) == subscribes
     finally:
         agent.terminate()
 
@@ -649,44 +554,84 @@ def test_check_and_pop_atomicity_prevents_torn_state():
         agent.terminate()
 
 
+class _SlowUnsubscribeBroker(FakeBroker):
+    """Holds every unsubscribe until `release` is set."""
+
+    def __init__(self, notifier):
+        super().__init__(notifier)
+        self.unsubscribing = threading.Event()
+        self.release = threading.Event()
+
+    def unsubscribe(self, topic):
+        self.unsubscribing.set()
+        self.release.wait(3.0)
+        super().unsubscribe(topic)
+
+
+@xfail_shared
+def test_a_caller_joining_while_the_last_one_unsubscribes_stays_subscribed():
+    """The last caller to leave a topic_wait unsubscribes it after
+    releasing the registry lock. A caller arriving meanwhile must not
+    subscribe before that unsubscribe lands, or it would wait on a
+    topic the broker no longer delivers. (This race predates RFC-014
+    for sequential reuse; sharing makes it common.)"""
+    agent = Agent(name='test_r006', agent_config={
+        'dispatch': {'shutdown_timeout_s': 1.0},
+    })
+    broker = _SlowUnsubscribeBroker(notifier=agent)
+    agent._broker = broker
+    agent._agent_worker = FakeWorker()
+    try:
+        broker.auto_respond_with('for-A')
+        a_thread, a_result, _ = _spawn_publish_sync(agent, 'T', 'A', timeout=2.0)
+        assert broker.unsubscribing.wait(2.0)       # A answered and is leaving
+        broker.stop_auto_responding()
+
+        b_thread, b_result, _ = _spawn_publish_sync(agent, 'T', 'B', timeout=3.0)
+        time.sleep(0.3)                             # B arrives during A's unsubscribe
+        broker.release.set()
+        a_thread.join(3.0)
+        assert a_result[0].content == 'for-A'
+
+        assert _wait_until(lambda: 'T' in broker.subscribed_topics, timeout=2.0), \
+            'B is waiting on a topic that is no longer subscribed'
+        assert _wait_until(lambda: len(_requests(broker)) == 2, timeout=2.0)
+        _reply_to(broker, _requests(broker)[1], 'for-B')
+        b_thread.join(3.0)
+        assert b_result[0].content == 'for-B'
+    finally:
+        broker.release.set()
+        agent.terminate()
+
+
 # ==========================================================================
-# G. Aspirational strict xfails — kept for future RFC
+# G. Shared topic_wait (RFC-014 §8), and an aspirational strict xfail
 # ==========================================================================
 
-@pytest.mark.xfail(
-    reason=('R.4 follow-up: RFC-006 closed the fast-fail path — a '
-            'second caller with the same topic_wait now raises '
-            'TopicWaitCollisionError. True concurrent multi-caller '
-            'support (both callers receive their own response) '
-            'requires a correlation-ID metadata field on Parcel and '
-            'is deferred to a future RFC under R-20.'),
-    strict=True,
-)
+@xfail_shared
 def test_both_callers_should_receive_own_response_with_shared_topic_wait():
+    """RFC-014 §8: each caller gets the reply carrying its own
+    correlation id, whatever order the replies arrive in."""
     agent, broker = _make_agent()
     try:
         a_thread, a_result, a_error = _spawn_publish_sync(
-            agent, 'T', 'A', timeout=1.0,
-        )
-        assert _wait_until(
-            lambda: _count_subscribed(broker, 'T') == 1, timeout=1.0,
+            agent, 'T', 'A', timeout=3.0,
         )
         b_thread, b_result, b_error = _spawn_publish_sync(
-            agent, 'T', 'B', timeout=1.0,
+            agent, 'T', 'B', timeout=3.0,
         )
         assert _wait_until(
-            lambda: b_error[0] is not None or _count_subscribed(broker, 'T') == 2,
+            lambda: len(_requests(broker)) == 2 or a_error[0] or b_error[0],
             timeout=1.0,
         )
 
-        broker.deliver('T', TextParcel('for-A').payload())
-        broker.deliver('T', TextParcel('for-B').payload())
+        for request in reversed(_requests(broker)):
+            _reply_to(broker, request, f'for-{request.content}')
 
-        a_thread.join(2.0)
-        b_thread.join(2.0)
-        # Ideal (future RFC): both complete with own responses.
-        assert a_result[0] is not None
-        assert b_result[0] is not None
+        a_thread.join(3.0)
+        b_thread.join(3.0)
+        assert (a_error[0], b_error[0]) == (None, None)
+        assert (a_result[0].content, b_result[0].content) == ('for-A', 'for-B')
     finally:
         agent.terminate()
 
