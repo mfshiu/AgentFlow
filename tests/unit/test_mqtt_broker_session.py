@@ -174,10 +174,7 @@ def test_the_agent_does_not_retry_a_refusal_that_retrying_cannot_fix(monkeypatch
     assert time.monotonic() - started < 2.0
 
 
-xfail_review = pytest.mark.xfail(strict=True, reason='issue #17: gaps found in review')
 
-
-@xfail_review
 def test_a_refusal_followed_by_its_disconnect_is_still_reported_as_a_refusal(client_kwargs, fake_client):
     """On a refused CONNACK paho calls on_connect and then on_disconnect,
     which cleared the event start() waits for. If both ran before start()
@@ -199,7 +196,6 @@ def test_a_refusal_followed_by_its_disconnect_is_still_reported_as_a_refusal(cli
     assert refused.value.retryable is False
 
 
-@xfail_review
 def test_a_start_that_timed_out_rolls_its_client_back_once_connect_returns(client_kwargs, fake_client):
     """start() gives up while connect() is still blocked (START_TIMEOUT)
     and defers the rollback to a stop() that the Agent never calls: it

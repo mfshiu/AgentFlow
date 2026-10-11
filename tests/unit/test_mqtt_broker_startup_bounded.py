@@ -1075,12 +1075,11 @@ def test_G63_stop_runs_cleanup_at_most_once_across_concurrent_callers(
     assert probe.returned.wait(1.0)
     release.set()   # helper can finish
 
-    # Give helper a moment to complete connect and loop_start.
+    # Give helper a moment to complete connect and loop_start. Since
+    # issue #17 the helper also runs the rollback itself once it
+    # finishes after a START_TIMEOUT, so that cleanup is counted below.
     if broker._start_helper_thread is not None:
         broker._start_helper_thread.join(2.0)
-
-    fake_client.disconnect.reset_mock()
-    fake_client.loop_stop.reset_mock()
 
     N = 4
     barrier = threading.Barrier(N, timeout=2.0)
@@ -1102,7 +1101,8 @@ def test_G63_stop_runs_cleanup_at_most_once_across_concurrent_callers(
     for e in done:
         assert e.wait(3.0)
 
-    # Cleanup primitive was run at most once → exactly one disconnect
+    # Cleanup primitive was run at most once in all (the helper's
+    # rollback, then cached for every stop()) → exactly one disconnect
     # + one loop_stop reached paho.
     assert fake_client.disconnect.call_count == 1
     assert fake_client.loop_stop.call_count == 1
@@ -1121,7 +1121,9 @@ def test_G64_start_timeout_cleanup_result_cached(broker, fake_client):
     if broker._start_helper_thread is not None:
         broker._start_helper_thread.join(2.0)
 
-    assert broker._last_start_cleanup_result is None
+    # Issue #17: the helper rolled its client back as soon as it
+    # finished (was: None until a stop()).
+    assert broker._last_start_cleanup_result is True
     assert broker.stop(graceful_timeout_s=2.0) is True
     assert broker._last_start_cleanup_result is True
     # Second stop returns cached result without re-running primitive.

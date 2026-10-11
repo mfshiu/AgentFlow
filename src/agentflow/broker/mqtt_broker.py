@@ -207,6 +207,12 @@ class MqttBroker(MessageBroker):
         self._connect_err = None
         # Issue #17: the CONNACK reason code of the last refusal.
         self._connect_rc: Optional[int] = None
+        # Issue #17: what start() waits for. Set by _on_connect on every
+        # CONNACK, accepted or refused, and reset only when start()
+        # begins. _on_disconnect clears _connected_evt and _connect_ok,
+        # so a refusal followed at once by its disconnect went unseen.
+        self._connack_evt = threading.Event()
+        self._connack_ok = False
 
         # 等待連線的行為設定
         self._wait = wait
@@ -320,6 +326,7 @@ class MqttBroker(MessageBroker):
                     skip = True
                 else:
                     self._connect_ok = True
+                    self._connack_ok = True
                     self._connect_err = None
                     is_first = not self._ever_connected
                     self._ever_connected = True
@@ -355,6 +362,7 @@ class MqttBroker(MessageBroker):
                     )
             finally:
                 self._connected_evt.set()
+                self._connack_evt.set()
         else:
             # Failure branch also fences post-stop.
             with self._state_lock:
@@ -364,6 +372,7 @@ class MqttBroker(MessageBroker):
                     )
                     return
                 self._connect_ok = False
+                self._connack_ok = False
                 self._connected = False
             name = getattr(reasonCode, "getName", lambda: str(reasonCode))()
             try:
@@ -374,6 +383,7 @@ class MqttBroker(MessageBroker):
             self._connect_err = f"{self._connect_rc} ({name})"
             logger.error(f"MQTT connection failed: {self._connect_err}")
             self._connected_evt.set()
+            self._connack_evt.set()
 
     def _recover_subscriptions(self, snapshot: Dict[str, Tuple[Any, int]]) -> None:
         """RFC-005 §6.3 recovery loop. Iterates the snapshot OUTSIDE
@@ -549,6 +559,8 @@ class MqttBroker(MessageBroker):
                 )
                 self.client_id = client_id
                 self._connected_evt.clear()
+                self._connack_evt.clear()
+                self._connack_ok = False
                 self._start_complete_event.clear()
                 self._start_generation += 1
                 self._last_start_result = False
@@ -653,6 +665,10 @@ class MqttBroker(MessageBroker):
                 self._transition_to_start_failure(
                     WorkerState.START_TIMEOUT, exc,
                 )
+                if not helper.is_alive():
+                    # Issue #17: the helper finished just now and may
+                    # have missed the transition; roll back here.
+                    self._rollback_after_start_timeout()
                 raise exc
 
             # Helper finished. Check outcome.
@@ -702,7 +718,7 @@ class MqttBroker(MessageBroker):
 
             # wait=True: await callback within the SAME remaining budget.
             remaining = max(0.0, deadline - time.monotonic())
-            if not self._connected_evt.wait(remaining):
+            if not self._connack_evt.wait(remaining):
                 # Callback wait timeout. Startup helper has finished;
                 # safe to run rollback.
                 exc = TimeoutError(
@@ -716,7 +732,7 @@ class MqttBroker(MessageBroker):
                 self._run_client_shutdown_primitive_and_cache()
                 raise exc
 
-            if not self._connect_ok:
+            if not self._connack_ok:
                 exc = MqttConnectRefused(
                     f"MQTT connect failed: {self._connect_err}",
                     self._connect_rc,
@@ -902,6 +918,34 @@ class MqttBroker(MessageBroker):
                 pass
         # Reached iff no BaseException propagated.
         self._start_helper_completed_normally = True
+        # Issue #17: if start() gave up while connect() was blocked
+        # (START_TIMEOUT), it deferred the rollback to a stop() that the
+        # Agent never calls: it retries with a fresh broker. Left
+        # running, this client would reconnect under the same client id
+        # as its replacement, and the two would keep taking over each
+        # other's session. Roll it back now.
+        with self._state_lock:
+            timed_out = self._state == WorkerState.START_TIMEOUT
+        if timed_out:
+            self._rollback_after_start_timeout()
+
+
+    def _rollback_after_start_timeout(self) -> None:
+        """Issue #17: run the client-shutdown primitive once a start
+        that ended in START_TIMEOUT has no helper left touching the
+        client. Called from the startup helper itself when it finishes,
+        or from start() if the helper finished just as start() gave up.
+        At most once, serialised with stop()'s START_TIMEOUT recovery by
+        `_start_timeout_recovery_lock` and the cached cleanup result."""
+        if not self._start_timeout_recovery_lock.acquire(timeout=5.0):
+            return
+        try:
+            with self._state_lock:
+                if self._last_start_cleanup_result is not None:
+                    return
+            self._run_client_shutdown_primitive_and_cache()
+        finally:
+            self._start_timeout_recovery_lock.release()
 
 
     def _run_client_shutdown_primitive(self, *,
@@ -1006,6 +1050,29 @@ class MqttBroker(MessageBroker):
         if cached is not None:
             return cached
 
+        # Bounded-wait for the startup helper BEFORE taking the lock.
+        # RFC-011 modification 2: MUST NOT run the primitive while the
+        # startup helper is still alive (would race on same paho
+        # client). Since issue #17 the helper takes the lock itself to
+        # roll back once it finishes, so joining it while holding the
+        # lock would stall both until the join timed out.
+        startup_helper = self._start_helper_thread
+        if startup_helper is not None and startup_helper.is_alive():
+            startup_helper.join(graceful_timeout_s)
+            if startup_helper.is_alive():
+                try:
+                    logger.warning(
+                        f"MqttBroker.stop from START_TIMEOUT: "
+                        f"startup helper still alive after "
+                        f"{graceful_timeout_s:.1f}s bounded wait; "
+                        f"deferring cleanup (would race on paho client)"
+                    )
+                except Exception:
+                    pass
+                # Do NOT cache False permanently — a later stop()
+                # retry can try again once the helper finishes.
+                return False
+
         # Serialise so concurrent callers do not double-run the primitive.
         # Bounded acquire — return False if we cannot acquire in time.
         acquired = self._start_timeout_recovery_lock.acquire(
@@ -1034,26 +1101,6 @@ class MqttBroker(MessageBroker):
                 cached = self._last_start_cleanup_result
             if cached is not None:
                 return cached
-
-            # Bounded-wait for startup helper to finish. RFC-011
-            # modification 2: MUST NOT run the primitive while startup
-            # helper is still alive (would race on same paho client).
-            startup_helper = self._start_helper_thread
-            if startup_helper is not None and startup_helper.is_alive():
-                startup_helper.join(graceful_timeout_s)
-                if startup_helper.is_alive():
-                    try:
-                        logger.warning(
-                            f"MqttBroker.stop from START_TIMEOUT: "
-                            f"startup helper still alive after "
-                            f"{graceful_timeout_s:.1f}s bounded wait; "
-                            f"deferring cleanup (would race on paho client)"
-                        )
-                    except Exception:
-                        pass
-                    # Do NOT cache False permanently — a later stop()
-                    # retry can try again once the helper finishes.
-                    return False
 
             # Startup helper has finished. Safe to run cleanup once.
             result = self._run_client_shutdown_primitive_and_cache(
