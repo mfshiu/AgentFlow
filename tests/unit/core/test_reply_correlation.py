@@ -117,7 +117,6 @@ def _serve(agent, handler):
     return handled
 
 
-@xfail_36
 @pytest.mark.parametrize('kind', ['content', 'parcel', 'error'])
 def test_auto_reply_echoes_the_request_correlation_id(agent_and_broker, kind):
     agent, broker = agent_and_broker
