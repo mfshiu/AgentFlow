@@ -1280,7 +1280,30 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Verification.** `tests/unit/core/test_holon_membership.py` (15 tests on `tests/fakes/fake_bus.py`) and `tests/wire/test_holon_wire.py` (real MqttBroker clients; child first → server drops every connection → parent replaced → terminate cascades).
 
-**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4), QoS 1 for control messages (#4), and the mid-tier terminate echo (#5). The latter now matters more, because mid-tier agents now actually have registered children in every start order.
+**Still open.** Membership expiry (LWT / `unregister_child`, roadmap P1-4) and QoS 1 for control messages (#4).
+
+### Mid-tier terminate echo storm (2026-10-11, issue #5)
+
+**Problem.** A mid-tier agent (e.g. `b.a`) listens on `to_child.b.a`, the channel for messages addressed to agents named `b.a`, and broadcasts to its own children on that same topic. The broker echoes a client's own publishes back (MQTT 3.1.1 has no no-local). So one `terminate` from the root made `b.a` receive its own `terminate`, run `_terminate` again, broadcast again, and start one more delayed-stop thread each round, until the 1 s stop fired. On a capped FakeBus, the mid-tier and leaf bodies each ran 147 times. Membership convergence (#6) made this reachable in every start order.
+
+**Change** (`src/agentflow/core/agent.py`):
+
+- `_terminate` runs its body once: a test-and-set under the runtime-only `_terminate_lock`. Later calls, whether from a worker stop, a parent's `terminate` or an echo, return immediately. So one broadcast and one delayed-stop thread per agent. If the body does not finish (e.g. `Thread.start` fails, or a `KeyboardInterrupt` lands), the flag is cleared again, so the next request retries instead of leaving the agent unstoppable.
+- `_handle_parents` drops any message whose `parent_id` is the agent itself (its own broadcast echoed back). It neither acts on it nor passes it to `on_parents_message`.
+
+**Verification.** `tests/unit/core/test_holon_terminate.py` (3-level hierarchy on a FakeBus capped at 300 deliveries):
+
+- Each body runs once.
+- The mid-tier broadcasts once, with no dropped deliveries.
+- The cascade reaches every level.
+- `_terminate` is idempotent, and one that failed part-way can be retried.
+- The agent's own broadcast never reaches its own `on_parents_message`.
+
+`tests/wire/test_holon_terminate_wire.py` checks the same 3-level cascade over real MqttBroker clients, where the mid-tier publishes `terminate` exactly once.
+
+**Compatibility.** Message shapes are unchanged. `on_parents_message` no longer receives the agent's own broadcasts.
+
+**Still open.** A same-name replica's broadcast on `to_child.{name}` is still accepted, so one mid-tier replica's `terminate` also stops its same-name replicas. The topic is ambiguous (#38), and control messages are unauthenticated (#13). Because `_terminate` now runs once, the replicas can no longer bounce `terminate` back and forth.
 
 ---
 
