@@ -116,19 +116,25 @@ class _ReplyRouter:
 
     A reply goes to the caller whose correlation id it carries. One
     without an id (a responder older than RFC-014) goes to the caller
-    waiting if there is exactly one; with several it cannot be
-    attributed, and nobody takes it rather than risk handing a caller
-    another's answer (RFC-006 Option D, FIFO, stays rejected). The
-    first reply a caller receives wins."""
+    waiting only while no other call has shared the topic. Once calls
+    have overlapped it cannot be attributed, even after all but one
+    have left (it may answer a call that already timed out), and nobody
+    takes it rather than risk handing a caller another's answer
+    (RFC-006 Option D, FIFO, stays rejected). The router is dropped
+    when its last caller leaves, so a topic_wait reused without overlap
+    behaves as before. The first reply a caller receives wins."""
 
     def __init__(self, owner_tag: str):
         self._owner_tag = owner_tag
         self._lock = threading.Lock()
         self._waiters: dict = {}        # correlation id -> Agent.DataEvent
+        self._shared = False            # calls have overlapped on the topic
         self._unattributed = 0
 
     def add(self, correlation_id: str, waiter) -> None:
         with self._lock:
+            if self._waiters:
+                self._shared = True
             self._waiters[correlation_id] = waiter
 
     def remove(self, correlation_id: str) -> bool:
@@ -144,7 +150,7 @@ class _ReplyRouter:
             waiting = len(self._waiters)
             if reply_id is not None:
                 waiter = self._waiters.get(reply_id)
-            elif waiting == 1:
+            elif waiting == 1 and not self._shared:
                 waiter = next(iter(self._waiters.values()))
             else:
                 waiter = None
@@ -161,7 +167,7 @@ class _ReplyRouter:
             # flood cannot flood the log.
             level = logging.WARNING if unattributed & (unattributed - 1) == 0 else logging.DEBUG
             logger.log(level, f"{self._owner_tag} Ignored a reply without a correlation id "
-                              f"on {topic!r}: {waiting} calls wait there, so it cannot be "
+                              f"on {topic!r}: calls have shared that topic, so it cannot be "
                               f"attributed. Its responder predates RFC-014.")
         else:
             # A reply to another request, e.g. a late reply to an

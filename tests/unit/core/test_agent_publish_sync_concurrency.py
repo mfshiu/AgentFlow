@@ -174,7 +174,6 @@ def test_an_uncorrelated_reply_is_not_guessed_between_several_waiters():
         agent.terminate()
 
 
-@pytest.mark.xfail(strict=True, reason='issue #36: an uncorrelated reply goes to whoever is left waiting')
 def test_an_uncorrelated_reply_is_not_handed_to_whoever_is_left_waiting():
     """Once calls have overlapped on a topic, a reply without a
     correlation id stays unattributable even after all but one have
