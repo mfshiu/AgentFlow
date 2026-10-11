@@ -18,7 +18,7 @@ import inspect
 import pytest
 
 from agentflow.broker.empty_broker import EmptyBroker
-from agentflow.broker.mqtt_broker import MqttBroker
+from agentflow.broker.mqtt_broker import MqttBroker, MqttPublishError
 from agentflow.broker.redis_broker import RedisBroker
 from agentflow.broker.ros_broker import RosBroker
 
@@ -28,6 +28,15 @@ class _PublishInfo:
     """paho 2's MQTTMessageInfo shape for a successful publish."""
     rc = 0
     mid = 1
+
+
+class _NoConnInfo:
+    """paho 2's result when the socket is already gone (MQTT_ERR_NO_CONN)."""
+    rc = 4
+    mid = 7
+
+
+xfail_review = pytest.mark.xfail(strict=True, reason='issue #4: gaps found in review')
 
 
 def _fire_connect(broker, fake_client, rc: int = 0):
@@ -93,3 +102,38 @@ def test_every_built_in_broker_accepts_the_qos_keywords(broker_class):
     assert publish['qos'].kind is inspect.Parameter.KEYWORD_ONLY and publish['qos'].default == 0
     assert publish['retain'].kind is inspect.Parameter.KEYWORD_ONLY and publish['retain'].default is False
     assert subscribe['qos'].kind is inspect.Parameter.KEYWORD_ONLY and subscribe['qos'].default == 0
+
+
+@xfail_review
+def test_a_qos_1_publish_paho_queued_without_a_socket_counts_as_accepted(broker, fake_client):
+    """paho closes the socket before it reports the disconnect. In that
+    window a QoS >= 1 publish gets MQTT_ERR_NO_CONN, yet paho keeps the
+    message and sends it after the reconnect. Reporting it as failed
+    would make a caller retry, and the service run the request twice
+    under two message ids. A QoS 0 publish is not kept, and still fails."""
+    _fire_connect(broker, fake_client)
+    fake_client.publish.return_value = _NoConnInfo()
+    assert broker.publish('t', b'x', qos=1) is fake_client.publish.return_value
+    with pytest.raises(MqttPublishError):
+        broker.publish('t', b'x')
+
+
+@xfail_review
+def test_the_resubscribe_after_a_reconnect_uses_each_topics_current_qos(broker, fake_client):
+    """A subscribe() that changes a topic's QoS while recovery is running
+    must not be undone by recovery resubscribing at the snapshot's QoS."""
+    _fire_connect(broker, fake_client)
+    broker.subscribe('Z', 'str')
+    broker.subscribe('A', 'str')                # QoS 0 in the snapshot
+    _fire_disconnect(broker, fake_client)
+    fake_client.subscribe.reset_mock()
+
+    def raise_qos_of_a_during_recovery(topic, qos=0):
+        if topic == 'Z':
+            broker.subscribe('A', 'str', qos=1)
+    fake_client.subscribe.side_effect = raise_qos_of_a_during_recovery
+    _fire_connect(broker, fake_client)
+
+    last_for_a = [c.kwargs.get('qos', 0) for c in fake_client.subscribe.call_args_list
+                  if c.kwargs['topic'] == 'A'][-1]
+    assert last_for_a == 1

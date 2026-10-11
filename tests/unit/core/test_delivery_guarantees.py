@@ -329,7 +329,9 @@ def test_a_requester_fails_fast_when_the_service_is_overloaded(bus):
         background[0].start()
         assert busy.wait(2)
         background[1].start()
-        assert _wait_until(lambda: len([t for t, *_ in _sent(client) if t == 'svc']) == 2)
+        # Wait until the second request is queued at the service, not just
+        # sent: FakeBusBroker records a publish before it routes it.
+        assert _wait_until(lambda: service._get_dispatcher().metrics_snapshot()['queue_depth'] == 1)
 
         started = time.monotonic()
         reply = client.publish_sync('svc', 'third', timeout=5)
