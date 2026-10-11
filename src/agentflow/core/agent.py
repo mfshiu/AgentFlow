@@ -1,5 +1,5 @@
 import copy
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import inspect
 import logging
 import math
@@ -41,6 +41,9 @@ _CONTROL_QOS = 1
 # Issue #4: how many recently received message ids an agent remembers to
 # drop redeliveries (QoS 1 resends follow a reconnect closely).
 _DEDUP_WINDOW = 4096
+# Follow-up of #17: at most this many messages with no handler are held
+# while the lifecycle hooks are still registering handlers.
+_EARLY_MESSAGE_LIMIT = 4096
 
 # Issue #13: keys accepted in the optional `holon` config section.
 _HOLON_KEYS = frozenset({
@@ -240,6 +243,15 @@ class Agent(BrokerNotifier):
         # first; a redelivered id is dropped (see __seen_before).
         self._recent_message_ids: OrderedDict = OrderedDict()
         self._dedup_lock = threading.Lock()
+        # Follow-up of #17: messages with no handler that arrive while
+        # lifecycle hooks are still registering handlers are held here
+        # (see __await_hook) and released once every awaited hook has
+        # returned. Only agents run through _activate are gated.
+        self._early_lock = threading.Lock()
+        self._early_messages: deque = deque()
+        self._awaiting_hooks: set = set()
+        self._early_dropped = 0
+        self._lifecycle_gating = False
 
         self._broker = None
         self._connected_once = False
@@ -278,6 +290,9 @@ class Agent(BrokerNotifier):
         '_reply_topics_lock',
         '_recent_message_ids',
         '_dedup_lock',
+        '_early_lock',
+        '_early_messages',
+        '_awaiting_hooks',
         '_dispatcher_init_lock',
         '_dispatcher',
         '_broker',
@@ -357,6 +372,9 @@ class Agent(BrokerNotifier):
         self._reply_topics_lock = threading.RLock()
         self._recent_message_ids = OrderedDict()
         self._dedup_lock = threading.Lock()
+        self._early_lock = threading.Lock()
+        self._early_messages = deque()
+        self._awaiting_hooks = set()
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
         self._broker = None
@@ -825,15 +843,26 @@ class Agent(BrokerNotifier):
         self.config = config
         self.__terminate_event = threading.Event()
 
-        if self.__activating():
-            sig = inspect.signature(self.on_activate)
-            if len(sig.parameters) == 0:
-                self.on_activate()
-            elif isinstance(sig.parameters.get('self'), Agent):
-                self.on_activate(self)
-            else:
-                self.on_activate(self.config)
+        # Follow-up of #17: a resumed persistent session delivers its
+        # queued messages right after the CONNACK, before on_activate
+        # (or on_connected, see _on_connect) has registered the
+        # handlers. Hold messages with no handler until they return.
+        self._lifecycle_gating = True
+        self.__await_hook('on_activate')
+        try:
+            activated = self.__activating()
+            if activated:
+                sig = inspect.signature(self.on_activate)
+                if len(sig.parameters) == 0:
+                    self.on_activate()
+                elif isinstance(sig.parameters.get('self'), Agent):
+                    self.on_activate(self)
+                else:
+                    self.on_activate(self.config)
+        finally:
+            self.__hook_done('on_activate')
 
+        if activated:
             logger.info(self.M("Waiting for termination..."))
             work_queue = config['work_queue']
             while not self.__terminate_event.is_set():
@@ -1582,10 +1611,17 @@ class Agent(BrokerNotifier):
         # Issue #6: children that started first registered with nobody.
         self._announce_parent_online()
 
+        if self._lifecycle_gating:
+            # Follow-up of #17: handlers may be registered in on_connected.
+            self.__await_hook('on_connected')
+
         def handle_connected():
-            time.sleep(1)
-            self.__connected_event.set()
-            self.on_connected()
+            try:
+                time.sleep(1)
+                self.__connected_event.set()
+                self.on_connected()
+            finally:
+                self.__hook_done('on_connected')
         threading.Thread(target=handle_connected).start()
 
 
@@ -1627,6 +1663,19 @@ class Agent(BrokerNotifier):
             # whose acknowledgement was lost across a reconnect.
             logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
             return
+        self.__route(topic, pcl)
+
+
+    def __route(self, topic, pcl):
+        """Hand a decoded, deduplicated message to its handler through
+        the dispatcher (RFC-003 / RFC-004 / RFC-007). Follow-up of #17:
+        while lifecycle hooks are still registering handlers, a message
+        with no handler is held instead, and replayed here once they
+        have returned."""
+        with self._early_lock:
+            if self._awaiting_hooks and not self.__has_handler(topic):
+                self.__hold(topic, pcl)
+                return
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
         # registry under _handlers_lock. is_specific_handler and
@@ -1702,6 +1751,52 @@ class Agent(BrokerNotifier):
                              "(dispatcher queue full or stopping)")
             dropped.correlation_id = pcl.correlation_id
             self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+
+
+    def __has_handler(self, topic) -> bool:
+        with self._handlers_lock:
+            return topic in self.__topic_handlers
+
+
+    def __hold(self, topic, pcl) -> None:
+        """Follow-up of #17: keep a message for release by __hook_done.
+        Called under _early_lock. Beyond _EARLY_MESSAGE_LIMIT the message
+        is dropped and counted; logged at WARNING on the 1st, 2nd, 4th,
+        ... drop."""
+        if len(self._early_messages) >= _EARLY_MESSAGE_LIMIT:
+            self._early_dropped += 1
+            dropped = self._early_dropped
+            level = logging.WARNING if dropped & (dropped - 1) == 0 else logging.DEBUG
+            logger.log(level, self.M(
+                f"Dropped a message on {topic!r} that arrived before the handlers were "
+                f"registered: {_EARLY_MESSAGE_LIMIT} already held ({dropped} dropped so far)."))
+            return
+        self._early_messages.append((topic, pcl))
+
+
+    def __await_hook(self, hook: str) -> None:
+        """Follow-up of #17: hold messages with no handler until `hook`
+        (and every other awaited hook) has returned; see __hook_done."""
+        with self._early_lock:
+            self._awaiting_hooks.add(hook)
+
+
+    def __hook_done(self, hook: str) -> None:
+        """Follow-up of #17: `hook` has returned. When no awaited hook is
+        left, release the held messages through __route, in arrival
+        order. They skip deduplication, which recorded their ids when
+        they arrived."""
+        with self._early_lock:
+            self._awaiting_hooks.discard(hook)
+            if self._awaiting_hooks:
+                return
+            held = list(self._early_messages)
+            self._early_messages.clear()
+        if held:
+            logger.info(self.M(
+                f"Releasing {len(held)} message(s) that arrived before the handlers were registered."))
+        for topic, pcl in held:
+            self.__route(topic, pcl)
 
 
     def __seen_before(self, message_id: str) -> bool:

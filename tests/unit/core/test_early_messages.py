@@ -31,7 +31,6 @@ from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_held = pytest.mark.xfail(strict=True, reason='messages before handler registration are lost')
 
 SETTLE_S = 0.3
 
@@ -72,7 +71,6 @@ def _done(agent, hook):
     agent._Agent__hook_done(hook)
 
 
-@xfail_held
 def test_a_held_message_reaches_the_handler_registered_meanwhile(agent_and_broker):
     agent, broker = agent_and_broker
     _await(agent, 'on_activate')
@@ -88,7 +86,6 @@ def test_a_held_message_reaches_the_handler_registered_meanwhile(agent_and_broke
     assert _wait_until(lambda: jobs == ['j1'] and agent.unhandled == [('stray', 's1')])
 
 
-@xfail_held
 def test_messages_with_a_handler_are_never_held(agent_and_broker):
     agent, broker = agent_and_broker
     jobs = []
@@ -99,7 +96,6 @@ def test_messages_with_a_handler_are_never_held(agent_and_broker):
     _done(agent, 'on_activate')
 
 
-@xfail_held
 def test_the_gate_opens_only_when_every_awaited_hook_has_returned(agent_and_broker):
     agent, broker = agent_and_broker
     _await(agent, 'on_activate', 'on_connected')
@@ -111,7 +107,6 @@ def test_the_gate_opens_only_when_every_awaited_hook_has_returned(agent_and_brok
     assert _wait_until(lambda: agent.unhandled == [('stray', 's1')])
 
 
-@xfail_held
 def test_the_hold_is_bounded():
     limit = agent_module._EARLY_MESSAGE_LIMIT
     agent = Recorder({'dispatch': {'queue_capacity': 2 * limit, 'shutdown_timeout_s': 1.0}})
@@ -130,7 +125,6 @@ def test_the_hold_is_bounded():
         agent.terminate()
 
 
-@xfail_held
 def test_a_held_message_is_replayed_although_its_id_was_seen(agent_and_broker):
     agent, broker = agent_and_broker
     _await(agent, 'on_activate')
@@ -143,7 +137,6 @@ def test_a_held_message_is_replayed_although_its_id_was_seen(agent_and_broker):
     assert _wait_until(lambda: jobs == ['j1'])
 
 
-@xfail_held
 def test_a_held_request_is_answered_once_its_handler_exists(agent_and_broker):
     agent, broker = agent_and_broker
     _await(agent, 'on_activate')

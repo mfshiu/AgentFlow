@@ -18,7 +18,6 @@ from tests.fakes.mini_mqtt_server import MiniMqttServer
 
 pytestmark = pytest.mark.wire
 
-xfail_held = pytest.mark.xfail(strict=True, reason='messages before handler registration are lost')
 
 
 def _config(port):
@@ -65,7 +64,6 @@ def _run(agent_class, queued):
     return server, agent
 
 
-@xfail_held
 @pytest.mark.parametrize('agent_class', [RegistersInOnActivate, RegistersInOnConnected])
 def test_queued_messages_reach_handlers_registered_in_the_lifecycle_hooks(agent_class):
     server, agent = _run(agent_class, [('jobs', 'j1'), ('jobs', 'j2')])
