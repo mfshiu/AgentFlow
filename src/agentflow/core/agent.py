@@ -1219,7 +1219,16 @@ class Agent(BrokerNotifier):
         order messages), so it waits for that registration for
         _PENDING_TERMINATE_TTL_S; at most _MAX_PENDING_TERMINATES wait,
         the oldest is dropped first. holon.trust_unregistered_parents
-        restores the pre-#13 behaviour."""
+        restores the pre-#13 behaviour.
+
+        With holon.control_secret set, the terminate has already been
+        authenticated: its sender holds the holon's secret and is named
+        like our parent. It is honoured without waiting for a
+        registration that may never come.
+
+        Without a secret, this check stops only senders that cannot
+        observe the holon's traffic: parent ids appear in every parent
+        broadcast."""
         if self._holon_options.trust_unregistered_parents:
             return True
         parent_id = parent.get('parent_id')
@@ -1227,6 +1236,8 @@ class Agent(BrokerNotifier):
             self.__log_holon_rejection(
                 'unattributed terminates', f"Ignored a terminate without a parent_id on {topic!r}.")
             return False
+        if self._holon_options.control_key is not None:
+            return True
         now = time.monotonic()
         with self._holon_lock:
             if parent_id in self._parents:

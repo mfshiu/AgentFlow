@@ -384,7 +384,6 @@ def test_with_a_secret_unsigned_membership_messages_are_ignored():
     publish.assert_not_called()
 
 
-@xfail_review
 def test_with_a_secret_an_authenticated_terminate_needs_no_registration():
     """The signature already proves the sender holds the holon's
     secret, so a terminate is not held back for a register_parent that
