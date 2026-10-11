@@ -270,7 +270,6 @@ class TaggedParcel(TextParcel):
         return managed
 
 
-@xfail_review
 def test_auto_reply_keeps_a_handlers_parcel_subclass_intact(agent_and_broker):
     agent, broker = agent_and_broker
     returned = TaggedParcel('pong', tag='t1')

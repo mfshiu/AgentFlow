@@ -1541,15 +1541,15 @@ class Agent(BrokerNotifier):
                 # RFC-003 R-strip-topic_return: the auto-reply must
                 # never carry topic_return. RFC-014 (issue #36): it
                 # carries the request's correlation id. If the handler
-                # returned a Parcel that differs in either, reconstruct
-                # instead of mutating the caller's object.
+                # returned a Parcel that differs in either, reply with a
+                # shallow copy instead of mutating the caller's object;
+                # a copy keeps a subclass's own state and never calls
+                # its constructor.
                 if not isinstance(data_resp, Parcel):
                     data_resp = Parcel.from_content(data_resp)
-                elif (data_resp.topic_return
-                        or getattr(data_resp, 'correlation_id', None) != pcl.correlation_id):
-                    stripped = type(data_resp)(data_resp.content)
-                    stripped.error = data_resp.error
-                    data_resp = stripped
+                elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
+                    data_resp = copy.copy(data_resp)
+                    data_resp.topic_return = None
                 data_resp.correlation_id = pcl.correlation_id
                 self.publish(pcl.topic_return, data_resp)
             else:
