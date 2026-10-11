@@ -172,3 +172,51 @@ def test_the_agent_does_not_retry_a_refusal_that_retrying_cannot_fix(monkeypatch
     assert agent._Agent__activating() is False
     assert len(attempts) == 1
     assert time.monotonic() - started < 2.0
+
+
+xfail_review = pytest.mark.xfail(strict=True, reason='issue #17: gaps found in review')
+
+
+@xfail_review
+def test_a_refusal_followed_by_its_disconnect_is_still_reported_as_a_refusal(client_kwargs, fake_client):
+    """On a refused CONNACK paho calls on_connect and then on_disconnect,
+    which cleared the event start() waits for. If both ran before start()
+    began to wait, the refusal surfaced only as a TimeoutError (retried
+    by the Agent) once the whole budget had passed."""
+    broker = MqttBroker(_agent_notifier(), wait=True, timeout=3.0)
+
+    def refuse_then_disconnect():
+        broker._on_connect(client=fake_client, userdata=None, flags={},
+                           reasonCode=5, properties=None)
+        broker._on_disconnect(client=fake_client, userdata=None, _flags={},
+                              reasonCode=1, _properties=None)
+    fake_client.loop_start.side_effect = refuse_then_disconnect
+
+    started = time.monotonic()
+    with pytest.raises(mqtt_broker.MqttConnectRefused) as refused:
+        broker.start({})
+    assert time.monotonic() - started < 1.5
+    assert refused.value.retryable is False
+
+
+@xfail_review
+def test_a_start_that_timed_out_rolls_its_client_back_once_connect_returns(client_kwargs, fake_client):
+    """start() gives up while connect() is still blocked (START_TIMEOUT)
+    and defers the rollback to a stop() that the Agent never calls: it
+    retries with a fresh broker. When the blocked connect() finally
+    returned, the orphaned client went on running under the same client
+    id as its replacement, and the two kept taking over each other's
+    session."""
+    release = threading.Event()
+    fake_client.connect.side_effect = lambda *args, **kwargs: release.wait(5)
+    broker = MqttBroker(_agent_notifier(), wait=True, timeout=0.3)
+    with pytest.raises(TimeoutError):
+        broker.start({})
+    assert broker._state is WorkerState.START_TIMEOUT
+
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not fake_client.loop_stop.called:
+        time.sleep(0.02)
+    fake_client.loop_stop.assert_called()
+    fake_client.disconnect.assert_called()
