@@ -122,7 +122,7 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 
 ## R-03 — MQTT reconnect and subscription recovery are not implemented
 
-- **Status**: **RESOLVED** (2026-07-27) — see [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md)
+- **Status**: **RESOLVED** (2026-10-10) — [RFC-005](../rfc/RFC-005-mqtt-subscription-recovery.md) (2026-07-27) added the subscription registry, but recovery never ran in production: the paho client was built with `reconnect_on_failure=False`, so paho's network loop ended on the first connection loss. Re-opened 2026-10-09 as GitHub issue #2; automatic reconnect added 2026-10-10 — see [Follow-up resolution](#follow-up-resolution-2026-10-10-issue-2).
 - **Severity**: High
 - **Category**: Fault Isolation / Message Reliability
 - **File / Function / Line** (historical): `src/agentflow/broker/mqtt_broker.py:17-18` (`reconnect_on_failure=False`); `mqtt_broker.py:52-53` (`_on_disconnect` only logs); `src/agentflow/core/agent.py:509-512` (`_on_connect` early-return via `_connected_once`)
@@ -213,6 +213,49 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 - **Broker-cluster failover**: not implemented.
 - **Connection generation / epoch counter** (RFC-005 Option E): not implemented; `_ever_connected` boolean suffices for first-vs-reconnect classification.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process `recovery_metrics()` snapshot.
+
+### Follow-up resolution (2026-10-10, issue #2)
+
+**Why RFC-005 was not enough.** The bullet above ("`reconnect_on_failure=False` is unchanged … AgentFlow does not itself reconnect") was the whole defect. In paho 2.1.0, `loop_forever()` (the `loop_start()` thread) exits on the first connection loss when `reconnect_on_failure` is False. No further CONNACK arrives, so `_recover_subscriptions` never ran outside the mocked unit tests. Meanwhile `state` stayed RUNNING and `Agent.is_active()` stayed True, while every publish failed with `BROKER_DISCONNECTED`. The 48 RFC-005 tests drive `_on_connect` / `_on_disconnect` by hand on a MagicMock client, so they could not observe this.
+
+**Scope of change:**
+
+- `src/agentflow/broker/mqtt_broker.py`
+  - The client is built with `reconnect_on_failure=True`.
+  - `start()` calls `reconnect_delay_set()` from the new options `reconnect_min_delay` / `reconnect_max_delay` (default 1 s … 30 s). Invalid values fall back to the defaults with a WARNING instead of raising.
+  - `reconnect: False` restores the legacy behaviour: `_on_disconnect` calls `loop_stop()` from the network thread. `disconnect()` would not work there, because paho resets the state to CONNECTION_LOST after the callback returns.
+  - The same `loop_stop()` ends the loop when a `wait=False` broker's FIRST connection is refused or dropped. Nobody awaits that connection, and stop() refuses STARTING, so the retries could otherwise never be ended.
+  - New `connect_timeout` option (default 2 s; paho's own default is 5 s) bounds each reconnect TCP connect. A reconnect blocked by a network partition therefore fits inside the 5 s worker/broker stop budgets. Not bounded: DNS resolution, and hosts that resolve to N addresses (up to N × `connect_timeout`).
+  - After `loop_stop()`, the stop helper and the start-rollback primitive close any socket left by a reconnect that completed after `disconnect()` had already run.
+  - `_on_disconnect` reports `notifier._on_disconnect(planned)` unless stop() has fenced callbacks.
+  - Exceptions from `notifier._on_connect` / `_on_disconnect` are contained (W-43). Before this, an `_on_connect` exception propagated into paho and killed the network thread, and with it every later reconnect.
+- `src/agentflow/broker/notifier.py`: new non-abstract `BrokerNotifier._on_disconnect(planned)`, a default no-op, so existing subclasses stay valid.
+- `src/agentflow/core/agent.py` (additive public API):
+  - `Agent.is_connected()`.
+  - Hooks `on_disconnected()`, called once per unexpected loss of an established connection, and `on_reconnected()`, called after every reconnect. Both run on a short-lived daemon thread, never on the paho thread.
+  - `on_connected()` still runs once. The one-time holon setup is not repeated on reconnect, because the broker registry restores the subscriptions.
+  - `__deactivating` clears the link state after `broker.stop()`, so `is_connected()` is False once the agent has stopped.
+
+**Verification:**
+
+- `tests/wire/` (new `wire` marker) drives a REAL paho client against `tests/fakes/mini_mqtt_server.py`, an in-process loopback MQTT 3.1.1 server. It covers:
+  - reconnect plus re-subscribe after a server-side drop;
+  - publish recovery;
+  - disconnect reporting;
+  - notifier exception containment;
+  - the `reconnect: False` opt-out;
+  - stop() during back-off (bounded, no retries afterwards);
+  - stop() and Agent.terminate() during a partition-blocked reconnect (simulated black-holed connect), staying within budget;
+  - a refused CONNACK at start() leaving no background retries, for both `wait=True` and `wait=False`;
+  - an end-to-end Agent in thread mode.
+- Mock-based contracts are in `tests/unit/test_mqtt_broker_auto_reconnect.py` and `tests/unit/core/test_agent_connection_state.py`.
+
+**Known residuals (tracked separately):**
+
+- **W-24 / issue #60.** If start() hits START_TIMEOUT while the startup helper is still wedged in `connect()`, and that helper later succeeds, the orphaned client now keeps reconnecting in the background. Previously it died at its first connection loss. Its callbacks stay fenced.
+- `register_child` is still sent only on the first connection (issue #6).
+- Subscriptions made before the first CONNACK are still not sent (issue #54).
+- Publishes made while disconnected are still dropped by `Agent.publish` (issue #4).
 
 ---
 
@@ -1327,7 +1370,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 |---|---|---|---|---|
 | R-01 | Critical | High | **Resolved 2026-10-10 (issue #1)** | `pickle.loads` on wire bytes |
 | R-02 | High | High | **Resolved 2026-07-26 (RFC-001)** | `publish_sync` handler / subscription leak |
-| R-03 | High | High | **Resolved 2026-07-27 (RFC-005)** | No MQTT reconnect / no re-subscribe |
+| R-03 | High | High | **Resolved 2026-10-10 (RFC-005 + issue #2)** | No MQTT reconnect / no re-subscribe |
 | R-04 | High | High | **Resolved 2026-07-26 (RFC-004)** | Unbounded per-message thread creation |
 | R-08 | High | High | Open | Parent-process `publish` silently fails in process mode |
 | R-09 | High | High | Open | Topic derived from unsanitised `Agent.name`; naming collisions |

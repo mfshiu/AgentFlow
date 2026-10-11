@@ -95,6 +95,9 @@ class Agent(BrokerNotifier):
 
         self._broker = None
         self._connected_once = False
+        # Issue #2: current broker link state, maintained by the
+        # BrokerNotifier callbacks (_on_connect / _on_disconnect).
+        self._broker_connected = False
 
         # RFC-004: bounded message dispatch. Dispatcher is created
         # lazily on first _on_message so that tests / lifecycles that
@@ -202,6 +205,7 @@ class Agent(BrokerNotifier):
         self._message_broker = None
         self._children = {}
         self._parents = {}
+        self._broker_connected = False
         if '_Agent__topic_handlers' not in self.__dict__:
             self._Agent__topic_handlers = {}
 
@@ -459,6 +463,18 @@ class Agent(BrokerNotifier):
         return self._agent_worker is not None and self._agent_worker.is_working()
 
 
+    def is_connected(self) -> bool:
+        """True while this agent's broker link is up (issue #2).
+
+        After an unexpected loss the broker reconnects automatically;
+        meanwhile this returns False and publishes fail. The state is
+        per process: in process mode (the default) the caller-side
+        Agent object never connects, so query it from inside the agent
+        (handlers / hooks) instead. Brokers that never report a
+        connection (e.g. EmptyBroker) always yield False."""
+        return self._broker_connected
+
+
     def on_activating(self):
         pass
     
@@ -620,6 +636,9 @@ class Agent(BrokerNotifier):
                         f"network thread may still be alive. See "
                         f"RFC-010 Appendix A / RFC-009 §H."
                     ))
+            # Issue #2: the broker fences notifier callbacks once stop()
+            # has begun (RFC-010 §F), so no _on_disconnect will arrive.
+            self._broker_connected = False
 
         self.on_terminated()
         
@@ -971,8 +990,14 @@ class Agent(BrokerNotifier):
         
         
     def _on_connect(self):
+        self._broker_connected = True
         if self._connected_once:
-            logger.warning(self.M("Already connected to the broker."))
+            # Issue #2: reconnected. The broker has already re-subscribed
+            # every topic from its registry, so the one-time setup below
+            # (holon subscriptions, register_child, on_connected) is not
+            # repeated.
+            logger.info(self.M("Reconnected to the broker."))
+            self._run_connection_hook(self.on_reconnected)
             return
         self._connected_once = True
         logger.info(self.M("Connected to the broker."))
@@ -996,6 +1021,35 @@ class Agent(BrokerNotifier):
             self.__connected_event.set()
             self.on_connected()
         threading.Thread(target=handle_connected).start()
+
+
+    def _on_disconnect(self, planned: bool = False):
+        """BrokerNotifier callback (issue #2): the broker link was lost.
+        Calls on_disconnected() once per unexpected loss of an
+        established connection."""
+        was_connected = self._broker_connected
+        self._broker_connected = False
+        if not was_connected or planned:
+            return
+        logger.warning(self.M(
+            "Disconnected from the broker; waiting for automatic reconnect."
+        ))
+        self._run_connection_hook(self.on_disconnected)
+
+
+    def _run_connection_hook(self, hook):
+        """Run a connection hook off the broker's network thread, so a
+        slow or failing hook can neither delay nor kill reconnects."""
+        hook_name = getattr(hook, '__name__', None) or type(hook).__name__
+
+        def run():
+            try:
+                hook()
+            except Exception as ex:
+                logger.exception(self.M(f"{hook_name} raised: {ex!r}"))
+        threading.Thread(
+            target=run, name=f'{self.name_tag}-{hook_name}', daemon=True,
+        ).start()
 
 
     @final
@@ -1088,6 +1142,21 @@ class Agent(BrokerNotifier):
 
     def on_connected(self):
         logger.debug(self.M('on_connected'))
+
+
+    def on_disconnected(self):
+        """Hook (issue #2): the broker link was lost unexpectedly. The
+        broker keeps reconnecting; publishes fail until on_reconnected().
+        Runs on a short-lived daemon thread."""
+        pass
+
+
+    def on_reconnected(self):
+        """Hook (issue #2): the broker link is back after an unexpected
+        loss and every subscription has been restored. Unlike
+        on_connected(), which runs once, this runs after every
+        reconnect. Runs on a short-lived daemon thread."""
+        pass
 
 
     def on_message(self, topic:str, data):
