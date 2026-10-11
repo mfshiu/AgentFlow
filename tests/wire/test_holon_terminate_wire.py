@@ -58,3 +58,29 @@ def test_terminate_cascades_through_three_levels_without_echo_storm():
         for a in agents:
             a.terminate()
         server.close()
+
+
+@pytest.mark.xfail(strict=True, reason='issue #38: to_child.{name} still reaches same-name replicas and grandchildren')
+def test_replica_terminate_does_not_stop_its_same_name_sibling():
+    """Issue #38: two mid-tier replicas named b.a share to_child.b.a.
+    Stopping one must not stop the other."""
+    server = MiniMqttServer()
+    root = WireAgent('a', server.port)
+    m1, m2 = WireAgent('b.a', server.port), WireAgent('b.a', server.port)
+    leaf = WireAgent('c.b.a', server.port)
+    agents = (root, m1, m2, leaf)
+    try:
+        for a in agents:
+            a.start_thread()
+        assert _wait(lambda: set(root._children) == {m1.agent_id, m2.agent_id}
+                     and leaf.agent_id in m1._children)
+
+        m1.terminate()
+
+        assert _wait(lambda: not m1.is_active(), timeout=15)
+        assert not _wait(lambda: not m2.is_active(), timeout=3), \
+            "a same-name replica's terminate stopped its sibling"
+    finally:
+        for a in agents:
+            a.terminate()
+        server.close()
