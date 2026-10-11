@@ -986,7 +986,14 @@ class Agent(BrokerNotifier):
             # the full response timeout (RFC-002).
             self._publish_or_raise(topic, request)
             if data_event.event.wait(timeout):
-                return data_event.data
+                reply = data_event.data
+                # RFC-014: the id served only to match this reply. Clear
+                # it so that forwarding this Parcel by hand to another
+                # requester (e.g. a gateway answering in on_message)
+                # does not carry a foreign id that requester would
+                # ignore. The Parcel was decoded for this call alone.
+                reply.correlation_id = None
+                return reply
             raise TimeoutError(f"No response received within timeout period for topic: {pcl.topic_return}.")
         finally:
             # RFC-006 §7.5 + RFC-007 §7.8: triple check under lock —

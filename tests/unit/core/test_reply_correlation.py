@@ -38,9 +38,6 @@ from tests.fakes.fake_bus import FakeBus
 
 
 
-xfail_review = pytest.mark.xfail(strict=True, reason='issue #36: gaps found in review')
-
-
 def _wait_until(predicate, timeout=2.0):
     return FakeBus.wait_until(predicate, timeout=timeout)
 
@@ -296,7 +293,6 @@ class Gateway(Agent):
         self.publish(pcl.topic_return, reply)
 
 
-@xfail_review
 def test_a_reply_forwarded_by_hand_reaches_the_original_requester():
     bus = FakeBus()
     service, gateway, client = Service(), Gateway(), Agent('client', {})
