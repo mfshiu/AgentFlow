@@ -85,6 +85,11 @@ class Agent(BrokerNotifier):
 
         self._children: dict = {}
         self._parents: dict = {}
+        # Issue #6: makes "is this a new member?" + insert atomic, so a
+        # repeated registration never fires the hooks twice.
+        self._holon_lock = threading.Lock()
+        # Children whose first on_register_child is still running.
+        self._children_registering: set = set()
         
         self._message_broker = None
         self.__topic_handlers: dict[str, _HandlerRecord] = {}
@@ -134,6 +139,8 @@ class Agent(BrokerNotifier):
         '_message_broker',
         '_children',
         '_parents',
+        '_holon_lock',
+        '_children_registering',
     })
 
     def __getstate__(self):
@@ -205,6 +212,8 @@ class Agent(BrokerNotifier):
         self._message_broker = None
         self._children = {}
         self._parents = {}
+        self._holon_lock = threading.Lock()
+        self._children_registering = set()
         self._broker_connected = False
         if '_Agent__topic_handlers' not in self.__dict__:
             self._Agent__topic_handlers = {}
@@ -848,11 +857,35 @@ class Agent(BrokerNotifier):
             self._broker.unsubscribe(topic)
     
     
-    def __register_child(self, child_id:str, child_info:dict):
+    def __register_child(self, child_id:str, child_info:dict) -> bool:
+        """Record a child. Returns whether the caller should answer with
+        register_parent.
+
+        Issue #6: children re-register on every (re)connect and on a
+        parent's parent_online, so registration is idempotent: a known
+        child only refreshes its entry and the hook fires once. While the
+        first registration's hook is still running, a duplicate gets no
+        answer; the first registration answers once its hook returns, so
+        register_parent never overtakes on_register_child."""
         child_info['parent_id'] = self.agent_id
-        self._children[child_id] = child_info
-        logger.info(self.M(f"Add a child: {child_id}, total: {len(self._children)}"))
-        self.on_register_child(child_id, child_info)
+        with self._holon_lock:
+            is_new = child_id not in self._children
+            self._children[child_id] = child_info
+            total = len(self._children)
+            if is_new:
+                self._children_registering.add(child_id)
+            elif child_id in self._children_registering:
+                return False
+        if not is_new:
+            logger.debug(self.M(f"Child re-registered: {child_id}"))
+            return True
+        try:
+            logger.info(self.M(f"Add a child: {child_id}, total: {total}"))
+            self.on_register_child(child_id, child_info)
+        finally:
+            with self._holon_lock:
+                self._children_registering.discard(child_id)
+        return True
 
 
     def on_register_child(self, child_id, child_info:dict):
@@ -860,9 +893,16 @@ class Agent(BrokerNotifier):
     
     
     def __register_parent(self, parent_id:str, parent_info):
+        # Issue #6: idempotent, as for __register_child.
         parent_info['child_id'] = self.agent_id
-        self._parents[parent_id] = parent_info
-        logger.info(self.M(f"Add a parent: {parent_id}, total: {len(self._parents)}"))
+        with self._holon_lock:
+            is_new = parent_id not in self._parents
+            self._parents[parent_id] = parent_info
+            total = len(self._parents)
+        if not is_new:
+            logger.debug(self.M(f"Parent re-registered: {parent_id}"))
+            return
+        logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
         self.on_register_parent(parent_id, parent_info)
 
 
@@ -887,8 +927,8 @@ class Agent(BrokerNotifier):
 
         if child_id:=child.get('child_id'):
             if "register_child" == child['subject']:
-                self.__register_child(child_id, child)
-                self._notify_child(child_id, 'register_parent')
+                if self.__register_child(child_id, child):
+                    self._notify_child(child_id, 'register_parent')
             
         return self.on_children_message(topic, child)
 
@@ -916,6 +956,17 @@ class Agent(BrokerNotifier):
         elif "register_parent" == parent.get('subject'):
             if parent_id := parent.get('parent_id'):
                 self.__register_parent(parent_id, parent)
+        elif "parent_online" == parent.get('subject'):
+            # Issue #6: a parent (re)connected and asks its children to
+            # register. Internal: never forwarded to on_parents_message.
+            # Only honoured on the parent channel: the same message also
+            # arrives on to_child.{self.name}, as our own broadcast
+            # echoed back or a same-name replica's.
+            parent_id = parent.get('parent_id')
+            if (parent_id and parent_id != self.agent_id
+                    and topic == f'to_child.{self.parent_name}'):
+                self.__register_with_parent(parent_id)
+            return None
             
         return self.on_parents_message(topic, parent)
 
@@ -974,6 +1025,30 @@ class Agent(BrokerNotifier):
             logger.error("The parent does not exist.")
     
     
+    def __register_with_parent(self, parent_id):
+        """Issue #6: answer one parent's parent_online on its own
+        channel, so same-name parent replicas are not all delivered (and
+        then discard) every child's answer."""
+        self.publish(f'{parent_id}.to_parent.{self.parent_name}', {
+            'child_id': self.agent_id,
+            'child_name': self.name,
+            'subject': 'register_child',
+            'data': None,
+            'target_parents': [parent_id],
+        })
+
+
+    def _announce_parent_online(self):
+        """Issue #6: ask any children of this agent to (re)register.
+        Published directly rather than through _notify_children, which
+        returns early while _children is still empty."""
+        self.publish(f'to_child.{self.name}', {
+            'parent_id': self.agent_id,
+            'subject': 'parent_online',
+            'data': None,
+        })
+
+
     def _notify_parents(self, subject, data=None, target_parents=None):
         logger.debug(f"subject: {subject}, data: {data}")
         
@@ -994,9 +1069,13 @@ class Agent(BrokerNotifier):
         if self._connected_once:
             # Issue #2: reconnected. The broker has already re-subscribed
             # every topic from its registry, so the one-time setup below
-            # (holon subscriptions, register_child, on_connected) is not
-            # repeated.
+            # (holon subscriptions, on_connected) is not repeated.
             logger.info(self.M("Reconnected to the broker."))
+            # Issue #6: membership messages may have been missed while
+            # offline; re-register and ask children to do the same.
+            if self.parent_name:
+                self._notify_parents("register_child")
+            self._announce_parent_online()
             self._run_connection_hook(self.on_reconnected)
             return
         self._connected_once = True
@@ -1015,6 +1094,8 @@ class Agent(BrokerNotifier):
             self.subscribe(f'to_child.{self.name}', topic_handler=self._handle_parents)    # All the children with the same name were notified by the parents.
             self.subscribe(f'{self.agent_id}.to_child.{self.parent_name}', topic_handler=self._handle_parents)    # Only this child notified by a parent.
             self._notify_parents("register_child")
+        # Issue #6: children that started first registered with nobody.
+        self._announce_parent_online()
 
         def handle_connected():
             time.sleep(1)
