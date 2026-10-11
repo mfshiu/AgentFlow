@@ -7,8 +7,8 @@ setup(
     package_dir={"": "src"},  # Set 'src' as the root directory for the package
     include_package_data=True,  # If you have any data files (e.g., non-Python files)
     install_requires=[
-        # List your dependencies here, for example:
-        # "numpy>=1.21",
+        # mqtt_broker uses paho's CallbackAPIVersion, added in paho-mqtt 2.0.
+        "paho-mqtt>=2.0,<3",
     ],
     entry_points={
         # If you have console scripts to expose as CLI, you can define them here.

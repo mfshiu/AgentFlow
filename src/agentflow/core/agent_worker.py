@@ -1,12 +1,53 @@
 import multiprocessing
 import os
 import queue
+import sys
 import threading
 from enum import Enum
 from typing import Optional
 
 import logging
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
+
+
+if sys.platform == 'win32':
+    import _winapi
+    from multiprocessing import popen_spawn_win32
+
+    class _OrphanSafePopen(popen_spawn_win32.Popen):
+        """#48: on Windows, multiprocessing creates the child process
+        (CreateProcess) BEFORE it pickles the Process object into it.
+        If that pickling fails, the child already exists, but
+        Process.start() never records it. Left alive, it later
+        duplicates a parent pipe handle that the half-built Popen's
+        finalizer has meanwhile closed and the OS has recycled,
+        corrupting the next spawn. Terminate it, and wait for it to
+        exit, before re-raising. (POSIX spawn pickles before starting
+        the child, so it needs no such guard.)"""
+
+        _KILL_WAIT_MS = 5000
+
+        def __init__(self, process_obj):
+            try:
+                super().__init__(process_obj)
+            except BaseException:
+                handle = getattr(self, '_handle', None)
+                if handle is not None:
+                    try:
+                        _winapi.TerminateProcess(handle, 1)
+                        _winapi.WaitForSingleObject(handle, self._KILL_WAIT_MS)
+                    except OSError:
+                        pass
+                raise
+
+    class _WorkerProcess(multiprocessing.Process):
+        # Windows only has the spawn start method, so this is the Popen
+        # the default context would use, plus the orphan guard.
+        @staticmethod
+        def _Popen(process_obj):
+            return _OrphanSafePopen(process_obj)
+else:
+    _WorkerProcess = multiprocessing.Process
 
 
 
@@ -159,7 +200,7 @@ class ProcessWorker(Worker):
             child_config = dict(self.initiator_agent.config)
             child_config['work_queue'] = self.work_queue
 
-            self.work_process = multiprocessing.Process(
+            self.work_process = _WorkerProcess(
                 target=self.initiator_agent._activate,
                 args=(child_config,),
                 daemon=False,   # RFC-008 §7.15

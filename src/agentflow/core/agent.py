@@ -82,7 +82,7 @@ class Agent(BrokerNotifier):
         self._parents: dict = {}
         
         self._message_broker = None
-        self.__topic_handlers: dict[str, function] = {}
+        self.__topic_handlers: dict[str, _HandlerRecord] = {}
         # RFC-006: guards atomic collision-check-and-register and
         # atomic identity-check-and-pop for publish_sync. Uses RLock
         # for future-proofing (RFC-006 Appendix B).
