@@ -157,7 +157,6 @@ def test_trust_unregistered_parents_restores_the_old_behaviour():
     term.assert_called_once()
 
 
-@xfail_review
 def test_register_parent_counts_only_on_our_own_channel():
     """Otherwise anyone could register as our parent on a broadcast
     topic, without knowing any agent id, and then terminate us."""

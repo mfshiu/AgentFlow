@@ -1162,6 +1162,14 @@ class Agent(BrokerNotifier):
                 return None
             self._terminate()
         elif "register_parent" == parent.get('subject'):
+            if topic != f'{self.agent_id}.to_child.{self.parent_name}':
+                # Issue #13: parents answer register_child only on our
+                # own channel. Honouring one on a broadcast topic would
+                # let anyone register as our parent without knowing any
+                # agent id, and then terminate us.
+                self.__log_holon_rejection(
+                    'misdirected register_parent', f"Ignored a register_parent on {topic!r}.")
+                return None
             if parent_id := parent.get('parent_id'):
                 if deferred := self.__register_parent(parent_id, parent):
                     # Issue #13: this parent's terminate overtook its
