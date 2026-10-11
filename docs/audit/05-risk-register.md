@@ -1460,29 +1460,44 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 - **Registered parents only.**
   - `terminate` is honoured only when its `parent_id` is a registered parent; one without a `parent_id` is ignored.
+  - `register_parent` counts only on the child's own channel `{agent_id}.to_child.{parent_name}`, where parents send it. Before, one published on a broadcast topic made anyone a parent without knowing any agent id.
   - The dispatcher does not order messages, so a parent's `terminate` can overtake its `register_parent`. Such a terminate is deferred and runs when that parent registers. At most 8 wait, for 10 s each, oldest dropped first.
+  - A terminating parent first waits, at most 3 s, for `on_register_child` hooks still running, so those children get `register_parent` before its broker stops.
+  - With `holon.control_secret`, an authenticated terminate needs no registration.
   - `holon.trust_unregistered_parents: True` restores the old behaviour.
+  - Without a secret, this check stops only senders that cannot observe the holon's traffic, because parent ids appear in every parent broadcast.
 - **`holon.max_children`** (default unlimited). A new child beyond the cap is refused under `_holon_lock`: no `register_parent` answer, and no `on_register_child` / `on_children_message`. Known children may still re-register.
   - The default stays unlimited because members never expire yet (R-18). Leave headroom for children that restart.
 - **`holon.control_secret`** (str or bytes, at least 16 bytes), opt-in.
-  - The control subjects `terminate`, `register_child`, `register_parent` and `parent_online` carry `auth = {v, ts, mac}`. The MAC is HMAC-SHA256 over a canonical JSON of the topic, the millisecond timestamp and the message.
+  - The control subjects `terminate`, `register_child`, `register_parent` and `parent_online` carry `auth = {v, ts, mac}`. The MAC is HMAC-SHA256 over a canonical JSON of the topic, the millisecond timestamp and the message as the receiver sees it after a JSON round trip.
+  - Control data that cannot be signed (NaN, bytes, ...) is logged and not sent.
   - Receivers drop control messages that are unsigned, tampered, sent to another topic, malformed, or further than `holon.control_max_age` (default 300 s) from the local clock. Verification never raises.
   - Application subjects stay unauthenticated, like every other topic.
   - The `auth` field is stripped before hooks run, and agents without a secret ignore it.
 - **Auto-replies.** An auto-reply is withheld when `topic_return` is a holon control topic (`to_child.*`, `to_parent.*`, or their `{agent_id}.`-prefixed forms). The handler still runs.
 - **Reply topics** come from `secrets`.
-- **Logging.** Refused messages are logged at WARNING on the 1st, 2nd, 4th, ... occurrence per kind and at DEBUG otherwise, so a flood cannot flood the log.
+- **Logging.**
+  - Refused messages are logged at WARNING on the 1st, 2nd, 4th, ... occurrence per kind and at DEBUG otherwise, so a flood cannot flood the log.
+  - The three log lines that print the Agent config mask `holon.control_secret`.
 
 **Compatibility.**
 
 - Message shapes are unchanged without a secret.
 - A `terminate` from an unregistered sender is now ignored. Tools that stop agents by publishing on `to_child.{name}` need `trust_unregistered_parents`, or must be a registered parent.
 - `control_secret` must be set on every agent of a holon at once. An agent without it sends unsigned control messages, which secret-holding agents drop.
-- Until #14 is fixed, Agent construction logs the full config at DEBUG, secret included. The redaction proposed in #81 covers keys containing `secret`.
+- The config log lines still print broker credentials (#14). The redaction proposed in #81 masks every key containing `secret` and would replace the `holon.control_secret` masking.
 
 **Verification.**
 
-- `tests/security/test_holon_control_auth.py` (50 tests): registered-parent terminate (incl. the deferred, expiring and bounded cases), `max_children`, config validation, HMAC binding and malformed input, a FakeBus holon sharing a secret, agents with another secret, auto-reply topics, and reply-topic randomness.
+- `tests/security/test_holon_control_auth.py` (62 tests) covers:
+  - registered-parent terminate, including the deferred, expiring and bounded cases;
+  - `register_parent` arriving on a broadcast topic;
+  - a parent terminating during a slow registration hook;
+  - `max_children` and config validation;
+  - HMAC binding, both Parcel encodings, and malformed or unsignable input;
+  - the secret never being logged;
+  - a FakeBus holon sharing a secret, and agents with another secret;
+  - auto-reply topics and reply-topic randomness.
 - `tests/wire/test_holon_terminate_wire.py`: a 3-level holon sharing a secret converges and terminates over real MqttBroker clients, and every control message on the wire is signed.
 
 **Still open.**
@@ -1491,7 +1506,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - Replays on the same topic within the age window are not detected. The operations are idempotent (#5, #6).
 - The opt-in secret is shared by the whole holon, and any holder can impersonate any member.
 - TLS, per-agent broker accounts and ACLs (#3) remain the primary defence; the holon v2 namespace (P2-7) would let ACLs restrict who writes control topics.
-- `_parents` is not capped.
+- `_parents` is not capped; without a secret, a sender who knows a child's id can still add entries on its channel.
 
 ---
 
