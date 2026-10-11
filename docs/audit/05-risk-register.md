@@ -373,7 +373,15 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 | **R-06.2** | Unbounded `Process.join()` in `stop()` (wedged child blocks the caller forever; no `terminate` / `kill` fallback; no `Optional[int]` exitcode return) | **RESOLVED** (RFC-008) |
 | **R-06.3** | No heartbeat / liveness / automatic restart on child crash (parent has no watchdog; a dead child is only observable via post-hoc `stop()` + `exitcode`) | **DEFERRED / OPEN** (out of RFC-008 scope) |
 | **R-06.4** | Parent-side Agent state divergence (parent-side `_broker` / `_dispatcher` / `__topic_handlers` never populate because `_activate` runs in the child; parent-side `publish` / `subscribe` do not proxy) | **DOCUMENTED architectural constraint** (RFC-008 §6.5, §7.16, §7.17) |
+| **R-06.5** | Windows orphan child on a start-time pickle failure (CreateProcess runs before the Agent is pickled into the child; on failure the child exists but `Process.start()` never records it, and it later duplicates a recycled parent handle, corrupting the next spawn) | **RESOLVED** (2026-10-11, #48) |
 | Child exception forwarding | No IPC surface for child-side handler exceptions; parent observes only exit code | **DEFERRED / OPEN** (out of RFC-008 scope) |
+
+### Resolution (R-06.5, 2026-10-11, #48)
+
+- **Found by**: the intermittent Windows failures of the ProcessWorker spawn tests (WinError 5/6, EOFError, exitcode 1). They always followed a start-pickle-failure test.
+- **Cause**: `multiprocessing.popen_spawn_win32.Popen` calls `CreateProcess` first and pickles the Process object afterwards. When `Agent.__getstate__` raised, the child already existed, but `Process.start()` never stored the Popen. Its finalizer then closed the parent's pipe handle while the orphaned child was still starting; the child later duplicated whatever handle reused that number. POSIX spawn pickles first and is unaffected.
+- **Fix**: on Windows, `ProcessWorker` starts its child through `_WorkerProcess`, whose `_OrphanSafePopen` terminates the just-created child, and waits for it to exit, before re-raising. Agents that carry multiprocessing primitives (Queue, Event) still start, because nothing is pre-pickled.
+- **Verification**: `test_start_pickle_failure_leaves_no_orphan_child_on_windows` records the child pid at `CreateProcess` and asserts that the child has exited when `start()` raises; it failed 5/5 before the fix. The two spawn tests previously marked as known-flaky on Windows now run unmarked.
 
 ### Resolution (R-06.1 / R-06.2 / R-06.4)
 

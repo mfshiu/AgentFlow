@@ -483,7 +483,7 @@ def test_G48_G49_daemon_change_would_break_broker_cleanup_semantics():
     # RFC-009 doc explicitly states the rejection.
     rfc_path = _REPO_ROOT / "docs" / "rfc" / "RFC-009-thread-worker-lifecycle.md"
     if rfc_path.exists():
-        text = rfc_path.read_text()
+        text = rfc_path.read_text(encoding='utf-8')
         # Look for either the option-C rejection or the daemon-policy
         # discussion (Option §5 C or §7.13).
         assert "daemon=True" in text or "Option C" in text

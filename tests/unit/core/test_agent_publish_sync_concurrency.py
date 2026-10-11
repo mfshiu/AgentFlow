@@ -536,8 +536,19 @@ def test_N_callers_same_topic_wait_first_owns_rest_collide(n):
 def test_atomic_ownership_under_concurrent_race_stress():
     """Many concurrent publish_sync calls compete for ownership of
     the same topic_wait. Exactly one wins per round; there is no
-    torn state (no partial registration, no orphan handler)."""
+    torn state (no partial registration, no orphan handler).
+
+    `barrier` only synchronises entry to publish_sync; it does not
+    keep the callers overlapping. FakeBroker auto-responds inline in
+    publish(), so an unhindered owner can finish and release the topic
+    before a late thread reaches the ownership check, which then
+    legitimately becomes the next owner (sequential transfer, see
+    test_check_and_pop_atomicity_prevents_torn_state). `overlap_gate`
+    holds the owner inside broker.publish -- ownership registered,
+    response not yet delivered -- until every other caller has passed
+    the ownership check, so every round is a genuine race."""
     agent, broker = _make_agent()
+    original_publish = broker.publish
     try:
         trials = 10
         threads_per_trial = 8
@@ -549,6 +560,25 @@ def test_atomic_ownership_under_concurrent_race_stress():
             errors = []
             results = []
             barrier = threading.Barrier(threads_per_trial, timeout=3.0)
+            overlap_gate = threading.Condition()
+            collided = [0]
+
+            def gated_publish(pub_topic, payload):
+                # Only the owner publishes. A second owner can never see
+                # all N-1 collisions, so it fails the round here (bounded)
+                # instead of hanging.
+                with overlap_gate:
+                    if not overlap_gate.wait_for(
+                        lambda: collided[0] >= threads_per_trial - 1,
+                        timeout=3.0,
+                    ):
+                        raise AssertionError(
+                            f'overlap_gate: {collided[0]} of '
+                            f'{threads_per_trial - 1} other callers collided'
+                        )
+                return original_publish(pub_topic, payload)
+
+            broker.publish = gated_publish
 
             def target(r, e):
                 try:
@@ -556,6 +586,11 @@ def test_atomic_ownership_under_concurrent_race_stress():
                     r[0] = agent.publish_sync(
                         'req', 'x', topic_wait=topic, timeout=2.0,
                     )
+                except TopicWaitCollisionError as ex:
+                    e[0] = ex
+                    with overlap_gate:
+                        collided[0] += 1
+                        overlap_gate.notify_all()
                 except BaseException as ex:
                     e[0] = ex
 
