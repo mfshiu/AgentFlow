@@ -407,7 +407,6 @@ def test_with_a_secret_unsignable_control_data_is_dropped_without_raising():
     publish.assert_not_called()
 
 
-@xfail_review
 def test_the_control_secret_is_never_logged(caplog):
     caplog.set_level(logging.DEBUG)
     for secret in (SECRET, KEY):

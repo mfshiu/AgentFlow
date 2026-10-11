@@ -60,6 +60,15 @@ class _HolonOptions:
     trust_unregistered_parents: bool = False
 
 
+def _config_for_log(cfg):
+    """Issue #13: `cfg` with holon.control_secret masked, for logging.
+    Other credentials in the config are #14."""
+    holon = cfg.get('holon') if isinstance(cfg, dict) else None
+    if isinstance(holon, dict) and holon.get('control_secret') is not None:
+        return {**cfg, 'holon': {**holon, 'control_secret': '***'}}
+    return cfg
+
+
 class TopicWaitCollisionError(RuntimeError):
     """Raised when a topic is already reserved by an active
     publish_sync waiter and another operation would trample it
@@ -98,7 +107,7 @@ class _HandlerRecord:
 
 class Agent(BrokerNotifier):
     def __init__(self, name:str, agent_config:dict={}):
-        logger.debug(f'name: {name}, agent_config: {agent_config}')
+        logger.debug(f'name: {name}, agent_config: {_config_for_log(agent_config)}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -274,7 +283,7 @@ class Agent(BrokerNotifier):
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
-        logger.debug(f'self.config: {self.config}')
+        logger.debug(f'self.config: {_config_for_log(self.config)}')
 
 
     def __parse_codec_config(self):
@@ -434,7 +443,7 @@ class Agent(BrokerNotifier):
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
             self.config[config.CONCURRENCY_TYPE] = 'process'
-        logger.info(self.M(f"self.config: {self.config}"))
+        logger.info(self.M(f"self.config: {_config_for_log(self.config)}"))
         self.work_process = self._get_worker().start()
         
         self._on_start()
