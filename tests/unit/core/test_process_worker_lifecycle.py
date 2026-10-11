@@ -37,17 +37,6 @@ import time
 
 import pytest
 
-# Known Windows-only flake (#48). On Windows, multiprocessing creates the
-# child BEFORE pickling the Agent into it. The start-pickle-failure tests
-# therefore leave an orphaned child whose process handle ProcessWorker
-# never sees; it later duplicates a recycled parent handle and corrupts
-# the next spawn (WinError 5/6, EOFError, exitcode 1). The fix changes
-# which Agents ProcessWorker.start accepts and is tracked in #48.
-_WINDOWS_ORPHAN_FLAKE = pytest.mark.xfail(
-    sys.platform == 'win32', strict=False,
-    reason='#48: orphan child from the preceding pickle-failure test',
-)
-
 # --------------------------------------------------------------------------
 # Ensure spawned children can import module-level helpers from this file.
 # --------------------------------------------------------------------------
@@ -303,7 +292,6 @@ def test_start_after_START_FAILED_raises_runtime_error():
 # C. Real spawn — success path (RFC-008 §C)
 # ==========================================================================
 
-@_WINDOWS_ORPHAN_FLAKE
 def test_start_spawns_functional_child_that_exits_cleanly():
     """End-to-end: start spawns a child that unpickles the Agent,
     runs _activate, receives 'terminate', and exits with code 0."""
@@ -593,11 +581,52 @@ def test_start_lambda_handler_failure_reaches_start_time():
     assert pw.state is WorkerState.START_FAILED
 
 
+def _windows_process_has_exited(pid):
+    import _winapi
+    SYNCHRONIZE = 0x00100000
+    try:
+        handle = _winapi.OpenProcess(SYNCHRONIZE, False, pid)
+    except OSError:
+        return True     # no such process any more
+    try:
+        return _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_OBJECT_0
+    finally:
+        _winapi.CloseHandle(handle)
+
+
+@pytest.mark.skipif(sys.platform != 'win32',
+                    reason='POSIX spawn pickles before starting the child')
+def test_start_pickle_failure_leaves_no_orphan_child_on_windows(monkeypatch):
+    """#48: on Windows, multiprocessing creates the child (CreateProcess)
+    BEFORE pickling the Agent into it. When that pickling fails, the
+    child already exists but Process.start() never records it; left
+    alive, it later duplicates a recycled parent handle and breaks the
+    next spawn. ProcessWorker.start must terminate it before raising."""
+    from multiprocessing import popen_spawn_win32
+    pids = []
+    real_create = popen_spawn_win32._winapi.CreateProcess
+
+    def recording_create(*args, **kwargs):
+        result = real_create(*args, **kwargs)
+        pids.append(result[2])      # (hProcess, hThread, pid, tid)
+        return result
+
+    monkeypatch.setattr(popen_spawn_win32._winapi, 'CreateProcess',
+                        recording_create)
+    agent = Agent(name='pw-orphan', agent_config=_minimal_empty_broker_config())
+    agent.subscribe('some/topic', topic_handler=lambda t, p: None)
+    pw = ProcessWorker(agent)
+    with pytest.raises(TypeError):
+        pw.start()
+    assert len(pids) == 1, 'the child is created before the Agent is pickled'
+    assert _windows_process_has_exited(pids[0]),         'the child of a failed start is still running (orphan)'
+    assert pw.state is WorkerState.START_FAILED
+
+
 # ==========================================================================
 # H. Observability + orphan sanity (RFC-008 §7.14 + acceptance #9)
 # ==========================================================================
 
-@_WINDOWS_ORPHAN_FLAKE
 def test_exitcode_property_is_None_before_stop_and_int_after():
     agent = Agent(name='pw-exit', agent_config=_minimal_empty_broker_config())
     pw = ProcessWorker(agent)
