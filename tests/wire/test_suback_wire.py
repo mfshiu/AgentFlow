@@ -41,12 +41,15 @@ def test_a_refused_subscription_is_reported_and_retried_on_reconnect(caplog):
             metrics = broker.recovery_metrics()
             return metrics.get('active_subscriptions'), metrics.get('failed_subscriptions')
         assert server.wait_until(lambda: counts() == (1, 1), 5), counts()
-        assert any('secure/denied' in r.getMessage() for r in caplog.records
-                   if r.levelno == logging.WARNING)
+        # Logged on paho's thread after the count: wait for it too.
+        assert server.wait_until(
+            lambda: any('secure/denied' in r.getMessage() for r in list(caplog.records)
+                        if r.levelno == logging.WARNING), 5)
 
         server.reject_topics = set()                       # the ACL now allows it
         server.drop_all()
-        assert server.wait_until(lambda: counts() == (2, 0), 10), counts()
+        assert server.wait_until(lambda: counts() == (2, 0), 10), counts()   # granted
+        assert 'secure/denied' in server.topics_of_connection(server.last_connection_index())
     finally:
         broker.stop()
         server.close()
