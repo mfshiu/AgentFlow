@@ -144,8 +144,17 @@ def _require_envelope(managed: Any, kind: str) -> Dict[str, Any]:
         raise ParcelDecodeError(f"invalid {kind} payload: missing version")
     version = body["version"]
     if type(version) is not int or not 1 <= version <= VERSION:
+        # Never repr() the value itself: a hostile one (an int too large
+        # to print, deep nesting, megabytes of bytes) would make the
+        # message raise or allocate.
+        if type(version) is not int:
+            shown = f"of type {type(version).__name__}"
+        elif -1000 < version < 1000:
+            shown = str(version)
+        else:
+            shown = "out of range"
         raise ParcelDecodeError(
-            f"invalid {kind} payload: unsupported version {repr(version)[:40]} "
+            f"invalid {kind} payload: unsupported version {shown} "
             f"(supported: 1 to {VERSION})"
         )
     return body
@@ -369,7 +378,8 @@ class TextParcel(Parcel):
         raw = bytes(payload)[len(TextParcel.HEAD):]
         try:
             data = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError as ex:
+        except (ValueError, RecursionError) as ex:
+            # Issue #15: RecursionError for deeply nested JSON.
             raise ParcelDecodeError(f"invalid TextParcel payload: {ex}") from ex
         pcl = TextParcel()
         pcl._set_managed_data(_require_envelope(data, "TextParcel"))

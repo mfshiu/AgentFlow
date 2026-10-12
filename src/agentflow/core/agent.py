@@ -17,7 +17,7 @@ from typing import Callable, final, Optional
 import uuid
 
 from agentflow.core import holon_auth
-from agentflow.core.parcel import Parcel, ParcelDecodeError, parse_pickle_globals
+from agentflow.core.parcel import Parcel, ParcelDecodeError, ensure_size, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -1694,11 +1694,13 @@ class Agent(BrokerNotifier):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
         try:
             pcl = Parcel.from_payload(data, **self._codec_options)
-        except ParcelDecodeError as ex:
+        except Exception as ex:
             # Issue #15: not a valid AgentFlow parcel (another MQTT
             # client's JSON, an unsupported version, garbage). Count it
             # instead of letting it escape to the broker callback, which
-            # logged a full traceback for every such message.
+            # logged a full traceback for every such message. Decoders
+            # raise ParcelDecodeError; anything else they raise on
+            # untrusted bytes is counted the same way.
             self.__count_decode_failure(topic, ex)
             return
         if pcl.message_id is not None and self.__seen_before(pcl.message_id):
@@ -1930,8 +1932,12 @@ class Agent(BrokerNotifier):
             self._decode_failures += 1
             count = self._decode_failures
         level = logging.WARNING if count & (count - 1) == 0 else logging.DEBUG
+        # The reason may carry sender-controlled text (e.g. a refused
+        # pickle global's name): escape it and bound its length.
+        reason = ensure_size(repr(f"{type(ex).__name__}: {ex}"), 300)
         logger.log(level, self.M(
-            f"Dropped an undecodable message on {topic!r}: {ex} ({count} so far)."))
+            f"Dropped an undecodable message on {ensure_size(repr(topic), 200)}: "
+            f"{reason} ({count} so far)."))
 
 
     def __seen_before(self, message_id: str) -> bool:

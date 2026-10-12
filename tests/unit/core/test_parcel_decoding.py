@@ -41,9 +41,6 @@ from tests.fakes.fake_bus import FakeBus
 
 
 
-xfail_review = pytest.mark.xfail(strict=True, reason='issue #15: gaps found in review')
-
-
 def _text(body) -> bytes:
     return TextParcel.HEAD + json.dumps(body).encode()
 
@@ -165,7 +162,6 @@ def _global_ref(module: str, name: str) -> bytes:
     return b'\x80\x04' + short_or_long(module) + short_or_long(name) + b'\x93.'
 
 
-@xfail_review
 @pytest.mark.parametrize('payload', [
     _binary({'version': 1 << 20000, 'content': 'x'}),       # int too large to print
     TextParcel.HEAD + b'[' * 200000,                          # nesting too deep for json
@@ -176,7 +172,6 @@ def test_hostile_envelopes_raise_parcel_decode_error(payload):
         Parcel.from_payload(payload)
 
 
-@xfail_review
 def test_the_decode_failure_warning_is_escaped_and_bounded(records):
     agent = Agent('sensor_reader', {})
     broker = MqttBroker(agent, wait=False)
