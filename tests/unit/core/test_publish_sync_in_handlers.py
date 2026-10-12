@@ -31,8 +31,6 @@ from agentflow.core.parcel import TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_7 = pytest.mark.xfail(strict=True, reason='issue #7: replies share the dispatcher')
-
 
 def _agent(**dispatch):
     agent = Agent('coordinator', {'dispatch': {'shutdown_timeout_s': 1.0, **dispatch}})
@@ -56,7 +54,6 @@ def _forwarding_handler(agent, results, timeout=3.0):
     return handle
 
 
-@xfail_7
 def test_a_handler_can_publish_sync_with_a_single_worker():
     agent, broker = _agent(workers=1)
     results = []
@@ -70,7 +67,6 @@ def test_a_handler_can_publish_sync_with_a_single_worker():
         agent.terminate()
 
 
-@xfail_7
 def test_eight_concurrent_nested_calls_all_return_with_eight_workers():
     agent, broker = _agent(workers=8)
     results = []
@@ -89,7 +85,6 @@ def test_eight_concurrent_nested_calls_all_return_with_eight_workers():
         agent.terminate()
 
 
-@xfail_7
 def test_a_reply_is_delivered_while_the_dispatcher_queue_is_full():
     agent, broker = _agent(workers=1, queue_capacity=1)
     gate, busy = threading.Event(), threading.Event()
@@ -108,7 +103,6 @@ def test_a_reply_is_delivered_while_the_dispatcher_queue_is_full():
         agent.terminate()
 
 
-@xfail_7
 def test_terminate_stops_the_reply_lane():
     agent, broker = _agent()
     assert agent.publish_sync('svc', 'q', timeout=2).content == 'pong'
@@ -117,7 +111,6 @@ def test_terminate_stops_the_reply_lane():
     assert lane.is_stopped
 
 
-@xfail_7
 def test_a_pickled_agent_carries_no_reply_lane():
     agent, broker = _agent()
     try:

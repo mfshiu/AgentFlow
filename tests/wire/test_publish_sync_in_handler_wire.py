@@ -56,7 +56,6 @@ class Coordinator(Agent):
         self.results.append((outcome, time.monotonic() - started))
 
 
-@pytest.mark.xfail(strict=True, reason='issue #7: replies share the dispatcher')
 def test_a_coordinator_forwards_from_its_handler_with_one_worker():
     server = MiniMqttServer()
     service, coordinator = Service(server.port), Coordinator(server.port)

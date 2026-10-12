@@ -333,6 +333,10 @@ class Agent(BrokerNotifier):
         # message flows.
         self._dispatcher = None
         self._dispatcher_init_lock = threading.Lock()
+        # Issue #7: the lane for publish_sync replies (see
+        # _get_reply_dispatcher); closed by terminate().
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         if self.config.get('dispatch', {}).get('mode') == 'per_message_thread':
             warnings.warn(
                 "Agent dispatch mode 'per_message_thread' is deprecated "
@@ -364,6 +368,7 @@ class Agent(BrokerNotifier):
         '_gate_timer',
         '_dispatcher_init_lock',
         '_dispatcher',
+        '_reply_dispatcher',
         '_broker',
         '_agent_worker',
         '_message_broker',
@@ -450,6 +455,8 @@ class Agent(BrokerNotifier):
         self._gate_timer = None
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         self._broker = None
         self._agent_worker = None
         self._message_broker = None
@@ -708,6 +715,19 @@ class Agent(BrokerNotifier):
                 # any exception and continue to worker.stop().
                 logger.exception(self.M(
                     f"terminate: dispatcher.stop() raised: {ex!r}"
+                ))
+        # Issue #7: the reply lane after the dispatcher, whose draining
+        # handlers may still be waiting in publish_sync. Closed under
+        # the init lock, so that no lane is created afterwards.
+        with self._dispatcher_init_lock:
+            self._reply_lane_closed = True
+            reply_lane = self._reply_dispatcher
+        if reply_lane is not None:
+            try:
+                reply_lane.stop()
+            except Exception as ex:
+                logger.exception(self.M(
+                    f"terminate: reply dispatcher stop() raised: {ex!r}"
                 ))
 
         if not self._agent_worker:
@@ -1170,6 +1190,10 @@ class Agent(BrokerNotifier):
 
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
+        """Publish a request and wait up to `timeout` seconds for its
+        reply, which is returned; raises TimeoutError without one. Safe
+        to call from a handler (issue #7): replies have their own lane,
+        so the waiting handler does not starve its reply."""
         if isinstance(data, Parcel):
             pcl = data
             if pcl.topic_return:
@@ -1821,12 +1845,15 @@ class Agent(BrokerNotifier):
             else:
                 is_specific_handler = False
                 topic_handler = self.on_message
+        # Issue #7: a publish_sync reply takes its own lane, so that a
+        # handler waiting in publish_sync cannot starve it.
+        is_reply = record is not None and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
 
         if not self.__reserve_queued_bytes(size):
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
             return
         try:
-            dispatcher = self._get_dispatcher()
+            dispatcher = self._get_reply_dispatcher() if is_reply else self._get_dispatcher()
         except BaseException:
             # A dispatcher that fails to start must not leave bytes
             # reserved.
@@ -2167,6 +2194,32 @@ class Agent(BrokerNotifier):
                 if self._dispatcher is None:
                     self._dispatcher = self.__create_dispatcher()
         return self._dispatcher
+
+
+    def _get_reply_dispatcher(self):
+        """Issue #7: the lane for publish_sync replies, a one-consumer
+        MessageDispatcher. It only decodes a reply and wakes the waiting
+        call (_ReplyRouter), never a user handler, so a handler waiting
+        in publish_sync cannot starve its own reply, and a queue full
+        of other messages cannot drop it. Created on the first reply.
+        The legacy per-message-thread mode cannot starve and uses its
+        own dispatcher; so does an Agent after terminate()."""
+        dispatcher = self._get_dispatcher()
+        if not isinstance(dispatcher, MessageDispatcher):
+            return dispatcher
+        if self._reply_dispatcher is None:
+            with self._dispatcher_init_lock:
+                if self._reply_lane_closed:
+                    return dispatcher
+                if self._reply_dispatcher is None:
+                    dispatch_cfg = self.config.get('dispatch', {}) or {}
+                    self._reply_dispatcher = MessageDispatcher(
+                        workers=1,
+                        queue_capacity=int(dispatch_cfg.get('queue_capacity', 1024)),
+                        shutdown_timeout_s=float(dispatch_cfg.get('shutdown_timeout_s', 5.0)),
+                        name=f'ReplyDispatcher-{self.tag}',
+                    )
+        return self._reply_dispatcher
 
 
     def on_connected(self):
