@@ -16,8 +16,13 @@ starve it.
 Contracts verified (with FakeBroker answering every request at once):
   - A handler's publish_sync returns at once with a single worker, and
     8 concurrent nested calls all return with 8 workers.
-  - A reply is delivered while the dispatcher queue is full.
-  - terminate() stops the reply lane; a pickled Agent carries none.
+  - A reply is delivered while the dispatcher queue, or its byte
+    budget (dispatch.max_queued_bytes), is full: replies have a budget
+    of their own, and a queue of at least 1024 whatever the
+    dispatch.queue_capacity, so a burst of replies is not dropped.
+  - terminate() stops the reply lane after the dispatcher, so a handler
+    draining meanwhile still gets its reply, and starts no lane
+    afterwards; a pickled Agent carries none.
 """
 
 import pickle
@@ -27,9 +32,11 @@ import time
 import pytest
 
 from agentflow.core.agent import Agent
-from agentflow.core.parcel import TextParcel
+from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
+
+xfail_7r = pytest.mark.xfail(strict=True, reason='issue #7 review: fixed in the next commit')
 
 
 def _agent(**dispatch):
@@ -101,6 +108,92 @@ def test_a_reply_is_delivered_while_the_dispatcher_queue_is_full():
     finally:
         gate.set()
         agent.terminate()
+
+
+@xfail_7r
+def test_a_reply_is_delivered_while_the_byte_budget_is_full():
+    agent, broker = _agent(workers=1, max_queued_bytes=4096)
+    gate, busy = threading.Event(), threading.Event()
+
+    def block(topic, pcl):
+        busy.set()
+        gate.wait(5)
+    agent.subscribe('busy', topic_handler=block)
+    try:
+        broker.deliver('busy', TextParcel('b').payload())
+        assert busy.wait(2)
+        broker.deliver('other', TextParcel('x' * 2000).payload())
+        overhead = len(TextParcel('').payload())
+        remaining = 4096 - agent._queued_bytes
+        broker.deliver('other', TextParcel('x' * (remaining - overhead)).payload())
+        assert agent._queued_bytes == 4096  # the budget is exactly full
+        assert agent.publish_sync('svc', 'q', timeout=2).content == 'pong'
+    finally:
+        gate.set()
+        agent.terminate()
+
+
+@xfail_7r
+def test_a_burst_of_replies_is_not_dropped_with_a_small_queue_capacity():
+    agent, broker = _agent(workers=8, queue_capacity=1)
+    broker.stop_auto_responding()
+    results = []
+
+    def call():
+        try:
+            results.append(agent.publish_sync('svc', 'q', timeout=3).content)
+        except Exception as ex:
+            results.append(ex)
+    callers = [threading.Thread(target=call) for _ in range(8)]
+    try:
+        for caller in callers:
+            caller.start()
+        assert FakeBus.wait_until(lambda: len(broker.publish_calls) == 8, timeout=3)
+        for _, payload in list(broker.publish_calls):   # back to back, as paho delivers them
+            request = Parcel.from_payload(payload)
+            reply = TextParcel('pong')
+            reply.correlation_id = request.correlation_id
+            broker.deliver(request.topic_return, reply.payload())
+        for caller in callers:
+            caller.join(5)
+        assert results == ['pong'] * 8
+    finally:
+        agent.terminate()
+
+
+@pytest.mark.parametrize('lane_exists', [True, False])
+def test_a_handler_draining_during_terminate_still_gets_its_reply(lane_exists):
+    agent, broker = _agent(workers=1)
+    terminating, results = threading.Event(), []
+    if lane_exists:
+        assert agent.publish_sync('svc', 'warm-up', timeout=2).content == 'pong'
+
+    def drain(topic, pcl):
+        terminating.wait(5)
+        try:
+            results.append(agent.publish_sync('svc', 'q', timeout=0.8).content)
+        except Exception as ex:
+            results.append(ex)
+    agent.subscribe('job', topic_handler=drain)
+    broker.deliver('job', TextParcel('j').payload())
+    dispatcher = agent._get_dispatcher()
+    stop_dispatcher = dispatcher.stop
+
+    def stop(*args, **kwargs):
+        terminating.set()                   # the handler calls publish_sync while terminate() drains
+        return stop_dispatcher(*args, **kwargs)
+    dispatcher.stop = stop
+    agent.terminate()
+    assert results == ['pong']
+
+
+def test_no_reply_lane_is_started_after_terminate():
+    agent, broker = _agent()
+    agent._get_dispatcher()                 # an agent that has received messages
+    agent.terminate()
+    with pytest.raises(TimeoutError):
+        agent.publish_sync('svc', 'q', timeout=0.3)
+    assert agent._reply_dispatcher is None
 
 
 def test_terminate_stops_the_reply_lane():
