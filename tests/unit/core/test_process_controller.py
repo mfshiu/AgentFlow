@@ -20,20 +20,30 @@ Contracts verified (no child process is spawned except where noted):
   - start() without an explicit CONCURRENCY_TYPE warns (FutureWarning)
     that the default will become 'thread'; start_thread(),
     start_process() and an explicit setting do not.
-  - start_process() with an attribute that cannot be pickled names it
-    (spawns a child, which the failure cleans up).
+  - start_process() with an attribute that cannot be pickled names it,
+    keeping the exception's type, and names nothing else (a
+    multiprocessing primitive, an attribute referring to the agent);
+    start_thread() then works on the same object. These spawn a child,
+    which the failure cleans up.
+  - A mode set after construction (set_config) counts as chosen.
+  - unsubscribe and start_interval_loop warn on the controller too, and
+    every warning points at the caller's line.
 """
 
+import multiprocessing
+import pickle
 import threading
 import warnings
 
 import pytest
 
 from agentflow.core.agent import Agent
-from agentflow.core.agent_worker import ProcessWorker, WorkerState
+from agentflow.core.agent_worker import ProcessWorker, ThreadWorker, WorkerState
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
 EMPTY_BROKER = {'broker': {'broker_name': 'b', 'b': {'broker_type': 'empty'}}}
+
+xfail_9r = pytest.mark.xfail(strict=True, reason='issue #9 review: fixed in the next commit')
 
 
 class _StartableWorker(FakeWorker):
@@ -82,11 +92,14 @@ def test_the_data_api_on_the_controlling_object_warns(controller, call):
             call(controller)
 
 
-@pytest.mark.parametrize('worker', [FakeWorker(), None])
+@pytest.mark.parametrize('worker', ['thread-before-broker', 'thread', None])
 def test_no_warning_in_thread_mode_before_start_or_in_the_child(worker):
     agent = Agent('local', {})
-    agent._agent_worker = worker
-    agent._broker = FakeBroker(notifier=agent) if worker is not None else None
+    if worker == 'thread-before-broker':          # e.g. during on_activating
+        agent._agent_worker = ThreadWorker(agent)
+    elif worker == 'thread':
+        agent._agent_worker = FakeWorker()
+        agent._broker = FakeBroker(notifier=agent)
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
         agent.publish('t', 'x')
@@ -109,6 +122,40 @@ def test_an_explicit_mode_does_not_warn(start):
         getattr(agent, 'start' if start == 'explicit' else start)()
 
 
+@xfail_9r
+@pytest.mark.parametrize('call', [
+    lambda a: a.unsubscribe('t'),
+    lambda a: a.start_interval_loop(0),
+])
+def test_other_controller_calls_warn_too(controller, call):
+    with pytest.warns(RuntimeWarning, match='start_thread'):
+        call(controller)
+
+
+def test_the_controller_warning_points_at_the_caller(controller):
+    with pytest.warns(RuntimeWarning) as caught:
+        controller.publish('t', 'x')
+    assert caught[0].filename == __file__
+
+
+def test_the_default_mode_warning_points_at_the_caller():
+    agent = Agent('default', {})
+    agent._agent_worker = _StartableWorker()
+    with pytest.warns(FutureWarning) as caught:
+        agent.start()
+    assert caught[0].filename == __file__
+
+
+@xfail_9r
+def test_a_mode_set_after_construction_counts_as_chosen():
+    agent = Agent('sub', {})
+    agent.set_config('CONCURRENCY_TYPE', 'process')
+    agent._agent_worker = _StartableWorker()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FutureWarning)
+        agent.start()
+
+
 class _WithLock(Agent):
     def __init__(self):
         super().__init__('locked', dict(EMPTY_BROKER))
@@ -119,5 +166,40 @@ def test_an_attribute_that_cannot_be_pickled_is_named():
     agent = _WithLock()
     with pytest.raises(TypeError, match="'lock'") as raised:
         agent.start_process()
-    assert 'on_activating' in str(raised.value)
+    assert 'on_activating' in str(raised.value) + ''.join(getattr(raised.value, '__notes__', []))
     assert agent._agent_worker.state is WorkerState.START_FAILED
+
+
+class _Helper:
+    def __init__(self, agent):
+        self.agent = agent
+
+
+class _WithSharedEventAndLambda(Agent):
+    def __init__(self):
+        super().__init__('mixed', dict(EMPTY_BROKER))
+        self.ready = multiprocessing.Event()          # shared with the child: fine
+        self.helper = _Helper(self)                   # refers to the agent: fine
+        self.callback = lambda: None                  # cannot be pickled
+
+
+@xfail_9r
+def test_only_the_attributes_at_fault_are_named_and_the_type_is_kept():
+    agent = _WithSharedEventAndLambda()
+    with pytest.raises((AttributeError, pickle.PicklingError)) as raised:
+        agent.start_process()
+    notes = ''.join(getattr(raised.value, '__notes__', []))
+    assert "'callback'" in notes
+    assert "'ready'" not in notes and "'helper'" not in notes
+
+
+@xfail_9r
+def test_start_thread_works_after_a_failed_process_start():
+    agent = _WithLock()
+    with pytest.raises(TypeError):
+        agent.start_process()
+    try:
+        agent.start_thread()
+        assert isinstance(agent._agent_worker, ThreadWorker)
+    finally:
+        agent.terminate()
