@@ -134,6 +134,32 @@ def _require_dict(managed: Any, kind: str) -> Dict[str, Any]:
     return managed
 
 
+def _require_envelope(managed: Any, kind: str) -> Dict[str, Any]:
+    """Issue #15: the body must be a dict whose `version` is an int
+    (not a bool) from 1 to VERSION. Unknown keys are ignored, so that
+    optional fields added later (as RFC-014 / RFC-015 did) do not break
+    older receivers."""
+    body = _require_dict(managed, kind)
+    if "version" not in body:
+        raise ParcelDecodeError(f"invalid {kind} payload: missing version")
+    version = body["version"]
+    if type(version) is not int or not 1 <= version <= VERSION:
+        # Never repr() the value itself: a hostile one (an int too large
+        # to print, deep nesting, megabytes of bytes) would make the
+        # message raise or allocate.
+        if type(version) is not int:
+            shown = f"of type {type(version).__name__}"
+        elif -1000 < version < 1000:
+            shown = str(version)
+        else:
+            shown = "out of range"
+        raise ParcelDecodeError(
+            f"invalid {kind} payload: unsupported version {shown} "
+            f"(supported: 1 to {VERSION})"
+        )
+    return body
+
+
 class Parcel(ABC):
     # RFC-014: class-level default, so a Parcel built without __init__
     # (a subclass that skips super().__init__, or one pickled by code
@@ -231,7 +257,9 @@ class Parcel(ABC):
                 pickle_allowed_globals=pickle_allowed_globals)
         if TextParcel.is_payload(payload):
             return TextParcel.from_payload(payload)
-        raise TypeError("Not valid Parcel payload.")
+        # Issue #15: e.g. plain JSON from another MQTT client.
+        raise ParcelDecodeError(
+            "not an AgentFlow payload (no known content-type prefix)")
 
     @staticmethod
     def is_payload(payload: bytes) -> bool:
@@ -319,7 +347,7 @@ class BinaryParcel(Parcel):
         except Exception as ex:
             raise ParcelDecodeError(f"invalid BinaryParcel payload: {ex}") from ex
         pcl = BinaryParcel()
-        pcl._set_managed_data(_require_dict(managed, "BinaryParcel"))
+        pcl._set_managed_data(_require_envelope(managed, "BinaryParcel"))
         return pcl
 
     @staticmethod
@@ -350,10 +378,11 @@ class TextParcel(Parcel):
         raw = bytes(payload)[len(TextParcel.HEAD):]
         try:
             data = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError as ex:
+        except (ValueError, RecursionError) as ex:
+            # Issue #15: RecursionError for deeply nested JSON.
             raise ParcelDecodeError(f"invalid TextParcel payload: {ex}") from ex
         pcl = TextParcel()
-        pcl._set_managed_data(_require_dict(data, "TextParcel"))
+        pcl._set_managed_data(_require_envelope(data, "TextParcel"))
         return pcl
 
     @staticmethod
