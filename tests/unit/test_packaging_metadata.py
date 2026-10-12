@@ -16,10 +16,6 @@ import ast
 import pathlib
 import re
 
-import pytest
-
-xfail_77 = pytest.mark.xfail(strict=True, reason='issue #77: Python versions disagree')
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
@@ -49,7 +45,6 @@ def test_the_python_floor_is_the_lowest_ci_version():
     assert _smoke_test_version() == floor
 
 
-@xfail_77
 def test_the_classifiers_name_the_ci_tested_versions():
     classifiers = _setup_keywords().get('classifiers', [])
     versions = sorted(c.rsplit(' :: ', 1)[1] for c in classifiers
