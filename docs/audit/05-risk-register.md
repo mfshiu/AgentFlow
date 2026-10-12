@@ -1177,7 +1177,11 @@ Signature and return type unchanged; **never-raise preserved** — the diagnosti
 
 ## R-14 — Shared dictionaries without locks
 
-- **Status**: **PARTIALLY RESOLVED** (2026-07-27) — `__topic_handlers` fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md); `_children` / `_parents` remain Open (not addressed in this RFC).
+- **Status**: **RESOLVED** (2026-10-13). `__topic_handlers` was fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md) on 2026-07-27. `_children` / `_parents` followed:
+  - **Issues #6 / #13:** writes happen under `_holon_lock`.
+  - **Issue #57, copy-on-write:** a new member replaces the dict instead of growing it. Code iterating one, such as a user hook while other members register, never sees it change size, and readers need no lock. A known member's re-registration (#6) updates its entry in place: the keys do not change, and no copy is made, so a round of re-registrations stays linear.
+  - **Issue #57, hooks:** a raising `on_register_child` no longer skips the `register_parent` answer, and a raising `on_register_parent` no longer escapes the handler. Both are logged.
+  - **Verification:** `tests/unit/core/test_holon_registry_concurrency.py`.
 - **Severity**: Medium
 - **Category**: Concurrency
 - **File / Function / Line** (historical): `__topic_handlers`, `_children`, `_parents` in `agent.py`
@@ -1705,7 +1709,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
-| R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
+| R-14 | Medium | Medium | **Resolved 2026-10-13** — `__topic_handlers` (RFC-007); `_children` / `_parents` locked writes (#6 / #13), copy-on-write and contained hooks (#57) | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
 | R-19 | Medium | High | **Resolved 2026-10-12 (#15)**: version validated, undecodable messages counted with rate-limited logging | Parcel `version` never validated |
