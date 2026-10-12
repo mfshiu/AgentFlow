@@ -1,6 +1,6 @@
 # RFC-008 — ProcessWorker lifecycle
 
-- **Status**: **Implemented** (2026-07-28)
+- **Status**: **Implemented** (2026-07-28); §F / §7.16 amended 2026-10-13 (issue #9): the docstring they cite now exists, and calls on the controller warn.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-06; downstream of RFC-006 / RFC-007 (which introduced `_handlers_lock` and the ownership model)
 - **Scope**: Making `ProcessWorker` actually usable — spawn-compatible Agent pickling, bounded shutdown with an escalation ladder, well-defined start-failure cleanup, repeated-start / repeated-stop semantics, exitcode observability, and an explicit parent-side Agent API contract under process mode
@@ -435,6 +435,13 @@ def stop(self,
 - Callers who need to interact with the running Agent must connect to the same broker (from the same or a different process) using a normal Agent — not the process-mode controller stub.
 
 This contract is documented in Agent's docstring; no behavioural change beyond what already happens today (post-fix, the child now actually runs, but the parent-controller behaviour is exactly what today's broken-spawn already implies).
+
+*Amended 2026-10-13 (issue #9):*
+- *Until #9, `Agent.__doc__` was `None`, so the claim above was untrue. Agent now has the docstring.*
+- *On the controller (a ProcessWorker and no broker), `publish`, `publish_sync`, `subscribe`, `get_data`, `put_data` and `pop_data` emit a `RuntimeWarning` that points to `start_thread()`, the agent's own hooks or a separate Agent. In the child, and in thread mode, they are silent. Refusing the calls (`AgentNotLocalError`) is left to roadmap P1-5.*
+- *`start()` without an explicit `CONCURRENCY_TYPE` emits a `FutureWarning`: the default will become `'thread'`.*
+- *When pickling the Agent to the child fails, `ProcessWorker.start` adds a note to the exception, which keeps its type. The note names the attributes that cannot be pickled, checked the way spawning pickles them, and suggests creating them in `on_activating()` or using `start_thread()`. After such a failure, `start()` replaces the failed worker, so `start_thread()` works on the same object.*
+- *`unsubscribe` and `start_interval_loop` warn on the controller too. The default-mode `FutureWarning` fires only when `start()` fills in the default: a mode chosen in the config, with `set_config`, or with `start_thread()` / `start_process()` counts as chosen.*
 
 ---
 
