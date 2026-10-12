@@ -405,7 +405,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
     - *`publish_sync(..., raise_on_error=True)` raises `RemoteError`.*
     - *Verified by `tests/unit/core/test_error_replies.py`.*
     - *A structured error (code, retryable) stays with the envelope redesign (P2-1).*
-- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
+- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. *(As of RFC-003. Since #68, `publish_sync` takes `raise_on_error`, `RemoteError` is new, and the Agent config has an `errors` section; see the amendment above.)* `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
 - **Observable behavioural changes** (three; all narrow, all in the loop-prevention direction):
   1. A topic that is subscribed but has no specific handler no longer produces an implicit auto-reply when a message with `topic_return` arrives; the message dispatches to `on_message` default (no-op) and no publish is emitted.
   2. Auto-reply parcels never carry `topic_return` on the wire. A handler that returns a `Parcel` with `topic_return` set observes the reply carrying `topic_return=None` after reconstruction, while the handler's own returned object is left intact.

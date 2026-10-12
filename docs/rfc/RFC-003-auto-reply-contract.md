@@ -395,7 +395,7 @@ Existing xfails that will flip to XPASS (remove `@pytest.mark.xfail`):
 | Test | Purpose |
 |---|---|
 | `test_exception_path_does_not_mutate_incoming_parcel` | Verify R-exception-fresh — capture `p.content` and `p.error` before/after, assert unchanged |
-| `test_exception_path_publishes_fresh_parcel_with_error_field` | Verify the emitted error carries `.error = str(ex)` and `content=None`, `topic_return=None` |
+| `test_exception_path_publishes_fresh_parcel_with_error_field` | Verify the emitted error carries `.error = str(ex)` and `content=None`, `topic_return=None` *(since #68: the exception type, not its message)* |
 | `test_handler_returned_Parcel_content_survives_strip` | Verify R-strip-topic_return preserves content while zeroing topic_return |
 | `test_handler_returned_Parcel_error_survives_strip` | Verify `.error` field survives reconstruction |
 | `test_handler_returned_BinaryParcel_stays_BinaryParcel_after_strip` | Verify `type(data_resp)(content)` preserves subclass |
