@@ -22,23 +22,18 @@ import sys
 
 import pytest
 
-xfail_76 = pytest.mark.xfail(strict=True, reason='issue #76: root __init__.py')
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-@xfail_76
 def test_test_modules_load_under_the_tests_package_only():
     assert __name__ == 'tests.unit.test_import_identity'
     assert not [name for name in sys.modules if name.split('.')[0] == REPO_ROOT.name]
 
 
-@xfail_76
 def test_the_repositorys_parent_directory_is_not_on_sys_path():
     assert REPO_ROOT.parent not in [pathlib.Path(p or '.').resolve() for p in sys.path]
 
 
-@xfail_76
 def test_importing_a_test_module_leaves_pythonpath_alone(monkeypatch):
     monkeypatch.setenv('PYTHONPATH', 'src')
     name = 'tests.unit.core.test_process_worker_lifecycle'
