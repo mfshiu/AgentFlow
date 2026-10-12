@@ -360,6 +360,9 @@ The first `_on_message` call constructs the dispatcher under the lock; concurren
 - **ProcessWorker dispatcher semantics**: dispatcher is per-Agent-instance; in a hypothetical ProcessWorker future, dispatcher would live in the child process. Out of RFC-004 scope.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process attributes + log lines are exposed.
 - **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`.
+- **`publish_sync` inside a handler** (issue #7, found 2026-10-09): the reply was queued for the same consumers, one of which the waiting handler held, so nested calls timed out. *Resolved 2026-10-12 (#7):*
+  - *Replies have their own one-consumer lane (RFC-004 §9 amended), with a byte budget of their own and a queue of at least 1024.*
+  - *Verified by `tests/unit/core/test_publish_sync_in_handlers.py` and `tests/wire/test_publish_sync_in_handler_wire.py`.*
 
 ---
 

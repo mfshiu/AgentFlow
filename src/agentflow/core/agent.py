@@ -297,6 +297,10 @@ class Agent(BrokerNotifier):
         # Issue #34: bytes of received payloads queued for a dispatcher
         # thread, and drops for exceeding that budget.
         self._queued_bytes = 0
+        # Issue #7: publish_sync replies have a byte budget of their own,
+        # of the same size, so that ordinary messages cannot crowd out
+        # a reply a handler is waiting for. Guarded by _queued_bytes_lock.
+        self._reply_queued_bytes = 0
         self._byte_budget_drops = 0
         self._queued_bytes_lock = threading.Lock()
         # Issue #35: publishes the broker refused because its outgoing
@@ -333,6 +337,10 @@ class Agent(BrokerNotifier):
         # message flows.
         self._dispatcher = None
         self._dispatcher_init_lock = threading.Lock()
+        # Issue #7: the lane for publish_sync replies (see
+        # _get_reply_dispatcher); closed by terminate().
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         if self.config.get('dispatch', {}).get('mode') == 'per_message_thread':
             warnings.warn(
                 "Agent dispatch mode 'per_message_thread' is deprecated "
@@ -364,6 +372,7 @@ class Agent(BrokerNotifier):
         '_gate_timer',
         '_dispatcher_init_lock',
         '_dispatcher',
+        '_reply_dispatcher',
         '_broker',
         '_agent_worker',
         '_message_broker',
@@ -443,6 +452,7 @@ class Agent(BrokerNotifier):
         self._dedup_lock = threading.Lock()
         self._decode_lock = threading.Lock()
         self._queued_bytes = 0
+        self._reply_queued_bytes = 0
         self._queued_bytes_lock = threading.Lock()
         self._early_lock = threading.Lock()
         self._early_messages = deque()
@@ -450,6 +460,8 @@ class Agent(BrokerNotifier):
         self._gate_timer = None
         self._dispatcher_init_lock = threading.RLock()
         self._dispatcher = None
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         self._broker = None
         self._agent_worker = None
         self._message_broker = None
@@ -677,9 +689,12 @@ class Agent(BrokerNotifier):
     def terminate(self):
         """Fire-and-forget termination — never raises.
 
-        Order (unchanged, RFC-004 / RFC-009 §7.16):
+        Order (RFC-004 / RFC-009 §7.16):
           1. dispatcher.stop() — bounded per RFC-004
-          2. worker.stop()     — bounded per RFC-008 (ProcessWorker)
+          2. the publish_sync reply lane's stop() (issue #7), after the
+             dispatcher, whose draining handlers may still wait for
+             replies; no lane is started afterwards
+          3. worker.stop()     — bounded per RFC-008 (ProcessWorker)
                                  or RFC-009 (ThreadWorker)
 
         RFC-009 §E: this method inspects the worker.stop() return
@@ -708,6 +723,19 @@ class Agent(BrokerNotifier):
                 # any exception and continue to worker.stop().
                 logger.exception(self.M(
                     f"terminate: dispatcher.stop() raised: {ex!r}"
+                ))
+        # Issue #7: the reply lane after the dispatcher, whose draining
+        # handlers may still be waiting in publish_sync. Closed under
+        # the init lock, so that no lane is created afterwards.
+        with self._dispatcher_init_lock:
+            self._reply_lane_closed = True
+            reply_lane = self._reply_dispatcher
+        if reply_lane is not None:
+            try:
+                reply_lane.stop()
+            except Exception as ex:
+                logger.exception(self.M(
+                    f"terminate: reply dispatcher stop() raised: {ex!r}"
                 ))
 
         if not self._agent_worker:
@@ -1170,6 +1198,10 @@ class Agent(BrokerNotifier):
 
     @final
     def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
+        """Publish a request and wait up to `timeout` seconds for its
+        reply, which is returned; raises TimeoutError without one. Safe
+        to call from a handler (issue #7): replies have their own lane,
+        so the waiting handler does not starve its reply."""
         if isinstance(data, Parcel):
             pcl = data
             if pcl.topic_return:
@@ -1821,20 +1853,23 @@ class Agent(BrokerNotifier):
             else:
                 is_specific_handler = False
                 topic_handler = self.on_message
+        # Issue #7: a publish_sync reply takes its own lane, so that a
+        # handler waiting in publish_sync cannot starve it.
+        is_reply = record is not None and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
 
-        if not self.__reserve_queued_bytes(size):
+        if not self.__reserve_queued_bytes(size, reply=is_reply):
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
             return
         try:
-            dispatcher = self._get_dispatcher()
+            dispatcher = self._get_reply_dispatcher() if is_reply else self._get_dispatcher()
         except BaseException:
             # A dispatcher that fails to start must not leave bytes
             # reserved.
-            self.__release_queued_bytes(size)
+            self.__release_queued_bytes(size, reply=is_reply)
             raise
 
         def task():
-            self.__release_queued_bytes(size)
+            self.__release_queued_bytes(size, reply=is_reply)
             self.__handle(topic, data, is_specific_handler, topic_handler)
 
         # RFC-004: dispatch via the bounded message dispatcher instead
@@ -1842,7 +1877,7 @@ class Agent(BrokerNotifier):
         # (broker-callback safety invariant, §7.3); the dispatcher counts
         # and logs its own drops.
         if not dispatcher.enqueue(task, topic=topic):
-            self.__release_queued_bytes(size)
+            self.__release_queued_bytes(size, reply=is_reply)
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=False)
 
 
@@ -1957,10 +1992,16 @@ class Agent(BrokerNotifier):
                 self._recent_message_ids.pop(pcl.message_id, None)
 
 
-    def __reserve_queued_bytes(self, size) -> bool:
+    def __reserve_queued_bytes(self, size, reply=False) -> bool:
         """Issue #34: account `size` against dispatch.max_queued_bytes.
-        Returns False, reserving nothing, if it does not fit."""
+        Returns False, reserving nothing, if it does not fit. Issue #7:
+        publish_sync replies (`reply`) have a budget of their own."""
         with self._queued_bytes_lock:
+            if reply:
+                if self._reply_queued_bytes + size > self._max_queued_bytes:
+                    return False
+                self._reply_queued_bytes += size
+                return True
             if self._queued_bytes + size > self._max_queued_bytes:
                 return False
             self._queued_bytes += size
@@ -1972,9 +2013,12 @@ class Agent(BrokerNotifier):
             return self._queued_bytes + size <= self._max_queued_bytes
 
 
-    def __release_queued_bytes(self, size) -> None:
+    def __release_queued_bytes(self, size, reply=False) -> None:
         with self._queued_bytes_lock:
-            self._queued_bytes -= size
+            if reply:
+                self._reply_queued_bytes -= size
+            else:
+                self._queued_bytes -= size
 
 
     def __has_handler(self, topic) -> bool:
@@ -2167,6 +2211,34 @@ class Agent(BrokerNotifier):
                 if self._dispatcher is None:
                     self._dispatcher = self.__create_dispatcher()
         return self._dispatcher
+
+
+    def _get_reply_dispatcher(self):
+        """Issue #7: the lane for publish_sync replies, a one-consumer
+        MessageDispatcher. It only decodes a reply and wakes the waiting
+        call (_ReplyRouter), never a user handler, so a handler waiting
+        in publish_sync cannot starve its own reply. Replies also have a
+        byte budget of their own (see __reserve_queued_bytes) and a
+        queue of at least 1024, so neither other messages nor a small
+        dispatch.queue_capacity can get them dropped. Created on the
+        first reply. The legacy per-message-thread mode cannot starve
+        and uses its own dispatcher; so does an Agent after terminate()."""
+        dispatcher = self._get_dispatcher()
+        if not isinstance(dispatcher, MessageDispatcher):
+            return dispatcher
+        if self._reply_dispatcher is None:
+            with self._dispatcher_init_lock:
+                if self._reply_lane_closed:
+                    return dispatcher
+                if self._reply_dispatcher is None:
+                    dispatch_cfg = self.config.get('dispatch', {}) or {}
+                    self._reply_dispatcher = MessageDispatcher(
+                        workers=1,
+                        queue_capacity=max(int(dispatch_cfg.get('queue_capacity', 1024)), 1024),
+                        shutdown_timeout_s=float(dispatch_cfg.get('shutdown_timeout_s', 5.0)),
+                        name=f'ReplyDispatcher-{self.tag}',
+                    )
+        return self._reply_dispatcher
 
 
     def on_connected(self):
