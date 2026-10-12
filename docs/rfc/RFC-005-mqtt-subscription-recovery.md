@@ -1,6 +1,6 @@
 # RFC-005 — MQTT subscription recovery
 
-- **Status**: **Implemented (2026-07-27)**
+- **Status**: **Implemented (2026-07-27)**; §7.3 and §7.5 amended 2026-10-12 (issue #54): the first CONNACK also replays the registry.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-03; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md), [RFC-002](RFC-002-publish-error-propagation.md), [RFC-003](RFC-003-auto-reply-contract.md), [RFC-004](RFC-004-bounded-message-dispatch.md)
 - **Scope**: MqttBroker subscription registry, on_connect / on_disconnect state machine, resubscribe on reconnect, stop-vs-reconnect race resolution
@@ -9,7 +9,7 @@
   - Landed the recommended Option C in `src/agentflow/broker/mqtt_broker.py`. All state is contained within `MqttBroker`; `MessageBroker` ABC, `BrokerNotifier` ABC, `Agent.*` public API, `Parcel` and wire format are all **untouched**.
   - Added attributes protected by `_state_lock`: `_registry: dict[str, Any]`, `_connected`, `_ever_connected`, `_stopping`, `_last_disconnect_was_planned`, three recovery counters (`_resubscribe_success_count`, `_resubscribe_error_count`, `_recovery_run_count`). Public observability surface added: `last_disconnect_was_planned` property, `recovery_metrics()` snapshot method.
   - `subscribe`/`unsubscribe` update the registry under lock and forward to `client.subscribe`/`client.unsubscribe` only when currently connected; disconnected calls only update the registry and return `None`. Post-stop calls short-circuit and return `None` without touching the registry.
-  - `_on_connect(rc=0)` distinguishes first-connect (empty snapshot, skip recovery) from reconnect (snapshot the registry, invoke `_recover_subscriptions`) via `_ever_connected`. Recovery iterates outside the lock with a per-iteration re-check of `_stopping` and `topic in _registry`; per-topic failures are counted and logged but do not abort the loop.
+  - `_on_connect(rc=0)` distinguishes first-connect (empty snapshot, skip recovery) from reconnect (snapshot the registry, invoke `_recover_subscriptions`) via `_ever_connected`. *Amended 2026-10-12 (issue #54): every CONNACK, the first included, snapshots the registry; skipping the first lost topics subscribed while STARTING.* Recovery iterates outside the lock with a per-iteration re-check of `_stopping` and `topic in _registry`; per-topic failures are counted and logged but do not abort the loop.
   - `_on_disconnect` classifies planned vs unexpected (`_stopping` or `reasonCode == 0`), clears `_connect_ok` and `_connected_evt`, preserves the registry.
   - `stop()` flips `_stopping = True` **before** `client.disconnect()`; any inline `_on_disconnect` or late `_on_connect` observes the flag.
   - Test surface: `tests/unit/test_mqtt_broker_reconnect.py` rewritten (48 tests, 10 categories) — the 6 aspirational strict xfails from R-03 characterization all converted to passing positive assertions; new tests cover per-topic failure isolation, stop-during-recovery, unsubscribe-during-recovery, subscribe-during-recovery, concurrent producer thread-safety, and three `_state_lock`-not-held-across-client-call assertions.
@@ -139,7 +139,7 @@ The broker maintains an authoritative `dict[topic, data_type]` populated by ever
 | MessageBroker ABC change | None required — the registry and recovery are internal to `MqttBroker` |
 | Agent API change | None |
 | Registry as source of truth | ✓ unsubscribe deletes from registry; recovery cannot resurrect |
-| First-connect vs reconnect distinction | Via a single `_ever_connected` bool; first connect skips recovery loop |
+| First-connect vs reconnect distinction | Via a single `_ever_connected` bool; first connect skips recovery loop. *Amended (issue #54): no distinction any more; every CONNACK replays the registry.* |
 | Stop guard | Same `_state_lock` protects registry, `_stopped`, and `_ever_connected` |
 | Per-topic failure isolation | Straightforward: try/except per `client.subscribe` inside the recovery loop |
 | Race between concurrent subscribe/unsubscribe and recovery | Present but rare; MQTT idempotency limits damage. Documented in §7 |
@@ -361,13 +361,15 @@ def recovery_metrics(self) -> dict:
 `{topic: data_type}`. `data_type` is kept even though `MqttBroker.subscribe` currently ignores it — future `RosBroker`-style subclasses need it. Additional metadata (subscription time, epoch, options) explicitly deferred.
 
 ### 7.3 Subscribe when disconnected
-`broker.subscribe(topic, data_type)` **still updates the registry and calls `client.subscribe`**. paho decides what to do while disconnected (typically queues or fails silently). The registry write is the durable contract: the topic will be re-subscribed on the next successful reconnect regardless of what paho did with the immediate call.
+*Amended 2026-10-12 (issue #54), to match the implementation:* `broker.subscribe(topic, data_type)` **updates the registry only**, and returns `None`. It calls `client.subscribe` only when connected. The registry write is the durable contract: the topic is subscribed on the next successful CONNACK, **including the first one** (a subscribe made while the broker is STARTING).
+
+The registry write and the read of `_connected` happen under `_state_lock`, as do `_on_connect`'s setting of `_connected` and its snapshot. So each topic is either sent by `subscribe` or replayed by `_on_connect`; none is missed.
 
 ### 7.4 Unsubscribe when disconnected
 Symmetric: `broker.unsubscribe(topic)` **removes from registry and calls `client.unsubscribe`**. Registry deletion is the durable contract; the topic will not be re-subscribed on reconnect.
 
 ### 7.5 on_connect success recovery flow
-Under `_state_lock`: check `_stopped` (bail if True); determine `is_first = not _ever_connected`; set `_ever_connected = True`; snapshot the registry if not first. Release lock. If snapshot non-empty, run `_recover_subscriptions`. Then call `notifier._on_connect()`. Finally set `_connected_evt`.
+Under `_state_lock`: check `_stopped` (bail if True); set `_ever_connected = True`; snapshot the registry (*amended 2026-10-12, issue #54: on every CONNACK; it used to skip the first*). Release lock. If snapshot non-empty, run `_recover_subscriptions`. Then call `notifier._on_connect()`. Finally set `_connected_evt`.
 
 Recovery iterates the snapshot outside the lock, checking `_stopped` between topics to allow prompt shutdown. Per-topic failures are counted (`_resubscribe_error_count`) and logged; recovery continues.
 

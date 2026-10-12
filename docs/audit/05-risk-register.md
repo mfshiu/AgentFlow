@@ -254,7 +254,7 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 
 - **W-24 / issue #60.** If start() hits START_TIMEOUT while the startup helper is still wedged in `connect()`, and that helper later succeeds, the orphaned client now keeps reconnecting in the background. Previously it died at its first connection loss. Its callbacks stay fenced.
 - `register_child` is still sent only on the first connection (issue #6).
-- Subscriptions made before the first CONNACK are still not sent (issue #54).
+- Subscriptions made before the first CONNACK are still not sent (issue #54). *Resolved 2026-10-12 (#54): every CONNACK, the first included, replays the registry. See RFC-005 §7.3 / §7.5 and `tests/unit/test_mqtt_broker_first_connect.py` / `tests/wire/test_first_connect_subscriptions_wire.py`. `recovery_run_count` now also counts a first connection that had topics to replay.*
 - Publishes made while disconnected are still dropped by `Agent.publish` (issue #4).
 
 ---
