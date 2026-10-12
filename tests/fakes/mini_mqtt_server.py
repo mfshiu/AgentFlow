@@ -19,6 +19,8 @@ Failure injection:
                             immediately without a CONNACK
                             (simulates a broker that is down)
   - connack_rc              return code sent in every CONNACK
+  - reject_topics           topic filters refused with SUBACK 0x80
+                            (an ACL denying them)
   - connack_gate            a threading.Event; when set to one, each
                             CONNACK waits until it is set (a slow
                             broker: the client stays STARTING)
@@ -70,6 +72,7 @@ class MiniMqttServer:
         self.connack_gate: Optional[threading.Event] = None
         self.reject_connections = False
         self.withhold_puback = False
+        self.reject_topics: Set[str] = set()
         self.deliver_on_connect: List[Tuple[str, bytes]] = []
 
         self._lock = threading.Lock()
@@ -312,10 +315,11 @@ class MiniMqttServer:
             topic = body[pos + 2:pos + 2 + tlen].decode('utf-8')
             pos += 2 + tlen + 1     # skip requested QoS byte
             topics.append(topic)
-            granted.append(0)
+            granted.append(0x80 if topic in self.reject_topics else 0)
+        accepted = [t for t, g in zip(topics, granted) if g != 0x80]
         with self._lock:
-            conn.topics.update(topics)
-            self.subscriptions.extend((conn.index, t) for t in topics)
+            conn.topics.update(accepted)
+            self.subscriptions.extend((conn.index, t) for t in accepted)
         conn.send(bytes([0x90]) + _encode_remaining_length(2 + len(granted))
                   + pid + bytes(granted))
 

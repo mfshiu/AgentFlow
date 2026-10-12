@@ -429,6 +429,7 @@ def test_unsubscribe_after_stop_returns_None_and_does_not_forward(
 # Category G: Failure isolation (RFC-005 §7.12)
 # ==========================================================================
 
+@pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
 def test_client_subscribe_exception_propagates_when_connected(
     broker, fake_client,
 ):
@@ -436,8 +437,11 @@ def test_client_subscribe_exception_propagates_when_connected(
     fake_client.subscribe.side_effect = RuntimeError('paho failure')
     with pytest.raises(RuntimeError, match='paho failure'):
         broker.subscribe('T', 'str')
-    # Registry was updated BEFORE the client call raised.
-    assert broker.recovery_metrics()['active_subscriptions'] == 1
+    # Registry was updated BEFORE the client call raised, so the next
+    # CONNACK replays it; issue #53: but it is not counted as active.
+    assert broker._registry.keys() == {'T'}
+    assert broker.recovery_metrics()['active_subscriptions'] == 0
+    assert broker.recovery_metrics()['failed_subscriptions'] == 1
 
 
 def test_client_unsubscribe_exception_propagates_when_connected(
@@ -528,6 +532,7 @@ def test_on_message_after_reconnect_still_forwards_to_same_notifier(
 # Category I: Metrics snapshot consistency (RFC-005 §7.13)
 # ==========================================================================
 
+@pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
 def test_recovery_metrics_returns_all_keys(broker, fake_client):
     snap = broker.recovery_metrics()
     assert set(snap.keys()) == {
@@ -536,6 +541,8 @@ def test_recovery_metrics_returns_all_keys(broker, fake_client):
         'connected', 'stopping', 'ever_connected',
         # Issue #35: the outbound limit's pending publishes.
         'pending_publish_count', 'pending_publish_bytes',
+        # Issue #53: topics the broker refused or that failed to send.
+        'failed_subscriptions',
     }
 
 
