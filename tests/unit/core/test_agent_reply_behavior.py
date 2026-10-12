@@ -272,11 +272,13 @@ def test_exception_path_does_not_mutate_incoming_parcel(agent_with_fake_broker):
     assert stored[0].topic_return == 'R'
 
 
+@pytest.mark.xfail(strict=True, reason='issue #68: error replies')
 def test_exception_path_publishes_fresh_parcel_with_error_field(
     agent_with_fake_broker,
 ):
-    """Post-RFC-003: the error echo is a NEW parcel carrying
-    .error=str(ex), content=None, topic_return=None."""
+    """Post-RFC-003: the error echo is a NEW parcel carrying an error,
+    content=None, topic_return=None. Issue #68: the error names the
+    exception type; its message stays in the responder's log."""
     agent, broker = agent_with_fake_broker
 
     def raising_handler(topic, pcl):
@@ -291,7 +293,8 @@ def test_exception_path_publishes_fresh_parcel_with_error_field(
     assert reply_pcl.content is None
     assert reply_pcl.topic_return is None
     assert reply_pcl.error is not None
-    assert 'the-diagnostic-message' in reply_pcl.error
+    assert 'RuntimeError' in reply_pcl.error
+    assert 'the-diagnostic-message' not in reply_pcl.error
 
 
 def test_handler_exception_error_echo_does_not_carry_topic_return(

@@ -121,7 +121,8 @@ def _serve(agent, handler):
     return handled
 
 
-@pytest.mark.parametrize('kind', ['content', 'parcel', 'error'])
+@pytest.mark.parametrize('kind', ['content', 'parcel', pytest.param(
+    'error', marks=pytest.mark.xfail(strict=True, reason='issue #68: error replies'))])
 def test_auto_reply_echoes_the_request_correlation_id(agent_and_broker, kind):
     agent, broker = agent_and_broker
     returned = _correlated('pong-parcel', 'handler-own')
@@ -141,7 +142,7 @@ def test_auto_reply_echoes_the_request_correlation_id(agent_and_broker, kind):
     assert reply.correlation_id == 'c-1'
     assert returned.correlation_id == 'handler-own'     # the handler's Parcel is not modified
     if kind == 'error':
-        assert reply.error == 'boom'
+        assert 'ValueError' in reply.error          # issue #68: the type, not 'boom'
 
 
 def test_auto_reply_to_an_uncorrelated_request_is_unchanged(agent_and_broker):
