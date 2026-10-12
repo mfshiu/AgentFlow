@@ -1632,8 +1632,9 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 ### Outbound limit (2026-10-12, issue #35)
 
 **Change.**
-- MqttBroker tracks each publish from the paho call until paho reports it sent: QoS 0 once written to the socket, QoS ≥ 1 once acknowledged.
-- A publish that would take the pending payload bytes past the `max_pending_bytes` broker option (default 64 MiB) raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` with reason `backpressure`, and a transport-neutral `PublishBackpressureError`.
+- MqttBroker tracks each publish from the paho call until paho reports it sent: QoS 0 once written to the socket, QoS ≥ 1 once acknowledged. It is kept per mid in publish order, because paho reuses mids after 65535.
+- Each pending publish counts its payload, its topic and a fixed 2 KiB for paho's bookkeeping. That overhead was measured with tracemalloc at about 2 KB per queued 100-byte message, so counting payloads alone understated memory 10–20× for small messages.
+- A publish that would take the pending bytes past the `max_pending_bytes` broker option (default 64 MiB) raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` with reason `backpressure`, and a transport-neutral `PublishBackpressureError`.
 - `Agent.publish` returns `False`, counts it in `publish_backpressure_count` and logs it without a traceback (WARNING on the 1st, 2nd, 4th, ... refusal). `publish_sync` raises it.
 - A connection loss forgets unsent QoS 0 messages, as paho drops them. QoS ≥ 1 ones stay pending until paho resends them and they are acknowledged.
 - `recovery_metrics()` reports `pending_publish_count` and `pending_publish_bytes`.
@@ -1641,12 +1642,21 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 **Compatibility.**
 - A publisher that outruns its link by more than 64 MiB now gets `False` (or an exception from `publish_sync`) instead of growing memory. Raise `max_pending_bytes` for bursty, high-volume senders.
 - A single payload larger than `max_pending_bytes` can never be sent.
+- At the default limit, at most about 32 000 small messages can be pending.
 
 **Verification**:
-- `tests/unit/test_mqtt_broker_backpressure.py`: tracking by mid, the limit and its default, a report that arrives before `publish()` returns, disconnects, option validation, and `Agent.publish`.
-- `tests/wire/test_outbound_backpressure_wire.py`: stalls the loopback server and expects backpressure, then a drain once the link moves again.
+- `tests/unit/test_mqtt_broker_backpressure.py` covers:
+  - tracking by mid, including reused mids;
+  - the cost per message, the limit and its default;
+  - a report that arrives before `publish()` returns;
+  - disconnects;
+  - a paho call that raises;
+  - option validation;
+  - `Agent.publish`.
+- `tests/wire/test_outbound_backpressure_wire.py`: stalls the loopback server and expects backpressure, then a backlog that stays while the link is stalled and drains once it moves again.
+- A review probe published 150 000 messages over a stalled link. The tracked count matched paho's queue exactly, far beyond 65 535, and returned to 0 after the drain.
 
-**Not covered**: the limit counts payload bytes only; topics and MQTT headers add a little. Only MqttBroker enforces it.
+**Not covered**: the per-message overhead is an estimate for CPython 3.11–3.13 and paho 2.1. Only MqttBroker enforces the limit.
 
 ---
 

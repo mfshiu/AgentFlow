@@ -154,9 +154,13 @@ paho queues QoS 0 messages without any limit (`max_queued_messages` applies only
 
 | Option | Default | Meaning |
 |---|---|---|
-| `max_pending_bytes` | `67108864` (64 MiB) | Payload bytes that may be pending: not yet written to the socket (QoS 0) or not yet acknowledged (QoS ≥ 1). A positive int; a malformed value raises at `start()` and leaves the broker NEW. |
+| `max_pending_bytes` | `67108864` (64 MiB) | Estimated bytes that may be pending: not yet written to the socket (QoS 0) or not yet acknowledged (QoS ≥ 1). Each publish counts its payload, its topic and 2 KiB for paho's bookkeeping. A positive int; a malformed value raises at `start()` and leaves the broker NEW. |
 
-- **Tracking.** A publish is pending from the paho call until paho's `on_publish` reports it. Its bytes are reserved before the call, so a report that arrives before `publish()` returns is handled. The broker's lock is never held across a paho call, because paho runs `on_publish` while holding its own message lock.
+- **Tracking.** A publish is pending from the paho call until paho's `on_publish` reports it.
+  - Its bytes are reserved before the call, so a report that arrives before `publish()` returns is handled.
+  - Pending publishes are kept per mid in publish order, because paho reuses a mid after 65535, possibly while an older publish with it is still pending. A report releases the oldest one.
+  - The broker's lock is never held across a paho call, because paho runs `on_publish` while holding its own message lock.
+- **Cost.** Each publish counts its payload and topic plus `_PENDING_MESSAGE_OVERHEAD` (2 KiB). That covers what paho holds per queued message: the packet dict and buffer, and an `MQTTMessageInfo` with its Condition. It was measured with tracemalloc at about 2 KB per 100-byte message on CPython 3.11 and 3.13.
 - **Refusal.** A publish that would take the pending bytes past the limit raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` (reason `backpressure`) and a transport-neutral `PublishBackpressureError` from `agentflow.broker`.
   - `Agent.publish` returns `False`, counts it in `publish_backpressure_count`, and logs it without a traceback (WARNING on the 1st, 2nd, 4th, ... refusal, DEBUG otherwise).
   - `publish_sync` raises it, so a requester fails fast.
