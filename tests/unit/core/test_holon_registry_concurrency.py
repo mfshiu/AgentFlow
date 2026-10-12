@@ -27,8 +27,6 @@ from agentflow.core.parcel import Parcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_57 = pytest.mark.xfail(strict=True, reason='issue #57: holon registry concurrency')
-
 
 class Parent(Agent):
     def __init__(self):
@@ -65,7 +63,6 @@ def _answers(broker):
     return [t for t, _ in broker.publish_calls if '.to_child.boss' in t]
 
 
-@xfail_57
 def test_a_hook_iterating_children_survives_concurrent_registrations():
     parent = Parent()
     broker = _attach(parent)
@@ -80,7 +77,6 @@ def test_a_hook_iterating_children_survives_concurrent_registrations():
         parent.terminate()
 
 
-@xfail_57
 def test_a_raising_child_hook_still_answers_register_parent(caplog):
     caplog.set_level(logging.ERROR)
     parent = Parent()
@@ -103,7 +99,6 @@ class Child(Agent):
         raise ValueError('hook failed')
 
 
-@xfail_57
 def test_a_raising_parent_hook_is_logged_and_contained(caplog):
     caplog.set_level(logging.ERROR)
     child = Child()
@@ -119,7 +114,6 @@ def test_a_raising_parent_hook_is_logged_and_contained(caplog):
         child.terminate()
 
 
-@xfail_57
 def test_registries_are_replaced_not_mutated():
     parent = Parent()
     broker = _attach(parent)

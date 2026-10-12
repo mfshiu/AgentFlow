@@ -319,6 +319,9 @@ class Agent(BrokerNotifier):
         self.interval_seconds = 0
         self._agent_worker: Optional["Worker"] = None
 
+        # Issue #57: replaced, never mutated, on each registration (under
+        # _holon_lock), so that code iterating them, e.g. a hook while
+        # other members register, never sees them change size.
         self._children: dict = {}
         self._parents: dict = {}
         # Issue #6: makes "is this a new member?" + insert atomic, so a
@@ -1577,7 +1580,7 @@ class Agent(BrokerNotifier):
             is_new = child_id not in self._children
             refused = is_new and cap is not None and len(self._children) >= cap
             if not refused:
-                self._children[child_id] = child_info
+                self._children = {**self._children, child_id: child_info}     # issue #57
                 total = len(self._children)
                 if is_new:
                     self._children_registering.add(child_id)
@@ -1593,6 +1596,10 @@ class Agent(BrokerNotifier):
         try:
             logger.info(self.M(f"Add a child: {child_id}, total: {total}"))
             self.on_register_child(child_id, child_info)
+        except Exception:
+            # Issue #57: the child is registered; a failing hook must not
+            # keep it from being answered with register_parent.
+            logger.exception(self.M(f"on_register_child raised for {child_id!r}"))
         finally:
             with self._holon_lock:
                 self._children_registering.discard(child_id)
@@ -1610,12 +1617,17 @@ class Agent(BrokerNotifier):
         parent_info['child_id'] = self.agent_id
         with self._holon_lock:
             is_new = parent_id not in self._parents
-            self._parents[parent_id] = parent_info
+            self._parents = {**self._parents, parent_id: parent_info}       # issue #57
             total = len(self._parents)
             pending = self._pending_terminates.pop(parent_id, None)
         if is_new:
             logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
-            self.on_register_parent(parent_id, parent_info)
+            try:
+                self.on_register_parent(parent_id, parent_info)
+            except Exception:
+                # Issue #57: the parent is registered, and a terminate it
+                # sent earlier must still be acted on.
+                logger.exception(self.M(f"on_register_parent raised for {parent_id!r}"))
         else:
             logger.debug(self.M(f"Parent re-registered: {parent_id}"))
         if pending is not None and pending[0] >= time.monotonic():
