@@ -40,8 +40,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.agent_worker import WorkerState
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_35r = pytest.mark.xfail(strict=True, reason='issue #35 review: fixed in the next commit')
-
 MiB = 1024 * 1024
 MQTT_ERR_NO_CONN = 4
 
@@ -86,7 +84,6 @@ def _cost(payload_size, topic='t'):
     return payload_size + len(topic) + mqtt_broker._PENDING_MESSAGE_OVERHEAD
 
 
-@xfail_35r
 def test_publishes_are_pending_until_paho_reports_them_sent(broker, fake_client, mids):
     _running(broker, fake_client)
     for _ in range(3):
@@ -96,14 +93,12 @@ def test_publishes_are_pending_until_paho_reports_them_sent(broker, fake_client,
     assert _pending(broker) == (2, 2 * _cost(1000, 'agents/a'))
 
 
-@xfail_35r
 def test_the_per_message_overhead_covers_pahos_bookkeeping():
     # Measured with tracemalloc on CPython 3.11 / 3.13 over a stalled
     # link: about 2 KB per queued 100-byte message.
     assert mqtt_broker._PENDING_MESSAGE_OVERHEAD >= 2000
 
 
-@xfail_35r
 def test_a_publish_beyond_max_pending_bytes_is_refused_before_paho(broker, fake_client, mids):
     _running(broker, fake_client, {'max_pending_bytes': _cost(1000) * 5 // 2})
     broker.publish('t', b'x' * 1000)
@@ -117,7 +112,6 @@ def test_a_publish_beyond_max_pending_bytes_is_refused_before_paho(broker, fake_
     broker.publish('t', b'x' * 1000)             # room again
 
 
-@xfail_35r
 def test_the_default_limit_is_64_mib(broker, fake_client, mids):
     _running(broker, fake_client)
     broker.publish('t', b'x' * (64 * MiB - _cost(0)))     # exactly the limit
@@ -138,7 +132,6 @@ def test_a_report_that_arrives_before_publish_returns_is_not_counted(broker, fak
     assert _pending(broker) == (0, 0)
 
 
-@xfail_35r
 def test_publishes_that_share_a_reused_mid_are_each_counted(broker, fake_client):
     fake_client.publish.side_effect = lambda *args, **kwargs: _Info(7)
     _running(broker, fake_client)
@@ -151,7 +144,6 @@ def test_publishes_that_share_a_reused_mid_are_each_counted(broker, fake_client)
     assert _pending(broker) == (0, 0)
 
 
-@xfail_35r
 def test_a_disconnect_forgets_unsent_qos0_but_keeps_qos1(broker, fake_client, mids):
     _running(broker, fake_client)
     broker.publish('t', b'x' * 1000)             # mid 1, QoS 0
