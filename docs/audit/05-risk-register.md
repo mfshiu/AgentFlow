@@ -1596,7 +1596,8 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
   - enqueuing the raw bytes.
 - `__handle` on a dispatcher thread decodes, deduplicates (#4) and handles the message.
 - `dispatch.max_queued_bytes` (default 256 MiB) bounds the payload bytes waiting for a dispatcher thread, and the bytes held by the early-message gate.
-- A message the queue cannot take is dropped without decoding. A request (RFC-003) of at most 64 KiB is decoded on the receiving thread only to answer it "overloaded" (#4).
+- A message the queue cannot take is dropped without decoding. A request (RFC-003) of at most 64 KiB is decoded on the receiving thread only to answer it "overloaded" (#4). Its message id is recorded then, so neither a copy still waiting in the queue nor a later redelivery runs a request whose requester was told it was dropped.
+- Held messages are released within the byte budget as well as the queue capacity.
 - TextParcel decodes from a `memoryview`, without a sliced copy.
 
 **Compatibility.**
