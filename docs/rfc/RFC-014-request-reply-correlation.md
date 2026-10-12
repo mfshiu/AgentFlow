@@ -35,12 +35,15 @@ The envelope had only `version`, `content`, `topic_return` and `error`. `publish
 ### 2.2 Requester: `publish_sync`
 
 - Each call draws a fresh id: `secrets.token_hex(16)`, 32 lowercase hex characters, unpredictable.
-- The id is set on a **copy** of the outgoing Parcel, so the caller's Parcel is not modified. The existing `topic_return` handling is unchanged (#21).
+- The id is set on a **copy** of the outgoing Parcel, so the caller's Parcel is not modified. The `topic_return` handling was left to #21 (see the amendment below).
 - *Amended 2026-10-13 (issue #21):*
   - **The reply topic is set on the copy too.** The caller's `topic_return` is untouched, and a retry with the same Parcel gets a fresh reply topic. A `topic_wait`, or a `topic_return` already on the Parcel, is still used.
   - **The waiter is a plain `threading.Event`.** It is no longer obtained from the worker, which could create a ProcessWorker and set the global start method.
-  - **`timeout=None` is deprecated.** It emits a `DeprecationWarning` and still waits forever.
-  - **Late replies.** The last 1024 reply topics `publish_sync` generated are remembered once left. A reply arriving later on one is dropped at DEBUG and counted in `Agent.late_reply_count`, instead of reaching `on_message`. A late reply on a caller's own `topic_wait` still reaches `on_message`, as RFC-001 specifies.
+  - **`timeout=None` is deprecated.** It emits a `DeprecationWarning`, and logs a WARNING once per process since Python hides the warning outside `__main__`. It still waits forever.
+  - **Late replies.** The last 1024 reply topics `publish_sync` generated are remembered once left.
+    - A message arriving later on one is dropped at DEBUG and counted in `Agent.late_reply_count`, instead of reaching `on_message`. It is checked at the top of message routing and again at the handler lookup, so a reply racing the timeout is caught too.
+    - A late reply on a caller's own `topic_wait` still reaches `on_message`, as RFC-001 specifies.
+    - So does one on a generated topic the caller has since subscribed with `Agent.subscribe`: the exact topic, with or without a handler.
 - The reply handler applies the rules in §2.4.
 - The Parcel returned to the caller has its `correlation_id` cleared. The id served only to match the reply. Without clearing, a gateway that answers in `on_message` (no auto-reply there, RFC-003) by forwarding that Parcel by hand would send its own requester a foreign id, and the requester would ignore it.
 

@@ -205,7 +205,7 @@ sequenceDiagram
     participant HR as Response handler
     Note over AS: publish_sync(topic, data, topic_wait=None, timeout=30)
     AS->>AS: generate return_topic = tag-<10 alnum>/topic
-    AS->>AS: create DataEvent(worker.create_event())
+    AS->>AS: create DataEvent() (a threading.Event; worker.create_event() before #21)
     AS->>AS: subscribe(return_topic, handle_response)<br/>__topic_handlers[return_topic] = handler
     rect rgba(220, 245, 220, 0.5)
       Note over AS: try:
@@ -239,7 +239,7 @@ For every `publish_sync` call, regardless of exit path (success, `TimeoutError`,
 
 - `return_topic not in agent._Agent__topic_handlers`
 - `broker.unsubscribe_calls` grew by exactly one entry equal to `return_topic`
-- Any late or duplicate response arriving after cleanup is routed to the default `Agent.on_message` (no-op) via fall-through, not to the completed `handle_response`.
+- Any late or duplicate response arriving after cleanup is routed to the default `Agent.on_message` (no-op) via fall-through, not to the completed `handle_response`. *Since issue #21 (2026-10-13): only on a caller's own `topic_wait`, or on a topic the caller has since subscribed; one on a reply topic `publish_sync` generated is dropped and counted in `Agent.late_reply_count` (RFC-014 §2.2).*
 
 The one exception is the **identity-guard bypass**: if a foreign handler races onto the same topic between `subscribe` and `finally`, the guard skips both the pop and the unsubscribe. In that case the foreign handler is preserved and the (already lost) subscription is not torn down. Verified by `test_identity_guard_preserves_foreign_handler_on_same_topic`.
 

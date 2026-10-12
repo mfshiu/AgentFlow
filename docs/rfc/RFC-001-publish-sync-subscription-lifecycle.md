@@ -166,7 +166,7 @@ finally:
 | MessageBroker contract | Unchanged. |
 | Broker-side subscription table | **Still leaks.** Broker keeps `topic_return` subscribed until connection drops. Under many `publish_sync` calls, broker's per-client subscription table grows without bound. |
 | Handler leak | Fixed. |
-| Late response after cleanup | Still delivered from broker → hits `Agent._on_message` → falls back to `self.on_message` (no-op default). Safe in-agent. |
+| Late response after cleanup | Still delivered from broker → hits `Agent._on_message` → falls back to `self.on_message` (no-op default). Safe in-agent. *Since #21: only for a caller's own `topic_wait`; on a generated reply topic it is dropped and counted (RFC-014 §2.2).* |
 | Backward compat risk | Nil. |
 | Migration cost | 1 file (`agent.py`), 4 lines. |
 
@@ -223,7 +223,7 @@ def unsubscribe(self, topic: str):
 | MessageBroker contract | Extended by one **non-abstract** method with default no-op. Existing subclasses (including hypothetical third-party) continue to work. |
 | Handler leak | Fixed. |
 | Broker-side subscription | Fixed for MQTT. Stub brokers (Redis/ROS/Empty) get a documented no-op — acceptable because they are stubs. |
-| Late response after cleanup | Handler entry gone; broker may still deliver in-flight message → falls to `on_message` default. Safe. |
+| Late response after cleanup | Handler entry gone; broker may still deliver in-flight message → falls to `on_message` default. Safe. *Since #21: only for a caller's own `topic_wait`; on a generated reply topic it is dropped and counted (RFC-014 §2.2).* |
 | Backward compat risk | Very low. Default no-op preserves callability. Users overriding `MessageBroker` are unaffected until they choose to implement `unsubscribe`. |
 | Migration cost | 5 files (`agent.py`, `message_broker.py`, `mqtt_broker.py`; optionally `empty_broker.py`, `redis_broker.py`, `ros_broker.py`, `dds_broker.py` for consistency). Under 25 lines total. |
 
