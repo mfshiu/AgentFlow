@@ -400,8 +400,12 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 - **Scope of change**: `src/agentflow/core/agent.py` — `Agent._on_message` (`@final`, public signature unchanged). Three rules now hold together:
   - **R-fallback-silent**: `is_specific_handler = topic in self.__topic_handlers` is computed at dispatch. Auto-reply is emitted **iff** `pcl.topic_return` is truthy AND `is_specific_handler` is `True`. Fall-through to `on_message` still runs the handler but never publishes an implicit reply.
   - **R-strip-topic_return**: before publishing an auto-reply, if `data_resp` is a `Parcel` whose `topic_return` is truthy, the framework reconstructs a fresh parcel via `type(data_resp)(data_resp.content)`, copies `.error`, and uses it as the reply. The handler's returned object is not mutated.
-  - **R-exception-fresh**: on handler exception, the reply is a new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming parcel `p` is not mutated; handlers that store a reference to `p` observe its original state.
-- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
+  - **R-exception-fresh**: on handler exception, the reply is a new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming parcel `p` is not mutated; handlers that store a reference to `p` observe its original state. *Amended 2026-10-13 (issue #68):*
+    - *`.error` names the exception type only; the message stays in the responder's log. `errors.expose_details` restores `str(ex)`.*
+    - *`publish_sync(..., raise_on_error=True)` raises `RemoteError`.*
+    - *Verified by `tests/unit/core/test_error_replies.py`.*
+    - *A structured error (code, retryable) stays with the envelope redesign (P2-1).*
+- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. *(As of RFC-003. Since #68, `publish_sync` takes `raise_on_error`, `RemoteError` is new, and the Agent config has an `errors` section; see the amendment above.)* `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
 - **Observable behavioural changes** (three; all narrow, all in the loop-prevention direction):
   1. A topic that is subscribed but has no specific handler no longer produces an implicit auto-reply when a message with `topic_return` arrives; the message dispatches to `on_message` default (no-op) and no publish is emitted.
   2. Auto-reply parcels never carry `topic_return` on the wire. A handler that returns a `Parcel` with `topic_return` set observes the reply carrying `topic_return=None` after reconstruction, while the handler's own returned object is left intact.
