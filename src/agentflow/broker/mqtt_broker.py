@@ -396,7 +396,6 @@ class MqttBroker(MessageBroker):
                     self._connect_ok = True
                     self._connack_ok = True
                     self._connect_err = None
-                    is_first = not self._ever_connected
                     self._ever_connected = True
                     self._connected = True
                     # NEW / STARTING → RUNNING; other states leave
@@ -405,8 +404,12 @@ class MqttBroker(MessageBroker):
                     # was before). RUNNING → RUNNING is a no-op.
                     if self._state in (WorkerState.NEW, WorkerState.STARTING):
                         self._state = WorkerState.RUNNING
-                    if not is_first:
-                        snapshot = dict(self._registry)
+                    # Every CONNACK, the first included (issue #54):
+                    # subscribe() only records a topic while not
+                    # connected. Taken with _connected under this lock,
+                    # so each topic is either sent by subscribe() or
+                    # replayed here.
+                    snapshot = dict(self._registry)
             if skip:
                 logger.info(
                     "on_connect(rc=0) after stop; fencing "
@@ -488,12 +491,30 @@ class MqttBroker(MessageBroker):
                 logger.exception(
                     f"recovery: resubscribe failed for topic {topic!r}: {ex}"
                 )
+            self._withdraw_if_unsubscribed(topic)
         with self._state_lock:
             self._resubscribe_success_count += successes
             self._resubscribe_error_count += failures
         logger.info(
             f"recovery complete: {successes} succeeded, {failures} failed"
         )
+
+
+    def _withdraw_if_unsubscribed(self, topic: str) -> None:
+        """RFC-005 §7.10 (issue #54 review): an unsubscribe() between
+        the recovery loop's registry check and its client.subscribe has
+        already sent its UNSUBSCRIBE, so the SUBSCRIBE would win. Send
+        another UNSUBSCRIBE after it: paho sends packets in call order."""
+        with self._state_lock:
+            withdrawn = (topic not in self._registry and self._connected
+                         and not self._stopping)
+        if withdrawn:
+            try:
+                self._client.unsubscribe(topic)
+            except Exception as ex:
+                logger.exception(
+                    f"recovery: unsubscribe of withdrawn topic {topic!r} failed: {ex}"
+                )
 
 
     def _on_disconnect(self, client, userdata, _flags, reasonCode, _properties):
@@ -1665,7 +1686,8 @@ class MqttBroker(MessageBroker):
 
     def subscribe(self, topic: str, data_type, *, qos: int = 0):
         # RFC-005 §7.3: desired-state first; only forward when currently
-        # connected. Disconnected-time subscribes rely on the next
+        # connected. Disconnected-time subscribes, including those made
+        # before the first CONNACK (issue #54), rely on the next
         # _on_connect to run recovery from the registry.
         check_qos(qos)      # issue #4
         with self._state_lock:
