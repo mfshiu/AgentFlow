@@ -1,6 +1,6 @@
 # RFC-014 — Request/reply correlation id
 
-- **Status**: **Implemented** (2026-10-12, issue #36)
+- **Status**: **Implemented** (2026-10-12, issue #36); §2.2 amended 2026-10-13 (issue #21).
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-20 (no message metadata). Consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md) (reply-topic lifecycle), [RFC-003](RFC-003-auto-reply-contract.md) (auto-reply contract) and [RFC-006](RFC-006-publish-sync-topic-collision.md) (topic_wait collision; this is its Option E).
 - **Scope**:
@@ -36,6 +36,11 @@ The envelope had only `version`, `content`, `topic_return` and `error`. `publish
 
 - Each call draws a fresh id: `secrets.token_hex(16)`, 32 lowercase hex characters, unpredictable.
 - The id is set on a **copy** of the outgoing Parcel, so the caller's Parcel is not modified. The existing `topic_return` handling is unchanged (#21).
+- *Amended 2026-10-13 (issue #21):*
+  - **The reply topic is set on the copy too.** The caller's `topic_return` is untouched, and a retry with the same Parcel gets a fresh reply topic. A `topic_wait`, or a `topic_return` already on the Parcel, is still used.
+  - **The waiter is a plain `threading.Event`.** It is no longer obtained from the worker, which could create a ProcessWorker and set the global start method.
+  - **`timeout=None` is deprecated.** It emits a `DeprecationWarning` and still waits forever.
+  - **Late replies.** The last 1024 reply topics `publish_sync` generated are remembered once left. A reply arriving later on one is dropped at DEBUG and counted in `Agent.late_reply_count`, instead of reaching `on_message`. A late reply on a caller's own `topic_wait` still reaches `on_message`, as RFC-001 specifies.
 - The reply handler applies the rules in §2.4.
 - The Parcel returned to the caller has its `correlation_id` cleared. The id served only to match the reply. Without clearing, a gateway that answers in `on_message` (no auto-reply there, RFC-003) by forwarding that Parcel by hand would send its own requester a foreign id, and the requester would ignore it.
 
