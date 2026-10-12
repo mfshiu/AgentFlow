@@ -33,8 +33,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.agent_worker import WorkerState
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_35 = pytest.mark.xfail(strict=True, reason='issue #35: no outbound limit')
-
 MiB = 1024 * 1024
 
 
@@ -68,7 +66,6 @@ def _pending(broker):
     return metrics['pending_publish_count'], metrics['pending_publish_bytes']
 
 
-@xfail_35
 def test_publishes_are_pending_until_paho_reports_them_sent(broker, fake_client, mids):
     _running(broker, fake_client)
     for _ in range(3):
@@ -78,7 +75,6 @@ def test_publishes_are_pending_until_paho_reports_them_sent(broker, fake_client,
     assert _pending(broker) == (2, 2000)
 
 
-@xfail_35
 def test_a_publish_beyond_max_pending_bytes_is_refused_before_paho(broker, fake_client, mids):
     _running(broker, fake_client, {'max_pending_bytes': 2500})
     broker.publish('t', b'x' * 1000)
@@ -92,7 +88,6 @@ def test_a_publish_beyond_max_pending_bytes_is_refused_before_paho(broker, fake_
     broker.publish('t', b'x' * 1000)             # room again
 
 
-@xfail_35
 def test_the_default_limit_is_64_mib(broker, fake_client, mids):
     _running(broker, fake_client)
     broker.publish('t', b'x' * (64 * MiB))      # exactly the limit
@@ -100,7 +95,6 @@ def test_the_default_limit_is_64_mib(broker, fake_client, mids):
         broker.publish('t', b'x')
 
 
-@xfail_35
 def test_a_report_that_arrives_before_publish_returns_is_not_counted(broker, fake_client):
     counter = itertools.count(1)
 
@@ -114,7 +108,6 @@ def test_a_report_that_arrives_before_publish_returns_is_not_counted(broker, fak
     assert _pending(broker) == (0, 0)
 
 
-@xfail_35
 def test_a_disconnect_forgets_unsent_qos0_but_keeps_qos1(broker, fake_client, mids):
     _running(broker, fake_client)
     broker.publish('t', b'x' * 1000)             # mid 1, QoS 0
@@ -126,7 +119,6 @@ def test_a_disconnect_forgets_unsent_qos0_but_keeps_qos1(broker, fake_client, mi
     assert _pending(broker) == (0, 0)
 
 
-@xfail_35
 @pytest.mark.parametrize('value, error', [(0, ValueError), (-1, ValueError), (True, TypeError), ('1', TypeError)])
 def test_a_malformed_max_pending_bytes_leaves_the_broker_new(broker, value, error):
     with pytest.raises(error, match='max_pending_bytes'):
@@ -148,7 +140,6 @@ def records():
     root.setLevel(level)
 
 
-@xfail_35
 def test_agent_publish_reports_backpressure_quietly(records):
     agent = Agent('sender', {'dispatch': {'shutdown_timeout_s': 1.0}})
     broker = FakeBroker(notifier=agent)

@@ -9,6 +9,13 @@ def check_qos(qos) -> int:
     return qos
 
 
+class PublishBackpressureError(RuntimeError):
+    """Issue #35: a broker refused a publish because its outgoing queue
+    is full (a slow or stalled link). Transient: the caller may retry
+    later or drop the message. Agent.publish counts it and returns
+    False; publish_sync raises it."""
+
+
 class MessageBroker(ABC):
     def __init__(self, notifier:BrokerNotifier):
         self._notifier = notifier

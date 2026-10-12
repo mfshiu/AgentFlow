@@ -17,7 +17,6 @@ pytestmark = pytest.mark.wire
 MiB = 1024 * 1024
 
 
-@pytest.mark.xfail(strict=True, reason='issue #35: no outbound limit')
 def test_a_stalled_link_turns_into_backpressure_and_drains_afterwards():
     server = MiniMqttServer()
     agent = Agent('sender', {'broker': {'broker_name': 'local', 'local': {
