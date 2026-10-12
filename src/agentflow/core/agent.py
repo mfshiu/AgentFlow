@@ -272,6 +272,28 @@ class _ReplyRouter:
 
 
 class Agent(BrokerNotifier):
+    """A named participant on the message bus: it subscribes handlers to
+    topics, publishes, answers requests (RFC-003) and joins a holon.
+
+    Concurrency (config `CONCURRENCY_TYPE`):
+      - 'thread' (`start_thread()`): the agent runs in this process, on
+        a worker thread. This object is the agent: publish, subscribe,
+        publish_sync and the data API (get_data / put_data / pop_data)
+        work on it.
+      - 'process' (`start_process()`, and `start()` by default): the
+        agent runs in a spawned child process. This object only
+        controls its lifecycle (terminate()). It has no broker and no
+        data store, so publishing, subscribing or using the data API
+        on it does not reach the running agent (RFC-008 §F); those
+        calls warn (issue #9). Do that work in the agent's own hooks
+        (on_activate and handlers run in the child), use start_thread(),
+        or create a separate Agent connected to the same broker.
+        Attributes are pickled to the child: create unpicklable ones
+        (locks, clients) in on_activating(), which runs there.
+
+    start() without an explicit CONCURRENCY_TYPE uses 'process' and warns
+    (FutureWarning) that the default will become 'thread'."""
+
     def __init__(self, name:str, agent_config:dict={}):
         logger.debug(f'name: {name}, agent_config: {_config_for_log(agent_config)}')
         
@@ -529,6 +551,8 @@ class Agent(BrokerNotifier):
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
         self.config.update(agent_config)
+        # Issue #9: whether the caller chose the mode; start() warns if not.
+        self._concurrency_explicit = config.CONCURRENCY_TYPE in agent_config
         logger.debug(f'self.config: {_config_for_log(self.config)}')
 
 
@@ -737,6 +761,13 @@ class Agent(BrokerNotifier):
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
             self.config[config.CONCURRENCY_TYPE] = 'process'
+        if self.config[config.CONCURRENCY_TYPE] == 'process' and not self._concurrency_explicit:
+            warnings.warn(
+                "Agent.start() runs the agent in a child process by default, and this "
+                "object then only controls it; the default will become 'thread' in a "
+                "future major version. Call start_thread() or start_process(), or set "
+                "CONCURRENCY_TYPE, to choose explicitly.",
+                FutureWarning, stacklevel=2)
         logger.info(self.M(f"self.config: {_config_for_log(self.config)}"))
         self.work_process = self._get_worker().start()
         
@@ -749,12 +780,40 @@ class Agent(BrokerNotifier):
         
     def start_process(self):
         self.config[config.CONCURRENCY_TYPE] = 'process'
+        self._concurrency_explicit = True
         self.start()
         
         
     def start_thread(self):
         self.config[config.CONCURRENCY_TYPE] = 'thread'
+        self._concurrency_explicit = True
         self.start()
+
+
+    def _warn_if_controller(self, api: str) -> None:
+        """Issue #9: warn when `api` is called on the object that only
+        controls a process-mode agent (RFC-008 §F); see the class
+        docstring. In the child, and in thread mode, it is silent."""
+        if isinstance(self._agent_worker, ProcessWorker) and self._broker is None:
+            warnings.warn(
+                f"Agent.{api}() was called on the object that controls a process-mode "
+                f"agent: the agent runs in a child process, and this object has no "
+                f"broker or data store, so the call does not reach it. Use "
+                f"start_thread(), do this in the agent's hooks or handlers, or create "
+                f"a separate Agent connected to the same broker.",
+                RuntimeWarning, stacklevel=3)
+
+
+    def _unpicklable_attributes(self) -> list:
+        """Issue #9: the names of the attributes that cannot be pickled
+        to a spawned child (see __getstate__)."""
+        names = []
+        for name, value in self.__getstate__().items():
+            try:
+                pickle.dumps(value)
+            except Exception:
+                names.append(name)
+        return names
 
 
     def terminate(self):
@@ -1167,11 +1226,13 @@ class Agent(BrokerNotifier):
 # ============
     @final
     def get_data(self, key:str):
+        self._warn_if_controller('get_data')
         return self.__data.get(key)
 
 
     @final
     def pop_data(self, key:str):
+        self._warn_if_controller('pop_data')
         data = None
         self.__data_lock.acquire()
         if key in self.__data:
@@ -1182,6 +1243,7 @@ class Agent(BrokerNotifier):
 
     @final
     def put_data(self, key:str, data):
+        self._warn_if_controller('put_data')
         self.__data_lock.acquire()
         self.__data[key] = data
         self.__data_lock.release()
@@ -1209,6 +1271,7 @@ class Agent(BrokerNotifier):
         # Returns True when the broker accepted the message and False
         # when it did not (the failure is logged); it used to return
         # None either way.
+        self._warn_if_controller('publish')
         check_qos(qos)
         try:
             self._publish_or_raise(topic, data, qos=qos)
@@ -1285,6 +1348,7 @@ class Agent(BrokerNotifier):
         Issue #68: a reply carrying a non-empty error (the responder's
         handler raised, or it was overloaded) is returned like any other
         unless `raise_on_error`, which raises RemoteError instead."""
+        self._warn_if_controller('publish_sync')
         if timeout is None:
             warnings.warn(
                 "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
@@ -1415,6 +1479,7 @@ class Agent(BrokerNotifier):
     @final
     def subscribe(self, topic, data_type:str="str", topic_handler=None, *, qos=0):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
+        self._warn_if_controller('subscribe')
 
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")

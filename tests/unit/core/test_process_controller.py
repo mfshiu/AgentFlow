@@ -33,8 +33,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.agent_worker import ProcessWorker, WorkerState
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_9 = pytest.mark.xfail(strict=True, reason='issue #9: process-mode controller')
-
 EMPTY_BROKER = {'broker': {'broker_name': 'b', 'b': {'broker_type': 'empty'}}}
 
 
@@ -53,13 +51,11 @@ def controller():
     agent._agent_worker = None
 
 
-@xfail_9
 def test_agent_documents_the_process_mode_contract():
     doc = Agent.__doc__ or ''
     assert 'process' in doc and 'start_thread' in doc
 
 
-@xfail_9
 @pytest.mark.parametrize('call', [
     lambda a: a.publish('t', 'x'),
     lambda a: a.subscribe('t', topic_handler=lambda topic, pcl: None),
@@ -69,14 +65,12 @@ def test_messaging_on_the_controlling_object_warns(controller, call):
         call(controller)
 
 
-@xfail_9
 def test_publish_sync_on_the_controlling_object_warns(controller):
     with pytest.warns(RuntimeWarning, match='start_thread'):
         with pytest.raises(RuntimeError, match='no broker'):
             controller.publish_sync('t', 'x', timeout=0.1)
 
 
-@xfail_9
 @pytest.mark.parametrize('call', [
     lambda a: a.get_data('k'),
     lambda a: a.put_data('k', 1),
@@ -99,7 +93,6 @@ def test_no_warning_in_thread_mode_before_start_or_in_the_child(worker):
         agent.subscribe('t', topic_handler=lambda topic, pcl: None)
 
 
-@xfail_9
 def test_start_with_the_default_mode_warns_of_the_coming_change():
     agent = Agent('default', {})
     agent._agent_worker = _StartableWorker()
@@ -122,7 +115,6 @@ class _WithLock(Agent):
         self.lock = threading.Lock()
 
 
-@xfail_9
 def test_an_attribute_that_cannot_be_pickled_is_named():
     agent = _WithLock()
     with pytest.raises(TypeError, match="'lock'") as raised:

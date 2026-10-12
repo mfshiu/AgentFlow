@@ -1,5 +1,6 @@
 import multiprocessing
 import os
+import pickle
 import queue
 import sys
 import threading
@@ -206,10 +207,13 @@ class ProcessWorker(Worker):
                 daemon=False,   # RFC-008 §7.15
             )
             self.work_process.start()
-        except BaseException:
+        except BaseException as ex:
             self._cleanup_after_start_failure()
             with self._state_lock:
                 self._state = WorkerState.START_FAILED
+            detail = self._unpicklable_detail(ex)
+            if detail:
+                raise TypeError(detail) from ex
             raise
 
         with self._state_lock:
@@ -222,6 +226,23 @@ class ProcessWorker(Worker):
         except Exception:
             pass
         return self.work_process
+
+
+    def _unpicklable_detail(self, ex: BaseException) -> Optional[str]:
+        """Issue #9: when pickling the Agent to the child failed, name
+        the attributes that cannot be pickled, which the pickle error
+        does not. None if that was not the failure."""
+        if not isinstance(ex, (TypeError, AttributeError, pickle.PicklingError)):
+            return None
+        try:
+            names = self.initiator_agent._unpicklable_attributes()
+        except Exception:
+            return None
+        if not names:
+            return None
+        return (f"{ex}. Agent attribute(s) {', '.join(map(repr, names))} cannot be "
+                f"pickled to the child process; create them in on_activating(), which "
+                f"runs in the child, or use start_thread().")
 
 
     def _cleanup_after_start_failure(self):
