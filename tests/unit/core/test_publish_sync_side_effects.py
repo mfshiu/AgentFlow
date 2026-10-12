@@ -18,8 +18,13 @@ Contracts verified (with FakeBroker):
   - publish_sync does not touch the worker.
   - timeout=None is deprecated (DeprecationWarning; it still waits).
   - A late reply on a reply topic publish_sync generated is dropped and
-    counted (late_reply_count), not handed to on_message; one on a
-    caller's own topic_wait still reaches on_message (RFC-001 test 6).
+    counted (late_reply_count), not handed to on_message, even when it
+    arrives as the call gives up; one on a caller's own topic_wait
+    still reaches on_message (RFC-001 test 6), and so does one on a
+    generated topic the caller subscribed afterwards, with or without
+    a handler. At most 1024 generated topics are remembered.
+  - timeout=None also logs a WARNING once per process, since Python
+    hides a DeprecationWarning raised outside __main__.
 """
 
 import warnings
@@ -30,6 +35,10 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
+
+import agentflow.core.agent as agent_module
+
+xfail_21r = pytest.mark.xfail(strict=True, reason='issue #21 review: fixed in the next commit')
 
 
 class Recorder(Agent):
@@ -120,6 +129,76 @@ def test_a_late_reply_on_a_generated_topic_is_dropped_and_counted(agent_and_brok
     assert FakeBus.wait_until(lambda: agent.late_reply_count == 1, timeout=2)
     FakeBus.wait_until(lambda: False, timeout=0.2)
     assert agent.unhandled == []
+
+
+def _timed_out_request(agent, broker):
+    with pytest.raises(TimeoutError):
+        agent.publish_sync('svc', 'q', timeout=0.05)
+    return _requests(broker)[-1]
+
+
+@xfail_21r
+def test_a_reply_racing_the_timeout_does_not_reach_on_message(agent_and_broker):
+    agent, broker = agent_and_broker
+    request = _timed_out_request(agent, broker)
+    # As if the first check ran just before the call gave up and retired
+    # its topic: the handler lookup must catch it.
+    agent._Agent__count_late_reply = lambda topic: 0
+    broker.deliver(request.topic_return, TextParcel('just too late').payload())
+    FakeBus.wait_until(lambda: False, timeout=0.2)
+    assert agent.unhandled == []
+    assert agent.late_reply_count == 1
+
+
+@xfail_21r
+def test_a_retired_topic_subscribed_without_a_handler_reaches_on_message(agent_and_broker):
+    agent, broker = agent_and_broker
+    request = _timed_out_request(agent, broker)
+    agent.subscribe(request.topic_return)          # to catch the late answer in on_message
+    broker.deliver(request.topic_return, TextParcel('late answer').payload())
+    assert FakeBus.wait_until(
+        lambda: agent.unhandled == [(request.topic_return, 'late answer')], timeout=2)
+
+
+def test_a_retired_topic_subscribed_with_a_handler_reaches_it(agent_and_broker):
+    agent, broker = agent_and_broker
+    request = _timed_out_request(agent, broker)
+    seen = []
+    agent.subscribe(request.topic_return, topic_handler=lambda t, p: seen.append(p.content))
+    broker.deliver(request.topic_return, TextParcel('late answer').payload())
+    assert FakeBus.wait_until(lambda: seen == ['late answer'], timeout=2)
+    assert agent.late_reply_count == 0
+
+
+def test_at_most_1024_generated_topics_are_remembered(agent_and_broker):
+    agent, broker = agent_and_broker
+    for _ in range(1030):
+        with pytest.raises(TimeoutError):
+            agent.publish_sync('svc', 'q', timeout=0)
+    retired = agent._retired_reply_topics
+    assert len(retired) == 1024
+    assert _requests(broker)[0].topic_return not in retired
+    assert _requests(broker)[-1].topic_return in retired
+
+
+def test_the_deprecation_points_at_the_caller(agent_and_broker):
+    agent, broker = agent_and_broker
+    broker.auto_respond_with('pong')
+    with pytest.warns(DeprecationWarning) as caught:
+        agent.publish_sync('svc', 'q', timeout=None)
+    assert caught[0].filename == __file__
+
+
+@xfail_21r
+def test_timeout_none_is_also_logged_once(agent_and_broker, caplog, monkeypatch):
+    monkeypatch.setattr(agent_module, '_TIMEOUT_NONE_LOGGED', False, raising=False)
+    agent, broker = agent_and_broker
+    broker.auto_respond_with('pong')
+    with pytest.warns(DeprecationWarning):
+        for _ in range(3):
+            agent.publish_sync('svc', 'q', timeout=None)
+    logged = [r for r in caplog.records if 'timeout=None' in r.getMessage()]
+    assert len(logged) == 1 and logged[0].levelname == 'WARNING'
 
 
 def test_a_late_reply_on_a_callers_topic_wait_still_reaches_on_message(agent_and_broker):
