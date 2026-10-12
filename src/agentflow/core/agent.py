@@ -68,6 +68,9 @@ _DEDUP_WINDOW = 4096
 # Issue #21: how many reply topics publish_sync generated and has left
 # are remembered, so that a reply arriving late on one is dropped.
 _RETIRED_REPLY_TOPICS = 1024
+# Issue #21: publish_sync(timeout=None) is also logged, once per process,
+# since Python hides its DeprecationWarning outside __main__.
+_TIMEOUT_NONE_LOGGED = False
 # Follow-up of #17: at most this many messages with no handler are held
 # while the lifecycle hooks are still registering handlers.
 _EARLY_MESSAGE_LIMIT = 4096
@@ -1224,6 +1227,12 @@ class Agent(BrokerNotifier):
                 "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
                 "(None will be refused in a future release)",
                 DeprecationWarning, stacklevel=2)
+            global _TIMEOUT_NONE_LOGGED
+            if not _TIMEOUT_NONE_LOGGED:
+                _TIMEOUT_NONE_LOGGED = True
+                logger.warning(self.M(
+                    "publish_sync(timeout=None) waits forever and is deprecated; "
+                    "pass a timeout in seconds."))
         # Issue #21: the request is a copy (RFC-014 / #36 sets its
         # correlation id there too), so the caller's Parcel keeps its
         # topic_return.
@@ -1889,6 +1898,13 @@ class Agent(BrokerNotifier):
             else:
                 is_specific_handler = False
                 topic_handler = self.on_message
+            retired = record is None and topic in self._retired_reply_topics
+        if retired and not self.__subscribed_exactly(topic):
+            # Issue #21: the call gave up, and retired its topic, after
+            # the check at the top of this method.
+            late = self.__note_late_reply()
+            logger.debug(self.M(f"Dropped a late reply on {topic!r} ({late} so far)."))
+            return
         # Issue #7: a publish_sync reply takes its own lane, so that a
         # handler waiting in publish_sync cannot starve it.
         is_reply = record is not None and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
@@ -2180,19 +2196,35 @@ class Agent(BrokerNotifier):
 
     def __count_late_reply(self, topic) -> int:
         """Issue #21: if `topic` is a reply topic publish_sync generated
-        and has left, count a late reply and return the count; else 0."""
+        and has left, which nobody has subscribed since, count a late
+        reply and return the count; else 0."""
         with self._handlers_lock:
-            if topic not in self._retired_reply_topics or topic in self.__topic_handlers:
-                return 0
+            retired = (topic in self._retired_reply_topics
+                       and topic not in self.__topic_handlers)
+        if not retired or self.__subscribed_exactly(topic):
+            return 0
+        return self.__note_late_reply()
+
+
+    def __subscribed_exactly(self, topic) -> bool:
+        """Whether Agent.subscribe(topic) was called in this process, for
+        this exact topic: a caller may subscribe a retired reply topic,
+        without a handler, to catch a late answer in on_message."""
+        with self._early_lock:
+            return topic in self._session_topics
+
+
+    def __note_late_reply(self) -> int:
+        with self._handlers_lock:
             self._late_replies += 1
             return self._late_replies
 
 
     @property
     def late_reply_count(self) -> int:
-        """Issue #21: replies dropped because they arrived on a reply
+        """Issue #21: messages dropped because they arrived on a reply
         topic publish_sync generated after the call had returned
-        (typically after its timeout)."""
+        (typically late replies, after its timeout), counted undecoded."""
         with self._handlers_lock:
             return self._late_replies
 

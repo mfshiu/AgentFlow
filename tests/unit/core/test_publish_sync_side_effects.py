@@ -38,8 +38,6 @@ from tests.fakes.fake_bus import FakeBus
 
 import agentflow.core.agent as agent_module
 
-xfail_21r = pytest.mark.xfail(strict=True, reason='issue #21 review: fixed in the next commit')
-
 
 class Recorder(Agent):
     def __init__(self):
@@ -137,7 +135,6 @@ def _timed_out_request(agent, broker):
     return _requests(broker)[-1]
 
 
-@xfail_21r
 def test_a_reply_racing_the_timeout_does_not_reach_on_message(agent_and_broker):
     agent, broker = agent_and_broker
     request = _timed_out_request(agent, broker)
@@ -150,7 +147,6 @@ def test_a_reply_racing_the_timeout_does_not_reach_on_message(agent_and_broker):
     assert agent.late_reply_count == 1
 
 
-@xfail_21r
 def test_a_retired_topic_subscribed_without_a_handler_reaches_on_message(agent_and_broker):
     agent, broker = agent_and_broker
     request = _timed_out_request(agent, broker)
@@ -189,7 +185,6 @@ def test_the_deprecation_points_at_the_caller(agent_and_broker):
     assert caught[0].filename == __file__
 
 
-@xfail_21r
 def test_timeout_none_is_also_logged_once(agent_and_broker, caplog, monkeypatch):
     monkeypatch.setattr(agent_module, '_TIMEOUT_NONE_LOGGED', False, raising=False)
     agent, broker = agent_and_broker
