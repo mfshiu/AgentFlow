@@ -7,7 +7,7 @@ from typing import Any, Deque, Dict, Optional, Set, Tuple
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from agentflow.core.agent_worker import WorkerState
-from .message_broker import MessageBroker, PublishBackpressureError, check_qos
+from .message_broker import MessageBroker, PublishBackpressureError, check_filter, check_qos
 from .notifier import BrokerNotifier
 
 
@@ -138,19 +138,6 @@ def _publish_cost(topic, payload) -> int:
     """Issue #35: an estimate of the memory paho holds for one queued
     publish, counted against max_pending_bytes."""
     return _encoded_size(topic) + _encoded_size(payload) + _PENDING_MESSAGE_OVERHEAD
-
-
-def _check_filter(topic) -> None:
-    """Issue #53: paho's own subscription-filter check, made before a
-    topic enters the registry: 1 to 65535 UTF-8 bytes, and '+' / '#'
-    only as a whole level, '#' only as the last one."""
-    if not isinstance(topic, str):
-        raise ValueError(f"MQTT subscription filter must be a str, got {topic!r}")
-    raw = topic.encode("utf-8")
-    if (not raw or len(raw) > 65535
-            or any(b"+" in level or b"#" in level for level in raw.split(b"/") if len(level) > 1)
-            or b"#/" in raw):
-        raise ValueError(f"Invalid MQTT subscription filter: {topic!r}")
 
 
 def _subscribe_result(result) -> Tuple[Optional[int], Optional[int]]:
@@ -326,6 +313,10 @@ class MqttBroker(MessageBroker):
         self._suback_topics: Dict[int, str] = {}
         self._early_subacks: Dict[int, bool] = {}
         self._subscribing = 0
+        # Counts connection losses: a mid is matched to its SUBACK on
+        # the connection its SUBSCRIBE went out on only, because paho
+        # reuses mids (review of #53).
+        self._subscribe_epoch = 0
         self._connected: bool = False
         self._ever_connected: bool = False
         self._stopping: bool = False
@@ -604,6 +595,7 @@ class MqttBroker(MessageBroker):
             # Issue #53: paho does not resend a SUBSCRIBE; the next
             # CONNACK replays the registry instead.
             self._suback_topics.clear()
+            self._subscribe_epoch += 1
         self._connect_ok = False
         self._connected_evt.clear()
         if planned:
@@ -1748,7 +1740,7 @@ class MqttBroker(MessageBroker):
         # before the first CONNACK (issue #54), rely on the next
         # _on_connect to run recovery from the registry.
         check_qos(qos)      # issue #4
-        _check_filter(topic)    # issue #53: before the registry
+        check_filter(topic)     # issue #53: before the registry
         with self._state_lock:
             if self._stopping:
                 logger.info(f"subscribe after stop; dropping topic {topic!r}")
@@ -1762,10 +1754,11 @@ class MqttBroker(MessageBroker):
     def _client_subscribe(self, topic: str, qos: int):
         """Send one SUBSCRIBE and return paho's result. Issue #53: a
         topic whose SUBSCRIBE paho raised on or did not send (rc not
-        success) is counted in failed_subscriptions until a later one
-        succeeds; one that was sent awaits its SUBACK (_on_subscribe)."""
+        success) is counted in failed_subscriptions until a SUBACK
+        grants it; one that was sent awaits its SUBACK (_on_subscribe)."""
         with self._state_lock:
             self._subscribing += 1
+            epoch = self._subscribe_epoch
         rc: Optional[int] = None
         mid: Optional[int] = None
         sent = False
@@ -1779,7 +1772,7 @@ class MqttBroker(MessageBroker):
             sent = rc is None or rc == MQTT_ERR_SUCCESS
             return result
         finally:
-            early_refusal = self._settle_subscribe(topic, mid if sent else None, sent)
+            early_refusal = self._settle_subscribe(topic, mid if sent else None, sent, epoch)
             if rc is not None and not sent:
                 logger.warning(
                     f"SUBSCRIBE to {topic!r} was not sent (paho rc={rc}); "
@@ -1788,27 +1781,39 @@ class MqttBroker(MessageBroker):
             if early_refusal:
                 self._log_refused_subscription(topic, mid)
 
-    def _settle_subscribe(self, topic: str, mid: Optional[int], sent: bool) -> bool:
-        """Issue #53: record the outcome of a SUBSCRIBE. Returns True if
-        its SUBACK, which arrived before this, refused it."""
+    def _settle_subscribe(self, topic: str, mid: Optional[int], sent: bool,
+                          epoch: int) -> bool:
+        """Issue #53: record the outcome of a SUBSCRIBE. A failed topic
+        counts as active again only once a SUBACK grants it, or at once
+        when there is no mid to await one for. Returns True if its
+        SUBACK, which arrived before this, refused a topic still wanted."""
         with self._state_lock:
             self._subscribing -= 1
-            refused = early_refusal = False
+            refused = granted = False
             if not sent:
                 refused = True
-            elif mid is not None:
+            elif mid is None:
+                granted = True
+            elif epoch != self._subscribe_epoch:
+                # The connection it went out on is gone; the CONNACK
+                # replay sends it again. Its mid may already be reused.
+                self._early_subacks.pop(mid, None)
+            else:
                 early = self._early_subacks.pop(mid, None)
                 if early is None:
                     self._suback_topics[mid] = topic
+                elif early:
+                    refused = True
                 else:
-                    refused = early_refusal = early
-            if refused and topic in self._registry:
+                    granted = True
+            wanted = topic in self._registry and not self._stopping
+            if refused and wanted:
                 self._failed_topics.add(topic)
-            elif not refused:
+            elif granted:
                 self._failed_topics.discard(topic)
             if not self._subscribing:
                 self._early_subacks.clear()
-        return early_refusal
+        return sent and refused and wanted
 
     def _on_subscribe(self, client, userdata, mid, reason_code_list, properties):
         """Issue #53: the broker's SUBACK. A reason code >= 0x80 means it
@@ -1823,12 +1828,15 @@ class MqttBroker(MessageBroker):
                         # _client_subscribe has not recorded the mid yet.
                         self._early_subacks[mid] = refused
                     return
-                if refused and topic in self._registry:
+                wanted = topic in self._registry and not self._stopping
+                if refused and wanted:
                     self._failed_topics.add(topic)
                 elif not refused:
                     self._failed_topics.discard(topic)
-            if refused:
+            if refused and wanted:
                 self._log_refused_subscription(topic, mid)
+            elif refused:
+                logger.debug(f"SUBACK refused {topic!r}, which is no longer wanted.")
         except Exception as ex:
             logger.exception(f"on_subscribe failed for mid {mid!r}: {ex!r}")
 

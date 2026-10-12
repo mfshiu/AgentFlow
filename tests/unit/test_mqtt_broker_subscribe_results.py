@@ -35,8 +35,6 @@ from paho.mqtt.reasoncodes import ReasonCode
 
 MQTT_ERR_NO_CONN = 4
 
-xfail_53r = pytest.mark.xfail(strict=True, reason='issue #53 review: fixed in the next commit')
-
 
 def _fire_connect(broker, fake_client):
     broker._on_connect(client=fake_client, userdata=None, flags={},
@@ -151,7 +149,6 @@ def test_on_subscribe_never_raises_into_paho(connected, fake_client, codes):
     connected._on_subscribe(fake_client, None, 5, codes, None)
 
 
-@xfail_53r
 def test_a_failed_topic_is_active_again_only_once_granted(connected, fake_client):
     connected.subscribe('T', 'str')
     _suback(connected, fake_client, 5, 0x80)
@@ -173,7 +170,6 @@ def test_two_subscribes_in_flight_the_last_suback_wins(connected, fake_client):
     assert _counts(connected) == (1, 0)
 
 
-@xfail_53r
 def test_a_suback_is_not_applied_across_a_link_loss(connected, fake_client):
     def subscribe_then_lose_the_link(*args, **kwargs):
         _fire_disconnect(connected, fake_client)           # before the mid is recorded
@@ -241,7 +237,6 @@ def test_an_unrelated_early_suback_is_not_kept(connected, fake_client):
     assert connected._early_subacks == {}
 
 
-@xfail_53r
 def test_no_refusal_warning_for_a_topic_no_longer_wanted(connected, fake_client, warnings_logged):
     connected.subscribe('T', 'str')
     connected.unsubscribe('T')

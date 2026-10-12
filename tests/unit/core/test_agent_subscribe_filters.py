@@ -14,8 +14,6 @@ from agentflow.broker import message_broker
 from agentflow.core.agent import Agent
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_53r = pytest.mark.xfail(strict=True, reason='issue #53 review: fixed in the next commit')
-
 
 @pytest.fixture
 def agent():
@@ -26,7 +24,6 @@ def agent():
     agent.terminate()
 
 
-@xfail_53r
 @pytest.mark.parametrize('topic', ['robot+1/cmd', 'a/#/b', ''])
 def test_an_invalid_filter_leaves_no_handler_and_no_session_topic(agent, topic):
     with pytest.raises(ValueError):
@@ -36,7 +33,6 @@ def test_an_invalid_filter_leaves_no_handler_and_no_session_topic(agent, topic):
     assert topic not in agent._Agent__topic_handlers
 
 
-@xfail_53r
 @pytest.mark.parametrize('topic', ['a/+/b', '#', '$share/g/a'])
 def test_check_filter_accepts_valid_filters(topic):
     assert message_broker.check_filter(topic) == topic

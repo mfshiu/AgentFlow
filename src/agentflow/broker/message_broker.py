@@ -9,6 +9,20 @@ def check_qos(qos) -> int:
     return qos
 
 
+def check_filter(topic) -> str:
+    """Issue #53: validate an MQTT subscription filter with paho's own
+    rules: 1 to 65535 UTF-8 bytes, '+' and '#' only as a whole level,
+    '#' only as the last one. Returns it; raises ValueError."""
+    if not isinstance(topic, str):
+        raise ValueError(f"MQTT subscription filter must be a str, got {topic!r}")
+    raw = topic.encode("utf-8")
+    if (not raw or len(raw) > 65535
+            or any(b"+" in level or b"#" in level for level in raw.split(b"/") if len(level) > 1)
+            or b"#/" in raw):
+        raise ValueError(f"Invalid MQTT subscription filter: {topic!r}")
+    return topic
+
+
 class PublishBackpressureError(RuntimeError):
     """Issue #35: a broker refused a publish because its outgoing queue
     is full (a slow or stalled link). Transient: the caller may retry
