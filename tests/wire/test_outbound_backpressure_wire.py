@@ -37,6 +37,10 @@ def test_a_stalled_link_turns_into_backpressure_and_drains_afterwards():
             pytest.fail('1600 publishes over a stalled link were all accepted')
         assert agent._broker.recovery_metrics()['pending_publish_bytes'] <= 2 * MiB
         assert agent.publish_backpressure_count == 1
+        # The link really is stalled: a second later the backlog is
+        # still there (a healthy link would have drained it).
+        server.wait_until(lambda: False, 1.0)
+        assert agent._broker.recovery_metrics()['pending_publish_bytes'] > MiB
 
         server.resume(connection)
         assert server.wait_until(
