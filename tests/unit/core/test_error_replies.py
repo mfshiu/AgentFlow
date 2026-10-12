@@ -9,8 +9,10 @@ only `.content` took a failure for a success whose content was None.
 
 Contracts verified (two agents on an in-memory hub):
   - publish_sync(..., raise_on_error=True) raises RemoteError (with
-    the topic, the error and the reply) for a reply carrying an error;
-    by default it still returns the Parcel.
+    the topic, the error and the reply) for a reply carrying a
+    non-empty error; by default it still returns the Parcel.
+    RemoteError pickles (e.g. across a process pool), and its message
+    bounds and escapes the remote error text.
   - The automatic error reply names the exception type only; the
     message stays in the responder's log. errors.expose_details=True
     restores the message. A handler's own Parcel.error is forwarded
@@ -19,6 +21,7 @@ Contracts verified (two agents on an in-memory hub):
 """
 
 import logging
+import pickle
 
 import pytest
 
@@ -26,6 +29,8 @@ from agentflow.core import agent as agent_module
 from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
+
+xfail_68r = pytest.mark.xfail(strict=True, reason='issue #68 review: fixed in the next commit')
 
 SECRET = 'postgresql://app:S3cr3t@10.0.0.5/prod'
 
@@ -81,6 +86,44 @@ def test_raise_on_error_raises_remote_error(hub):
     assert raised.value.topic == 'db/query'
     assert 'ConnectionError' in raised.value.error
     assert raised.value.reply.error == raised.value.error
+    assert raised.value.reply.correlation_id is None    # RFC-014: cleared before raising
+
+
+def _service_replying_error(make, error):
+    service = make('svc')
+
+    def handler(topic, pcl):
+        failed = Parcel.from_content('partial')
+        failed.error = error
+        return failed
+    service.subscribe('db/query', topic_handler=handler)
+
+
+@pytest.mark.parametrize('error', [pytest.param('', marks=xfail_68r), None])
+def test_an_empty_error_is_not_raised(hub, error):
+    _service_replying_error(hub, error)
+    reply = hub('cli').publish_sync('db/query', 'q', timeout=3, raise_on_error=True)
+    assert reply.content == 'partial'
+
+
+@xfail_68r
+def test_remote_error_pickles():
+    reply = Parcel.from_content(None)
+    reply.error = 'ConnectionError'
+    error = agent_module.RemoteError('db/query', 'ConnectionError', reply)
+    clone = pickle.loads(pickle.dumps(error))
+    assert (clone.topic, clone.error, clone.reply.error, str(clone)) == (
+        'db/query', 'ConnectionError', 'ConnectionError', str(error))
+
+
+@xfail_68r
+def test_remote_error_message_bounds_and_escapes_the_remote_text(hub):
+    forged = 'x\n2026-10-13 00:00:00,000 CRITICAL forged line ' + 'y' * 100_000
+    _service_replying_error(hub, forged)
+    with pytest.raises(agent_module.RemoteError) as raised:
+        hub('cli').publish_sync('db/query', 'q', timeout=3, raise_on_error=True)
+    assert '\n' not in str(raised.value) and len(str(raised.value)) < 1000
+    assert raised.value.error == forged                   # the full value is kept
 
 
 def test_by_default_the_error_parcel_is_returned(hub):

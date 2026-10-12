@@ -15,7 +15,8 @@ Post-RFC-003 (Option D):
     object.
 
   R-exception-fresh: on handler exception the auto-reply is a fresh
-    TextParcel(None) with .error = str(ex); the incoming parcel is
+    TextParcel(None) with .error naming the exception (str(ex) before
+    issue #68); the incoming parcel is
     not mutated and is not reused as the reply.
 """
 
