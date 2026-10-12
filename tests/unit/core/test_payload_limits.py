@@ -13,9 +13,13 @@ Contracts verified:
     dropped without being decoded, and counted in decode_failure_count.
   - Decoding runs on a dispatcher thread, not on the receiving thread.
   - A message that the full queue drops is not decoded (small requests
-    are still answered "overloaded", issue #4).
+    are still answered "overloaded", issue #4). A request answered
+    "overloaded" is not run after all, whether the original or a
+    redelivered copy (#4) was the one dropped.
   - dispatch.max_queued_bytes bounds the bytes of queued, and of held
-    (follow-up of #17), messages.
+    (follow-up of #17), messages. Releasing held messages waits for
+    room in the byte budget.
+  - A dispatcher that fails to start leaves no bytes reserved.
   - Malformed limits fail at construction.
 """
 
@@ -32,6 +36,8 @@ from tests.fakes.fake_bus import FakeBus
 
 MiB = 1024 * 1024
 SETTLE_S = 0.3
+
+xfail_34r = pytest.mark.xfail(strict=True, reason='issue #34 review: fixed in the next commit')
 
 
 def _wait_until(predicate, timeout=3.0):
@@ -125,6 +131,7 @@ def test_decoding_runs_off_the_receiving_thread(decoded):
 
 def test_a_message_the_full_queue_drops_is_not_decoded(decoded):
     agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
+    agent.subscribe('t', topic_handler=lambda topic, pcl: 'ok')   # a request would be answered
     gate = _blocked_worker(agent, broker)
     try:
         broker.deliver('t', TextParcel('queued').payload())             # fills the queue
@@ -135,6 +142,93 @@ def test_a_message_the_full_queue_drops_is_not_decoded(decoded):
         assert [t for t, _ in broker.publish_calls if t == 'reply/1'] == []   # too large to answer
     finally:
         gate.set()
+        agent.terminate()
+
+
+def _request(content, reply_topic, message_id='m-1'):
+    request = TextParcel(content, topic_return=reply_topic)
+    request.correlation_id = 'c-1'
+    request.message_id = message_id
+    return request.payload()
+
+
+def _replies(broker, topic):
+    return [Parcel.from_payload(p) for t, p in broker.publish_calls if t == topic]
+
+
+@xfail_34r
+def test_a_redelivered_copy_of_a_waiting_request_is_not_answered_twice():
+    agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
+    handled = []
+    agent.subscribe('svc', topic_handler=lambda topic, pcl: handled.append(pcl.content) or 'done')
+    gate = _blocked_worker(agent, broker)
+    try:
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # waits in the queue
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # a QoS 1 redelivery: dropped
+        gate.set()
+        _settle()
+        # Its requester was told "overloaded", so the waiting original
+        # must not run after all.
+        [reply] = _replies(broker, 'reply/1')
+        assert 'overloaded' in reply.error and reply.correlation_id == 'c-1'
+        assert handled == []
+    finally:
+        gate.set()
+        agent.terminate()
+
+
+@xfail_34r
+def test_a_request_answered_overloaded_is_not_run_when_redelivered():
+    agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
+    handled = []
+    agent.subscribe('svc', topic_handler=lambda topic, pcl: handled.append(pcl.content) or 'done')
+    gate = _blocked_worker(agent, broker)
+    try:
+        broker.deliver('other', TextParcel('filler').payload())  # fills the queue
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # dropped: answered "overloaded"
+        gate.set()
+        assert _wait_until(lambda: agent._get_dispatcher().queue_depth == 0)
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # its redelivery
+        _settle()
+        assert handled == []
+        assert len(_replies(broker, 'reply/1')) == 1
+    finally:
+        gate.set()
+        agent.terminate()
+
+
+@xfail_34r
+def test_the_release_of_held_messages_waits_for_room_in_the_byte_budget(monkeypatch):
+    monkeypatch.setattr(agent_module, '_REPLAY_ROOM_TIMEOUT_S', 10.0, raising=False)
+    agent, broker = _agent({'dispatch': {'workers': 1, 'max_queued_bytes': 10_000}})
+    gate = _blocked_worker(agent, broker)
+    agent.subscribe('live', topic_handler=lambda topic, pcl: None)
+    try:
+        agent._Agent__await_hook('on_activate')
+        for i in range(2):
+            broker.deliver('late', _request('x' * 4000, f'reply/{i}', f'm-{i}'))  # held
+        broker.deliver('live', TextParcel('y' * 4000).payload())                  # queued
+        assert len(agent._early_messages) == 2
+        agent.subscribe('late', topic_handler=lambda topic, pcl: 'late-ok')
+        agent._Agent__hook_done('on_activate')
+        _settle()                    # the second held request does not fit yet
+        gate.set()
+        assert _wait_until(lambda: [r.content for i in range(2) for r in _replies(broker, f'reply/{i}')]
+                           == ['late-ok', 'late-ok'])
+    finally:
+        gate.set()
+        agent.terminate()
+
+
+@xfail_34r
+def test_a_dispatcher_that_fails_to_start_leaves_no_bytes_reserved():
+    agent, broker = _agent({'dispatch': {'workers': 0}})
+    try:
+        for _ in range(2):
+            with pytest.raises(ValueError, match='workers'):
+                broker.deliver('t', TextParcel('m').payload())
+        assert agent._queued_bytes == 0
+    finally:
         agent.terminate()
 
 
