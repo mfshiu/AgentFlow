@@ -440,7 +440,8 @@ This contract is documented in Agent's docstring; no behavioural change beyond w
 - *Until #9, `Agent.__doc__` was `None`, so the claim above was untrue. Agent now has the docstring.*
 - *On the controller (a ProcessWorker and no broker), `publish`, `publish_sync`, `subscribe`, `get_data`, `put_data` and `pop_data` emit a `RuntimeWarning` that points to `start_thread()`, the agent's own hooks or a separate Agent. In the child, and in thread mode, they are silent. Refusing the calls (`AgentNotLocalError`) is left to roadmap P1-5.*
 - *`start()` without an explicit `CONCURRENCY_TYPE` emits a `FutureWarning`: the default will become `'thread'`.*
-- *When pickling the Agent to the child fails, `ProcessWorker.start` names the attributes that cannot be pickled and suggests creating them in `on_activating()`.*
+- *When pickling the Agent to the child fails, `ProcessWorker.start` adds a note to the exception, which keeps its type. The note names the attributes that cannot be pickled, checked the way spawning pickles them, and suggests creating them in `on_activating()` or using `start_thread()`. After such a failure, `start()` replaces the failed worker, so `start_thread()` works on the same object.*
+- *`unsubscribe` and `start_interval_loop` warn on the controller too. The default-mode `FutureWarning` fires only when `start()` fills in the default: a mode chosen in the config, with `set_config`, or with `start_thread()` / `start_process()` counts as chosen.*
 
 ---
 
