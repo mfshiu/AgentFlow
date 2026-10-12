@@ -1532,7 +1532,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-27 — At-most-once delivery (QoS 0) with silent losses and no message id
 
-- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #4, [RFC-015](../rfc/RFC-015-delivery-guarantees.md)). Persistent sessions (#17) and the outbound buffer bound (#35) remain **Open**.
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issues #4, #17 and #35, [RFC-015](../rfc/RFC-015-delivery-guarantees.md)). Persistent sessions are opt-in (#17) and the outbound buffer is bounded (#35, see R-29). With the default clean session the broker still keeps nothing for a disconnected subscriber.
 - **Severity**: High
 - **Category**: Message reliability
 - **File / Function / Line**:
@@ -1564,7 +1564,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Still open**:
 - Persistent sessions and stable client ids: available since #17 (RFC-015 §6), opt-in. With the default clean session the broker still keeps nothing for a disconnected subscriber.
-- Bounding the outbound buffer (#35).
+- Bounding the outbound buffer: resolved by #35 (see R-29).
 - Decode-failure observability: resolved by #15 (see R-19).
 - Duplicates beyond the window, or from senders without ids, still reach handlers, which should stay idempotent.
 
@@ -1572,7 +1572,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-28 — Payloads decoded on the network thread, without size or byte limits
 
-- **Status**: **RESOLVED** (2026-10-12, issue #34). The outbound direction (#35) remains **Open**.
+- **Status**: **RESOLVED** (2026-10-12, issue #34). The outbound direction is resolved by #35 (see R-29).
 - **Severity**: Medium
 - **Category**: Resource management
 - **File / Function / Line**:
@@ -1611,7 +1611,42 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - byte budget, for queued and held messages;
 - config validation.
 
-**Still open**: the outbound direction (#35).
+**Outbound direction**: resolved by #35 (see R-29).
+
+---
+
+## R-29 — Unbounded outbound queue on a slow or stalled link
+
+- **Status**: **RESOLVED** (2026-10-12, issue #35).
+- **Severity**: Medium
+- **Category**: Resource management
+- **File / Function / Line**:
+  - `src/agentflow/broker/mqtt_broker.py` `publish`, which set no limit and exposed no pending count;
+  - paho's outgoing packet queue, to which `max_queued_messages` does not apply at QoS 0.
+- **Trigger**: publishing faster than the link drains: a slow network, a stalled broker, a full TCP window.
+- **Impact**:
+  - Every publish "succeeded" while paho's queue, and the process's memory, grew without bound (CLAUDE.md invariant 5).
+  - Nothing reported the backlog.
+- **Confidence**: High (reproduced over a stalled loopback link: 100 MiB accepted).
+
+### Outbound limit (2026-10-12, issue #35)
+
+**Change.**
+- MqttBroker tracks each publish from the paho call until paho reports it sent: QoS 0 once written to the socket, QoS ≥ 1 once acknowledged.
+- A publish that would take the pending payload bytes past the `max_pending_bytes` broker option (default 64 MiB) raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` with reason `backpressure`, and a transport-neutral `PublishBackpressureError`.
+- `Agent.publish` returns `False`, counts it in `publish_backpressure_count` and logs it without a traceback (WARNING on the 1st, 2nd, 4th, ... refusal). `publish_sync` raises it.
+- A connection loss forgets unsent QoS 0 messages, as paho drops them. QoS ≥ 1 ones stay pending until paho resends them and they are acknowledged.
+- `recovery_metrics()` reports `pending_publish_count` and `pending_publish_bytes`.
+
+**Compatibility.**
+- A publisher that outruns its link by more than 64 MiB now gets `False` (or an exception from `publish_sync`) instead of growing memory. Raise `max_pending_bytes` for bursty, high-volume senders.
+- A single payload larger than `max_pending_bytes` can never be sent.
+
+**Verification**:
+- `tests/unit/test_mqtt_broker_backpressure.py`: tracking by mid, the limit and its default, a report that arrives before `publish()` returns, disconnects, option validation, and `Agent.publish`.
+- `tests/wire/test_outbound_backpressure_wire.py`: stalls the loopback server and expects backpressure, then a drain once the link moves again.
+
+**Not covered**: the limit counts payload bytes only; topics and MQTT headers add a little. Only MqttBroker enforces it.
 
 ---
 
@@ -1627,7 +1662,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-09 | High | High | **Partially resolved 2026-10-11 (#38)**: same-name replica / grandchild addressing fixed; name validation and namespace still open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
-| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions (#17) and outbound bound (#35) still open | At-most-once delivery, silent losses |
+| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions opt-in (#17), outbound buffer bounded (#35); the default clean session still loses messages for a disconnected subscriber | At-most-once delivery, silent losses |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
@@ -1639,7 +1674,8 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-19 | Medium | High | **Resolved 2026-10-12 (#15)**: version validated, undecodable messages counted with rate-limited logging | Parcel `version` never validated |
 | R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
-| R-28 | Medium | High | **Resolved 2026-10-12 (#34)**: payload size limit before decoding, decoding on dispatcher threads, byte-bounded queue; outbound (#35) still open | Payloads decoded on the network thread without limits |
+| R-28 | Medium | High | **Resolved 2026-10-12 (#34)**: payload size limit before decoding, decoding on dispatcher threads, byte-bounded queue; outbound bounded by #35 (R-29) | Payloads decoded on the network thread without limits |
+| R-29 | Medium | High | **Resolved 2026-10-12 (#35)**: `max_pending_bytes` outbound limit (default 64 MiB); backpressure reported as `publish` → `False` | Unbounded outbound queue on a slow or stalled link |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
