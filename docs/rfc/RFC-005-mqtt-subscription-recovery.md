@@ -83,7 +83,7 @@ sequenceDiagram
 ## 4. Desired state
 
 - `MqttBroker` owns a `dict[topic, data_type]` **subscription registry**, updated on every `subscribe` / `unsubscribe` under a single lock.
-- On the **first** successful `_on_connect`, notify the notifier normally; the notifier drives initial subscribes as today (populating the registry).
+- On the **first** successful `_on_connect`, notify the notifier normally; the notifier drives initial subscribes as today (populating the registry). *Amended 2026-10-12 (issue #54): the first CONNACK also replays the registry, like a reconnect, so topics subscribed while STARTING are sent.*
 - On a **subsequent** successful `_on_connect` (== reconnect), the broker snapshots the registry, iterates it under best-effort ordering, and re-issues `client.subscribe(topic)` for each entry before notifying the notifier. Per-topic failures are counted and logged; recovery continues.
 - `stop()` sets a `_stopped` flag under the same lock. Any subsequent `subscribe` / `unsubscribe` / `_on_connect` short-circuits: subscribe/unsubscribe log-and-return without touching either the registry or the client; `_on_connect` skips both recovery and notifier delegation.
 - `_on_disconnect` records whether the disconnect was **planned** (reason code 0 or during `stop()`) or **unexpected**, exposed as `last_disconnect_was_planned` for observability; clears `_connect_ok` and `_connected_evt`.
@@ -253,7 +253,7 @@ def _on_connect(self, client, userdata, flags, reasonCode, properties):
             return
         is_first = not self._ever_connected
         self._ever_connected = True
-        snapshot = dict(self._registry) if not is_first else {}
+        snapshot = dict(self._registry) if not is_first else {}   # issue #54: now always dict(self._registry)
 
     self._connect_ok = True
     self._connect_err = None
@@ -366,10 +366,10 @@ def recovery_metrics(self) -> dict:
 The registry write and the read of `_connected` happen under `_state_lock`, as do `_on_connect`'s setting of `_connected` and its snapshot. So each topic is either sent by `subscribe` or replayed by `_on_connect`; none is missed.
 
 ### 7.4 Unsubscribe when disconnected
-Symmetric: `broker.unsubscribe(topic)` **removes from registry and calls `client.unsubscribe`**. Registry deletion is the durable contract; the topic will not be re-subscribed on reconnect.
+Symmetric: `broker.unsubscribe(topic)` **removes from registry and calls `client.unsubscribe`**. Registry deletion is the durable contract; the topic will not be re-subscribed on reconnect. *Amended 2026-10-12 (issue #54), to match the implementation: it calls `client.unsubscribe` only when connected.*
 
 ### 7.5 on_connect success recovery flow
-Under `_state_lock`: check `_stopped` (bail if True); set `_ever_connected = True`; snapshot the registry (*amended 2026-10-12, issue #54: on every CONNACK; it used to skip the first*). Release lock. If snapshot non-empty, run `_recover_subscriptions`. Then call `notifier._on_connect()`. Finally set `_connected_evt`.
+Under `_state_lock`: check `_stopping` (bail if True); set `_ever_connected = True`; snapshot the registry (*amended 2026-10-12, issue #54: on every CONNACK; it used to skip the first*). Release lock. If snapshot non-empty, run `_recover_subscriptions`. Then call `notifier._on_connect()`. Finally set `_connected_evt` and `_connack_evt` (issue #17).
 
 Recovery iterates the snapshot outside the lock, checking `_stopped` between topics to allow prompt shutdown. Per-topic failures are counted (`_resubscribe_error_count`) and logged; recovery continues.
 
@@ -388,10 +388,10 @@ Yes. Recovery snapshots the registry under the lock, then iterates the snapshot 
 ### 7.10 Linearization semantics
 - Registry writes (`subscribe`'s dict-set, `unsubscribe`'s dict-pop, `stop`'s flag flip) are strictly linearizable via `_state_lock`.
 - `client.subscribe` / `client.unsubscribe` calls are best-effort ordered relative to each other: the calling thread issues them after releasing the lock, so if two threads concurrently call `broker.subscribe(A)` and `broker.unsubscribe(A)`, the client-side ordering is not deterministic. The registry-side ordering IS deterministic. MQTT itself is idempotent for repeated subscribes/unsubscribes, which bounds the damage.
-- Recovery vs concurrent `subscribe`/`unsubscribe` race: acknowledged and documented. A `subscribe(X)` arriving between snapshot and the recovery loop's last iteration may result in two client-side subscribes for X — harmless. An `unsubscribe(X)` in the same window may result in a client.subscribe(X) followed by a client.unsubscribe(X) — final state matches the caller's intent.
+- Recovery vs concurrent `subscribe`/`unsubscribe` race: acknowledged and documented. A `subscribe(X)` arriving between snapshot and the recovery loop's last iteration may result in two client-side subscribes for X — harmless. An `unsubscribe(X)` in the same window may result in a client.subscribe(X) followed by a client.unsubscribe(X) — final state matches the caller's intent. *Amended 2026-10-12 (issue #54 review): an `unsubscribe(X)` between the loop's registry check and its `client.subscribe(X)` sent its UNSUBSCRIBE first, so the SUBSCRIBE won. After each subscribe the loop now re-checks the registry and, if X is gone while connected, sends another UNSUBSCRIBE; paho sends packets in call order.*
 
 ### 7.11 Connection generation
-**Not introduced in this RFC.** A single `_ever_connected` boolean suffices to distinguish first-connect (no recovery) from reconnect (recovery). A full epoch counter is a valid future addition (Option E) to enable stricter concurrent-race detection; deferring keeps the initial change small.
+**Not introduced in this RFC.** A single `_ever_connected` boolean suffices to distinguish first-connect (no recovery) from reconnect (recovery). *Since issue #54 every CONNACK runs recovery; `_ever_connected` remains for the reconnect policy and `recovery_metrics()`.* A full epoch counter is a valid future addition (Option E) to enable stricter concurrent-race detection; deferring keeps the initial change small.
 
 ### 7.12 Individual resubscribe failure handling
 `_recover_subscriptions` wraps each `client.subscribe` call in `try/except Exception`. Failures increment `_resubscribe_error_count` and log at ERROR with topic name and exception detail. **The loop continues with the next topic**; a single failing topic does not abort the recovery of the remaining topics. `BaseException` subclasses propagate (KeyboardInterrupt / SystemExit), consistent with RFC-004 §7.10.
