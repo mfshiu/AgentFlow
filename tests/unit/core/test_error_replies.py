@@ -30,8 +30,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_68r = pytest.mark.xfail(strict=True, reason='issue #68 review: fixed in the next commit')
-
 SECRET = 'postgresql://app:S3cr3t@10.0.0.5/prod'
 
 
@@ -99,14 +97,13 @@ def _service_replying_error(make, error):
     service.subscribe('db/query', topic_handler=handler)
 
 
-@pytest.mark.parametrize('error', [pytest.param('', marks=xfail_68r), None])
+@pytest.mark.parametrize('error', ['', None])
 def test_an_empty_error_is_not_raised(hub, error):
     _service_replying_error(hub, error)
     reply = hub('cli').publish_sync('db/query', 'q', timeout=3, raise_on_error=True)
     assert reply.content == 'partial'
 
 
-@xfail_68r
 def test_remote_error_pickles():
     reply = Parcel.from_content(None)
     reply.error = 'ConnectionError'
@@ -116,7 +113,6 @@ def test_remote_error_pickles():
         'db/query', 'ConnectionError', 'ConnectionError', str(error))
 
 
-@xfail_68r
 def test_remote_error_message_bounds_and_escapes_the_remote_text(hub):
     forged = 'x\n2026-10-13 00:00:00,000 CRITICAL forged line ' + 'y' * 100_000
     _service_replying_error(hub, forged)

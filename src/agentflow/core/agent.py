@@ -161,13 +161,19 @@ class RemoteError(RuntimeError):
     """Issue #68: raised by publish_sync(..., raise_on_error=True) when
     the reply carries an error, e.g. because the responder's handler
     raised. Attributes: `topic` (the request's), `error` (the reply's)
-    and `reply` (the reply Parcel)."""
+    and `reply` (the reply Parcel). The message quotes the error
+    escaped and bounded: it is text from the network."""
 
     def __init__(self, topic, error, reply):
-        super().__init__(f"The request to {topic!r} failed at the responder: {error}")
+        super().__init__(
+            f"The request to {topic!r} failed at the responder: {ensure_size(repr(error), 200)}")
         self.topic = topic
         self.error = error
         self.reply = reply
+
+    def __reduce__(self):
+        # Rebuilt from the attributes, so that it crosses processes.
+        return (type(self), (self.topic, self.error, self.reply))
 
 
 def _withheld_error(ex: BaseException) -> str:
@@ -1276,9 +1282,9 @@ class Agent(BrokerNotifier):
         after the call has returned is dropped and counted
         (late_reply_count). timeout=None (wait forever) is deprecated.
 
-        Issue #68: a reply carrying an error (the responder's handler
-        raised, or it was overloaded) is returned like any other unless
-        `raise_on_error`, which raises RemoteError instead."""
+        Issue #68: a reply carrying a non-empty error (the responder's
+        handler raised, or it was overloaded) is returned like any other
+        unless `raise_on_error`, which raises RemoteError instead."""
         if timeout is None:
             warnings.warn(
                 "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
@@ -1327,7 +1333,7 @@ class Agent(BrokerNotifier):
                 # does not carry a foreign id that requester would
                 # ignore. The Parcel was decoded for this call alone.
                 reply.correlation_id = None
-                if raise_on_error and reply.error is not None:
+                if raise_on_error and reply.error:
                     raise RemoteError(topic, reply.error, reply)
                 return reply
             raise TimeoutError(f"No response received within timeout period for topic: {reply_topic}.")
