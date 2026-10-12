@@ -51,9 +51,6 @@ def test_a_topic_unsubscribed_before_the_first_connack_is_not_sent(broker, fake_
     assert _subscribed_topics(fake_client) == []
 
 
-xfail_54r = pytest.mark.xfail(strict=True, reason='issue #54 review: fixed in the next commit')
-
-
 def _subscription_calls(fake_client, topic):
     calls = []
     for name, args, kwargs in fake_client.mock_calls:
@@ -62,7 +59,6 @@ def _subscription_calls(fake_client, topic):
     return calls
 
 
-@xfail_54r
 def test_an_unsubscribe_during_the_replay_wins(broker, fake_client):
     assert broker.start({}) is True
     broker.subscribe('early/topic', 'str')

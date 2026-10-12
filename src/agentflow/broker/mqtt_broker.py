@@ -491,12 +491,30 @@ class MqttBroker(MessageBroker):
                 logger.exception(
                     f"recovery: resubscribe failed for topic {topic!r}: {ex}"
                 )
+            self._withdraw_if_unsubscribed(topic)
         with self._state_lock:
             self._resubscribe_success_count += successes
             self._resubscribe_error_count += failures
         logger.info(
             f"recovery complete: {successes} succeeded, {failures} failed"
         )
+
+
+    def _withdraw_if_unsubscribed(self, topic: str) -> None:
+        """RFC-005 §7.10 (issue #54 review): an unsubscribe() between
+        the recovery loop's registry check and its client.subscribe has
+        already sent its UNSUBSCRIBE, so the SUBSCRIBE would win. Send
+        another UNSUBSCRIBE after it: paho sends packets in call order."""
+        with self._state_lock:
+            withdrawn = (topic not in self._registry and self._connected
+                         and not self._stopping)
+        if withdrawn:
+            try:
+                self._client.unsubscribe(topic)
+            except Exception as ex:
+                logger.exception(
+                    f"recovery: unsubscribe of withdrawn topic {topic!r} failed: {ex}"
+                )
 
 
     def _on_disconnect(self, client, userdata, _flags, reasonCode, _properties):
