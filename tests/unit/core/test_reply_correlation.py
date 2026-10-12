@@ -121,8 +121,7 @@ def _serve(agent, handler):
     return handled
 
 
-@pytest.mark.parametrize('kind', ['content', 'parcel', pytest.param(
-    'error', marks=pytest.mark.xfail(strict=True, reason='issue #68: error replies'))])
+@pytest.mark.parametrize('kind', ['content', 'parcel', 'error'])
 def test_auto_reply_echoes_the_request_correlation_id(agent_and_broker, kind):
     agent, broker = agent_and_broker
     returned = _correlated('pong-parcel', 'handler-own')

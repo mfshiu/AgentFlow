@@ -27,8 +27,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.parcel import Parcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
-xfail_68 = pytest.mark.xfail(strict=True, reason='issue #68: error replies')
-
 SECRET = 'postgresql://app:S3cr3t@10.0.0.5/prod'
 
 
@@ -75,7 +73,6 @@ def _wire_replies(service):
     return [p for t, p in service._broker.publish_calls if t != 'db/query']
 
 
-@xfail_68
 def test_raise_on_error_raises_remote_error(hub):
     _failing_service(hub)
     client = hub('cli')
@@ -92,7 +89,6 @@ def test_by_default_the_error_parcel_is_returned(hub):
     assert reply.content is None and reply.error
 
 
-@xfail_68
 def test_the_error_reply_withholds_the_exception_message(hub, caplog):
     caplog.set_level(logging.ERROR)
     service = _failing_service(hub)
@@ -120,7 +116,6 @@ def test_a_handlers_own_error_is_forwarded_as_is(hub):
     assert hub('cli').publish_sync('db/query', 'q', timeout=3).error == 'quota exceeded'
 
 
-@xfail_68
 @pytest.mark.parametrize('errors, exception', [
     ('yes', TypeError),
     ({'expose_details': 'yes'}, TypeError),

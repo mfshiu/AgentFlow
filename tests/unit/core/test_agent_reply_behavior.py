@@ -272,7 +272,6 @@ def test_exception_path_does_not_mutate_incoming_parcel(agent_with_fake_broker):
     assert stored[0].topic_return == 'R'
 
 
-@pytest.mark.xfail(strict=True, reason='issue #68: error replies')
 def test_exception_path_publishes_fresh_parcel_with_error_field(
     agent_with_fake_broker,
 ):

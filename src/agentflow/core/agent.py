@@ -33,6 +33,8 @@ logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
 _CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals', 'max_payload_bytes'})
+# Issue #68: the keys of the optional `errors` config section.
+_ERRORS_KEYS = frozenset({'expose_details'})
 
 # Issue #34: payload limits. A payload larger than codec.max_payload_bytes
 # is dropped without decoding; at most dispatch.max_queued_bytes of
@@ -155,6 +157,27 @@ class TopicWaitCollisionError(RuntimeError):
     share the topic (RFC-014 §8, superseding RFC-006's fail-fast)."""
 
 
+class RemoteError(RuntimeError):
+    """Issue #68: raised by publish_sync(..., raise_on_error=True) when
+    the reply carries an error, e.g. because the responder's handler
+    raised. Attributes: `topic` (the request's), `error` (the reply's)
+    and `reply` (the reply Parcel)."""
+
+    def __init__(self, topic, error, reply):
+        super().__init__(f"The request to {topic!r} failed at the responder: {error}")
+        self.topic = topic
+        self.error = error
+        self.reply = reply
+
+
+def _withheld_error(ex: BaseException) -> str:
+    """Issue #68: the error an automatic reply carries for a handler
+    exception, unless errors.expose_details: its type only. Its message
+    may hold internals (connection strings, hosts, credentials) that
+    anyone subscribed to the reply topic would read."""
+    return f"{type(ex).__name__} (details are in the responder's log)"
+
+
 class _HandlerOwnerType(Enum):
     """Internal (RFC-007): owner tag for an Agent handler registry
     entry. NORMAL is registered via Agent.subscribe; PUBLISH_SYNC is
@@ -256,6 +279,8 @@ class Agent(BrokerNotifier):
         self._max_payload_bytes, self._max_queued_bytes = self.__parse_payload_limits()
         # Issue #13: holon control-plane policy, validated the same way.
         self._holon_options = self.__parse_holon_config()
+        # Issue #68: whether an error reply carries the exception message.
+        self._expose_error_details = self.__parse_errors_config()
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
@@ -550,6 +575,33 @@ class Agent(BrokerNotifier):
             'accept_pickle': accept_pickle,
             'pickle_allowed_globals': parse_pickle_globals(allowed),
         }
+
+
+    def __parse_errors_config(self) -> bool:
+        """Issue #68: the optional `errors` config section.
+
+          expose_details (bool, default False) — when a handler raises,
+                         the automatic error reply carries str(ex), as
+                         before #68, instead of the exception type only.
+                         The message is always logged by the responder.
+
+        Raises TypeError / ValueError on a malformed section."""
+        errors = self.config.get('errors')
+        if errors is None:
+            return False
+        if not isinstance(errors, dict):
+            raise TypeError(
+                f"Agent config 'errors' must be a dict, got {type(errors).__name__}")
+        unknown = set(errors) - _ERRORS_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent config 'errors' keys {sorted(map(str, unknown))}; "
+                f"expected {sorted(_ERRORS_KEYS)}")
+        expose = errors.get('expose_details', False)
+        if not isinstance(expose, bool):
+            raise TypeError(
+                f"Agent config 'errors.expose_details' must be a bool, got {expose!r}")
+        return expose
 
 
     def __parse_payload_limits(self):
@@ -1210,7 +1262,8 @@ class Agent(BrokerNotifier):
         return f"{self.tag}-{rand}/{topic}"
 
     @final
-    def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
+    def publish_sync(self, topic, data=None, topic_wait=None, timeout=30, *,
+                     raise_on_error=False)->Parcel:
         """Publish a request and wait up to `timeout` seconds for its
         reply, which is returned; raises TimeoutError without one. Safe
         to call from a handler (issue #7): replies have their own lane,
@@ -1221,7 +1274,11 @@ class Agent(BrokerNotifier):
         a fresh one is generated for each call, so a retry with the same
         Parcel gets a new topic. A reply arriving on a generated topic
         after the call has returned is dropped and counted
-        (late_reply_count). timeout=None (wait forever) is deprecated."""
+        (late_reply_count). timeout=None (wait forever) is deprecated.
+
+        Issue #68: a reply carrying an error (the responder's handler
+        raised, or it was overloaded) is returned like any other unless
+        `raise_on_error`, which raises RemoteError instead."""
         if timeout is None:
             warnings.warn(
                 "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
@@ -1270,6 +1327,8 @@ class Agent(BrokerNotifier):
                 # does not carry a foreign id that requester would
                 # ignore. The Parcel was decoded for this call alone.
                 reply.correlation_id = None
+                if raise_on_error and reply.error is not None:
+                    raise RemoteError(topic, reply.error, reply)
                 return reply
             raise TimeoutError(f"No response received within timeout period for topic: {reply_topic}.")
         finally:
@@ -1976,7 +2035,9 @@ class Agent(BrokerNotifier):
                 # RFC-003 R-exception-fresh: build a new parcel for
                 # the error echo; do NOT mutate or reuse pcl.
                 err_pcl = Parcel.from_content(None)
-                err_pcl.error = str(ex)
+                # Issue #68: the type only, unless errors.expose_details;
+                # the message was just logged.
+                err_pcl.error = str(ex) if self._expose_error_details else _withheld_error(ex)
                 data_resp = err_pcl
                 logger.debug(data_resp)
             # RFC-003 R-strip-topic_return: the auto-reply must
