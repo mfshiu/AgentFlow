@@ -1793,12 +1793,16 @@ class Agent(BrokerNotifier):
                 is_specific_handler = False
                 topic_handler = self.on_message
 
-        # Created first: a dispatcher that fails to start must not leave
-        # bytes reserved.
-        dispatcher = self._get_dispatcher()
         if not self.__reserve_queued_bytes(size):
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
             return
+        try:
+            dispatcher = self._get_dispatcher()
+        except BaseException:
+            # A dispatcher that fails to start must not leave bytes
+            # reserved.
+            self.__release_queued_bytes(size)
+            raise
 
         def task():
             self.__release_queued_bytes(size)
@@ -1910,14 +1914,18 @@ class Agent(BrokerNotifier):
         if pcl.message_id is not None and self.__seen_before(pcl.message_id):
             # A redelivered copy of a request that was handled, answered,
             # or is still waiting in the queue. Recording the id here
-            # makes "overloaded" true: a waiting original, or a later
-            # redelivery, is then dropped as a duplicate instead of run.
+            # makes "overloaded" true (within the _DEDUP_WINDOW ids): a
+            # waiting original, or a later redelivery, is then dropped
+            # as a duplicate instead of run.
             return
         dropped = Parcel.from_content(None)
         dropped.error = ("overloaded: the request was dropped before it was handled "
                          "(dispatcher queue or byte budget full, or stopping)")
         dropped.correlation_id = pcl.correlation_id
-        self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+        if not self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS) and pcl.message_id is not None:
+            # The requester was not told: let a redelivery run it.
+            with self._dedup_lock:
+                self._recent_message_ids.pop(pcl.message_id, None)
 
 
     def __reserve_queued_bytes(self, size) -> bool:

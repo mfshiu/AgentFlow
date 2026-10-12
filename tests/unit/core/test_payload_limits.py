@@ -40,8 +40,6 @@ from tests.fakes.fake_bus import FakeBus
 MiB = 1024 * 1024
 SETTLE_S = 0.3
 
-xfail_34s = pytest.mark.xfail(strict=True, reason='issue #34 second review: fixed in the next commit')
-
 
 def _wait_until(predicate, timeout=3.0):
     return FakeBus.wait_until(predicate, timeout=timeout)
@@ -198,7 +196,6 @@ def test_a_request_answered_overloaded_is_not_run_when_redelivered():
         agent.terminate()
 
 
-@xfail_34s
 def test_a_request_whose_overloaded_reply_failed_runs_when_redelivered():
     agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
     handled = []
@@ -251,7 +248,6 @@ def test_a_dispatcher_that_fails_to_start_leaves_no_bytes_reserved():
         agent.terminate()
 
 
-@xfail_34s
 def test_a_message_dropped_over_the_byte_budget_does_not_start_the_dispatcher():
     agent, broker = _agent({'dispatch': {'max_queued_bytes': 1000}})
     try:
