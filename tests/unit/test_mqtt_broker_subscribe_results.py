@@ -27,8 +27,6 @@ import pytest
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
-xfail_53 = pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
-
 MQTT_ERR_NO_CONN = 4
 
 
@@ -65,7 +63,6 @@ def warnings_logged(caplog):
     return lambda: [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
-@xfail_53
 @pytest.mark.parametrize('topic', ['robot+1/cmd', 'a/#/b', 'a/b#', '#/x', ''])
 def test_an_invalid_filter_is_refused_before_the_registry(connected, fake_client, topic):
     with pytest.raises(ValueError):
@@ -80,7 +77,6 @@ def test_valid_filters_are_accepted(connected, fake_client, topic):
     assert fake_client.subscribe.call_count == 1
 
 
-@xfail_53
 def test_a_rejected_suback_is_logged_and_not_counted_active(connected, fake_client, warnings_logged):
     connected.subscribe('secure/denied', 'str')
     _suback(connected, fake_client, 5, 0x80)
@@ -89,7 +85,6 @@ def test_a_rejected_suback_is_logged_and_not_counted_active(connected, fake_clie
     assert 'secure/denied' in connected._registry          # retried on the next CONNACK
 
 
-@xfail_53
 def test_a_granted_suback_keeps_the_topic_active(connected, fake_client, warnings_logged):
     connected.subscribe('ok/topic', 'str', qos=1)
     _suback(connected, fake_client, 5, 1)
@@ -97,7 +92,6 @@ def test_a_granted_suback_keeps_the_topic_active(connected, fake_client, warning
     assert warnings_logged() == []
 
 
-@xfail_53
 def test_a_later_successful_resubscribe_clears_the_failure(connected, fake_client):
     connected.subscribe('secure/denied', 'str')
     _suback(connected, fake_client, 5, 0x80)
@@ -108,7 +102,6 @@ def test_a_later_successful_resubscribe_clears_the_failure(connected, fake_clien
     assert _counts(connected) == (1, 0)
 
 
-@xfail_53
 def test_a_suback_that_arrives_before_subscribe_returns_is_handled(connected, fake_client):
     def subscribe_and_refuse(*args, **kwargs):
         _suback(connected, fake_client, 9, 0x80)          # the network thread was faster
@@ -118,7 +111,6 @@ def test_a_suback_that_arrives_before_subscribe_returns_is_handled(connected, fa
     assert _counts(connected) == (0, 1)
 
 
-@xfail_53
 def test_a_resubscribe_with_an_error_rc_counts_as_a_failure(connected, fake_client, warnings_logged):
     connected.subscribe('T', 'str')
     _fire_disconnect(connected, fake_client)
@@ -130,7 +122,6 @@ def test_a_resubscribe_with_an_error_rc_counts_as_a_failure(connected, fake_clie
     assert any("'T'" in r.getMessage() for r in warnings_logged())
 
 
-@xfail_53
 def test_a_paho_error_on_subscribe_keeps_the_topic_desired_but_not_active(connected, fake_client):
     fake_client.subscribe.side_effect = RuntimeError('paho failure')
     with pytest.raises(RuntimeError, match='paho failure'):
@@ -139,7 +130,6 @@ def test_a_paho_error_on_subscribe_keeps_the_topic_desired_but_not_active(connec
     assert _counts(connected) == (0, 1)
 
 
-@xfail_53
 def test_an_unsubscribe_clears_the_failure(connected, fake_client):
     connected.subscribe('secure/denied', 'str')
     _suback(connected, fake_client, 5, 0x80)
@@ -147,7 +137,6 @@ def test_an_unsubscribe_clears_the_failure(connected, fake_client):
     assert _counts(connected) == (0, 0)
 
 
-@xfail_53
 @pytest.mark.parametrize('codes', [None, [object()], ['x']])
 def test_on_subscribe_never_raises_into_paho(connected, fake_client, codes):
     connected.subscribe('T', 'str')

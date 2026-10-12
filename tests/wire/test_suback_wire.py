@@ -26,7 +26,6 @@ class _Notifier:
         pass
 
 
-@pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
 def test_a_refused_subscription_is_reported_and_retried_on_reconnect(caplog):
     caplog.set_level(logging.WARNING)
     server = MiniMqttServer()

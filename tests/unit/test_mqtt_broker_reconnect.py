@@ -429,7 +429,6 @@ def test_unsubscribe_after_stop_returns_None_and_does_not_forward(
 # Category G: Failure isolation (RFC-005 §7.12)
 # ==========================================================================
 
-@pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
 def test_client_subscribe_exception_propagates_when_connected(
     broker, fake_client,
 ):
@@ -532,7 +531,6 @@ def test_on_message_after_reconnect_still_forwards_to_same_notifier(
 # Category I: Metrics snapshot consistency (RFC-005 §7.13)
 # ==========================================================================
 
-@pytest.mark.xfail(strict=True, reason='issue #53: subscription results not checked')
 def test_recovery_metrics_returns_all_keys(broker, fake_client):
     snap = broker.recovery_metrics()
     assert set(snap.keys()) == {
