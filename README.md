@@ -75,6 +75,10 @@ Tested using a swarm of 50–500 autonomous mobile robots (AMRs):
 - Intelligent grid and healthcare logistics
 - Programmable, real-time distributed systems
 
+## 🐍 Requirements
+
+Python 3.11 or newer. CI tests CPython 3.11 and 3.13 on Linux and Windows; the package depends on `paho-mqtt` 2.x.
+
 ## 📦 Repository Structure
 
 ```bash
