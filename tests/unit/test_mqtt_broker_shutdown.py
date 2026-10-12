@@ -22,7 +22,7 @@ Post-RFC-010 contract:
 """
 
 import inspect
-import re
+import logging
 import threading
 import time
 from typing import Optional
@@ -82,6 +82,25 @@ def _install_blocking(mock_call, release_event, started_event):
         started_event.set()
         release_event.wait(timeout=30.0)
     mock_call.side_effect = _blocked
+
+
+def _deactivate_with(broker, caplog):
+    """Run `Agent.__deactivating` against `broker`. Returns the log
+    records (WARNING and above) that agent.py emitted, and whether the
+    on_terminated hook ran, i.e. whether teardown completed."""
+    from agentflow.core.agent import Agent
+    terminated = []
+
+    class _HookedAgent(Agent):
+        def on_terminated(self):
+            terminated.append(True)
+
+    agent = _HookedAgent(name='deactivating', agent_config={})
+    agent._broker = broker
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        agent._Agent__deactivating()
+    return [r for r in caplog.records if r.module == 'agent'], bool(terminated)
 
 
 # ===========================================================================
@@ -533,24 +552,43 @@ def test_C25_STOP_TIMEOUT_retry_stays_STOP_TIMEOUT_when_still_wedged(
         broker.stop(graceful_timeout_s=2.0)
 
 
-def test_C26_agent_terminate_still_bounded_when_broker_stop_wedges_source_x_ref():
+def test_C26_agent_terminate_still_bounded_when_broker_stop_wedges_source_x_ref(
+    broker, fake_client, monkeypatch, caplog,
+):
     """Cross-reference: `Agent.__deactivating` observes `broker.stop`
     bool return. Even when broker.stop returns False (STOP_TIMEOUT),
-    Agent.terminate remains bounded via ThreadWorker.stop (RFC-009).
-    Source-inspection here; the runtime scenario is in the
-    ThreadWorker suite."""
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, '_Agent__deactivating'))
-    assert 'self._broker.stop()' in src
-    assert 'stopped is False' in src
-    assert 'logger.warning' in src
+    Agent.terminate remains bounded via ThreadWorker.stop (RFC-009);
+    that runtime scenario is in the ThreadWorker suite. Here:
+    __deactivating against this broker with a wedged disconnect
+    returns once stop() gives up, and logs a WARNING with the state."""
+    _prime_connected(broker, fake_client)
+    release = threading.Event()
+    started = threading.Event()
+    _install_blocking(fake_client.disconnect, release, started)
+    # __deactivating calls stop() with the default 5s budget; shorten it.
+    monkeypatch.setattr(
+        broker, 'stop', lambda: MqttBroker.stop(broker, graceful_timeout_s=0.3),
+    )
+    try:
+        t0 = time.monotonic()
+        records, terminated = _deactivate_with(broker, caplog)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2.0, f"__deactivating took {elapsed:.2f}s"
+        assert broker.state is WorkerState.STOP_TIMEOUT
+        warnings_ = [r for r in records if r.levelno == logging.WARNING]
+        assert len(warnings_) == 1
+        assert 'STOP_TIMEOUT' in warnings_[0].getMessage()
+        assert terminated
+    finally:
+        release.set()
+        MqttBroker.stop(broker, graceful_timeout_s=2.0)
 
 
-def test_C27_process_worker_hard_containment_still_available_source_check():
-    from agentflow.core.agent_worker import ProcessWorker
-    src = inspect.getsource(ProcessWorker.stop)
-    assert 'terminate()' in src
-    assert 'kill()' in src
+# test_C27_process_worker_hard_containment_still_available_source_check:
+# removed in #74, a duplicate source pin. ProcessWorker's terminate() /
+# kill() escalation is tested by test_F44 in
+# core/test_thread_worker_process_exit.py and the escalation tests in
+# core/test_process_worker_lifecycle.py.
 
 
 # ===========================================================================
@@ -761,12 +799,33 @@ def test_E40_delayed_on_connect_rc_nonzero_after_stop_also_fences(
 # ===========================================================================
 
 
-def test_F41_waiter_uses_bounded_event_wait_by_source_inspection():
-    src = inspect.getsource(MqttBroker.stop)
-    assert '_stop_complete_event.wait()' not in src, (
-        "waiter must not perform an unbounded event.wait()"
-    )
-    assert re.search(r'_stop_complete_event\.wait\(\s*\S', src)
+def test_F41_waiter_uses_bounded_event_wait_by_source_inspection(
+    broker, fake_client,
+):
+    """The waiter path must not wait on the completion event without a
+    timeout. Observed with a completion that never comes (a first
+    caller that entered STOPPING and died without signalling): a
+    second stop() still returns after about graceful_timeout_s plus
+    the coordination margin. (test_F42's first caller does signal, so
+    it cannot tell a bounded wait from an unbounded one.)"""
+    _prime_connected(broker, fake_client)
+    with broker._state_lock:
+        broker._state = WorkerState.STOPPING
+        broker._stop_complete_event.clear()
+
+    probe = _StopProbe(broker, graceful_timeout_s=0.2)
+    t0 = time.monotonic()
+    probe.start()
+    try:
+        assert probe.returned.wait(2.0), (
+            "waiter performed an unbounded wait on the completion event"
+        )
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, f"waiter took {elapsed:.2f}s"
+        assert probe.raised is None
+    finally:
+        # Release a waiter that did block, so no thread outlives the test.
+        broker._stop_complete_event.set()
 
 
 def test_F42_waiter_returns_bounded_when_first_caller_wedges(broker, fake_client):
@@ -897,24 +956,52 @@ def test_H51_mqtt_broker_stop_signature_has_graceful_timeout_s_default_5(
 # ===========================================================================
 
 
-def test_I52_agent_deactivating_source_observes_broker_stop_result():
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, '_Agent__deactivating'))
-    assert 'self._broker.stop()' in src
-    assert 'stopped is False' in src
-    assert 'logger.warning' in src
+class _StubBroker:
+    """A broker whose stop() returns `result` or raises `error`."""
+
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.stop_calls = 0
+        self.state = 'stub-state'
+        self.last_stop_exception = None
+
+    def stop(self):
+        self.stop_calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_I52_agent_deactivating_source_observes_broker_stop_result(caplog):
+    """__deactivating calls broker.stop() once and observes its result:
+    False → one WARNING naming the broker state. Any Exception from
+    stop() — not only the broker-shaped ones (LookupError here) — is
+    logged, never raised, and teardown still completes (on_terminated
+    runs)."""
+    stub = _StubBroker(result=False)
+    records, terminated = _deactivate_with(stub, caplog)
+    assert stub.stop_calls == 1
+    warnings_ = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1
+    assert 'stub-state' in warnings_[0].getMessage()
+    assert terminated
+
     # never-raise contract preserved.
-    assert 'except Exception' in src
+    for error in (RuntimeError('paho exploded'), LookupError('unexpected')):
+        failing = _StubBroker(error=error)
+        records, terminated = _deactivate_with(failing, caplog)
+        assert failing.stop_calls == 1
+        assert [r for r in records if r.levelno == logging.ERROR], error
+        assert terminated, error
 
 
-def test_I53_agent_deactivating_treats_None_return_as_success():
+def test_I53_agent_deactivating_treats_None_return_as_success(caplog):
     """Legacy brokers (EmptyBroker) return None from stop(); the
     observation path treats None as success (only False triggers
     the WARNING)."""
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, '_Agent__deactivating'))
-    # The guard is `stopped is False` (not `not stopped`) so None
-    # falls through as success.
-    assert 'stopped is False' in src
-    # Sanity: not the truthy shortcut.
-    assert 'if not stopped' not in src
+    for broker in (EmptyBroker(notifier=MagicMock(name='notifier')),
+                   _StubBroker(result=True)):
+        records, terminated = _deactivate_with(broker, caplog)
+        assert [r for r in records if r.levelno >= logging.WARNING] == []
+        assert terminated
