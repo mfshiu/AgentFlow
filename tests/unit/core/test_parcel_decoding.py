@@ -41,6 +41,9 @@ from tests.fakes.fake_bus import FakeBus
 
 
 
+xfail_review = pytest.mark.xfail(strict=True, reason='issue #15: gaps found in review')
+
+
 def _text(body) -> bytes:
     return TextParcel.HEAD + json.dumps(body).encode()
 
@@ -142,5 +145,47 @@ def test_a_valid_message_after_failures_is_still_handled():
                 pass                                # escaped before #15
         broker.deliver('t', TextParcel('ok').payload())
         assert FakeBus.wait_until(lambda: seen == ['ok'], timeout=2)
+        assert agent.decode_failure_count == 2
     finally:
         agent.terminate()
+
+
+# ==========================================================================
+# C. Hostile envelopes (gaps found in review)
+# ==========================================================================
+
+def _global_ref(module: str, name: str) -> bytes:
+    """A protocol-4 pickle that only references module.name (refused by
+    the restricted unpickler before anything is called)."""
+    def short_or_long(text):
+        raw = text.encode('utf-8')
+        if len(raw) < 256:
+            return b'\x8c' + bytes([len(raw)]) + raw
+        return b'\x8d' + len(raw).to_bytes(8, 'little') + raw
+    return b'\x80\x04' + short_or_long(module) + short_or_long(name) + b'\x93.'
+
+
+@xfail_review
+@pytest.mark.parametrize('payload', [
+    _binary({'version': 1 << 20000, 'content': 'x'}),       # int too large to print
+    TextParcel.HEAD + b'[' * 200000,                          # nesting too deep for json
+    TextParcel.HEAD + b'{"version": ' + b'[' * 200000 + b']' * 200000 + b'}',
+], ids=['huge-int-version', 'deep-json', 'deep-json-version'])
+def test_hostile_envelopes_raise_parcel_decode_error(payload):
+    with pytest.raises(ParcelDecodeError):
+        Parcel.from_payload(payload)
+
+
+@xfail_review
+def test_the_decode_failure_warning_is_escaped_and_bounded(records):
+    agent = Agent('sensor_reader', {})
+    broker = MqttBroker(agent, wait=False)
+    forged = 'x\n2026-10-12 00:00:00,000 CRITICAL agentflow forged line' + 'y' * 100000
+    payload = BinaryParcel.HEAD + _global_ref(forged, 'name')
+    broker._on_message(MagicMock(), None, SimpleNamespace(topic='t', payload=payload))
+
+    assert agent.decode_failure_count == 1
+    [warning] = [r for r in records if r.levelno == logging.WARNING]
+    text = warning.getMessage()
+    assert '\n' not in text
+    assert len(text) < 1000
