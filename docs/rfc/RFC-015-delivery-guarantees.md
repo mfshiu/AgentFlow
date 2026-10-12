@@ -15,7 +15,7 @@
 - **Explicitly out of scope**:
   - Persistent sessions and stable client ids were out of scope at first; issue #17 added them (§6).
   - Bounding the outbound buffer (#35).
-  - Decode-failure observability (#15).
+  - Decode-failure observability (#15; since resolved, see the risk register's R-19).
   - Retained / last-will messages and membership expiry (R-18).
   - The envelope redesign (P2-1).
 

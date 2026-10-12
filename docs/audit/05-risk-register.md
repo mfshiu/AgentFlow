@@ -1348,6 +1348,15 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Schema drift is silent; no error, no upgrade path.
 - **Confidence**: High
 - **Recommended verification test**: Feed a parcel with `version=1` — expect no error.
+- **Status**: **RESOLVED** (2026-10-12, issue #15).
+  - Decoding requires the envelope's `version` to be an int from 1 to `VERSION`, in both encodings. A missing, future, malformed or boolean version raises `ParcelDecodeError` (a `TypeError`). So does a payload without an AgentFlow prefix.
+  - Unknown envelope keys are ignored on purpose: additive optional fields (RFC-014 `correlation_id`, RFC-015 `message_id`) must not break older receivers.
+  - `Agent._on_message` counts undecodable messages (`decode_failure_count`) and logs them at a rate-limited WARNING without a traceback. Before, each one escaped into `MqttBroker._on_message` and was logged with a full traceback.
+  - Still open, for the envelope redesign (roadmap P2-1):
+    - a version in the prefix, checked before the body is parsed or unpickled;
+    - a raw codec for consuming non-AgentFlow MQTT traffic;
+    - a size limit before decoding (#34).
+  - Verification: `tests/unit/core/test_parcel_decoding.py`.
 
 ---
 
@@ -1551,7 +1560,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 **Still open**:
 - Persistent sessions and stable client ids: available since #17 (RFC-015 §6), opt-in. With the default clean session the broker still keeps nothing for a disconnected subscriber.
 - Bounding the outbound buffer (#35).
-- Decode-failure observability (#15).
+- Decode-failure observability: resolved by #15 (see R-19).
 - Duplicates beyond the window, or from senders without ids, still reach handlers, which should stay idempotent.
 
 ---
@@ -1577,7 +1586,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
-| R-19 | Medium | High | Open | Parcel `version` never validated |
+| R-19 | Medium | High | **Resolved 2026-10-12 (#15)**: version validated, undecodable messages counted with rate-limited logging | Parcel `version` never validated |
 | R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
