@@ -21,7 +21,7 @@ from agentflow.core.parcel import Parcel, ensure_size, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
-from agentflow.broker.message_broker import PublishBackpressureError, check_qos
+from agentflow.broker.message_broker import PublishBackpressureError, check_filter, check_qos
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
@@ -1284,6 +1284,7 @@ class Agent(BrokerNotifier):
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
         check_qos(qos)      # issue #4: before anything is registered
+        check_filter(topic)     # issue #53: likewise
         with self._early_lock:
             self._session_topics.add(topic)
 

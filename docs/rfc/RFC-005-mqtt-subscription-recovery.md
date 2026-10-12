@@ -1,6 +1,6 @@
 # RFC-005 — MQTT subscription recovery
 
-- **Status**: **Implemented (2026-07-27)**; §7.3 and §7.5 amended 2026-10-12 (issue #54): the first CONNACK also replays the registry.
+- **Status**: **Implemented (2026-07-27)**; §7.3 and §7.5 amended 2026-10-12 (issue #54): the first CONNACK also replays the registry. §7.12 / §7.13 amended 2026-10-12 (issue #53): subscription results are checked.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-03; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md), [RFC-002](RFC-002-publish-error-propagation.md), [RFC-003](RFC-003-auto-reply-contract.md), [RFC-004](RFC-004-bounded-message-dispatch.md)
 - **Scope**: MqttBroker subscription registry, on_connect / on_disconnect state machine, resubscribe on reconnect, stop-vs-reconnect race resolution
@@ -396,6 +396,20 @@ Yes. Recovery snapshots the registry under the lock, then iterates the snapshot 
 ### 7.12 Individual resubscribe failure handling
 `_recover_subscriptions` wraps each `client.subscribe` call in `try/except Exception`. Failures increment `_resubscribe_error_count` and log at ERROR with topic name and exception detail. **The loop continues with the next topic**; a single failing topic does not abort the recovery of the remaining topics. `BaseException` subclasses propagate (KeyboardInterrupt / SystemExit), consistent with RFC-004 §7.10.
 
+*Amended 2026-10-12 (issue #53): subscription results are checked.*
+- **paho's rc.** A resubscribe whose rc is not `MQTT_ERR_SUCCESS` counts in `_resubscribe_error_count`; it used to count as a success whenever paho did not raise.
+- **SUBACK.** `on_subscribe` is bound, and each SUBSCRIBE's mid is mapped to its topic.
+  - A reason code ≥ 0x80 (an ACL, a resource limit) is logged at WARNING.
+  - Such a topic, or one whose SUBSCRIBE paho raised on or did not send, is counted in `failed_subscriptions` rather than `active_subscriptions`.
+  - It stays in the registry, so the next CONNACK retries it. Only a granted SUBACK clears it (sending again does not), and so does `unsubscribe`.
+  - A SUBACK that arrives before `subscribe()` records its mid is kept until it does.
+  - A SUBACK is matched to its topic only on the connection its SUBSCRIBE went out on, because paho reuses mids. One settled after a connection loss is not recorded; the CONNACK replay sends it again.
+  - A refusal for a topic that was unsubscribed meanwhile, or after `stop()`, is not counted and logged only at DEBUG.
+  - `on_subscribe` never raises, because paho would let the exception end its network thread.
+- **Filters.** `subscribe()` checks the filter with paho's own rules before the registry changes. An invalid filter (`a+/b`, `a/#/b`, an empty one) raises `ValueError` and is never recorded or replayed.
+  - The check is `agentflow.broker.message_broker.check_filter`.
+  - `Agent.subscribe` calls it before it registers the handler or the session topic, so an invalid filter leaves nothing behind.
+
 ### 7.13 Logging + metrics
 - INFO on `subscribe` / `unsubscribe` after stop ("dropping topic X")
 - INFO on `on_connect` after stop ("skipping notifier + recovery")
@@ -404,6 +418,9 @@ Yes. Recovery snapshots the registry under the lock, then iterates the snapshot 
 - INFO on planned disconnect; WARNING on unexpected disconnect (existing WARNING preserved as WARNING for unexpected)
 - Metrics attributes: `resubscribe_success_count`, `resubscribe_error_count`, `recovery_run_count`, `active_subscriptions`, `stopped`, `ever_connected`, plus the existing `_connect_ok`, `_connect_err`
 - `recovery_metrics()` returns a coherent snapshot under `_state_lock`
+- *Amended (issue #53):*
+  - WARNING for a refused SUBACK, and for a SUBSCRIBE paho did not send.
+  - `active_subscriptions` excludes the topics counted in the new `failed_subscriptions`.
 
 ### 7.14 Backward compatibility
 - `MessageBroker` ABC: **unchanged**. `EmptyBroker`, `RedisBroker`, `RosBroker`, `LegacyPerMessageDispatcher`-adjacent stubs: **unchanged**.
