@@ -60,6 +60,16 @@ def _success_info(mid=1):
     return _FakeMessageInfo(rc=MQTT_ERR_SUCCESS, mid=mid)
 
 
+def _spied_message_info(rc=MQTT_ERR_SUCCESS, mid=1):
+    """A MagicMock shaped like paho's MQTTMessageInfo that records any
+    method publish() calls on it (e.g. a blocking wait_for_publish)."""
+    from paho.mqtt.client import MQTTMessageInfo
+    info = MagicMock(spec=MQTTMessageInfo)
+    info.rc = rc
+    info.mid = mid
+    return info
+
+
 def _configure_paho_return(fake_client, message_info):
     fake_client.publish.return_value = message_info
 
@@ -136,23 +146,43 @@ def test_A6_publish_success_returns_original_paho_result_unchanged(broker, fake_
     assert result is info
 
 
-def test_A7_publish_source_still_does_NOT_call_wait_for_publish():
-    """RFC-012 §Out of scope: QoS 1/2 acknowledgment deferred."""
-    src = inspect.getsource(MqttBroker.publish)
-    assert "wait_for_publish" not in src
+def test_A7_publish_source_still_does_NOT_call_wait_for_publish(broker, fake_client):
+    """RFC-012 §Out of scope: QoS 1/2 acknowledgment deferred —
+    publish returns paho's result without waiting on it."""
+    _prime_connected(broker, fake_client)
+    info = _spied_message_info()
+    _configure_paho_return(fake_client, info)
+    assert broker.publish("t", b"p") is info
+    info.wait_for_publish.assert_not_called()
 
 
-def test_A8_publish_source_still_does_NOT_call_is_published():
-    src = inspect.getsource(MqttBroker.publish)
-    assert "is_published" not in src
+def test_A8_publish_source_still_does_NOT_call_is_published(broker, fake_client):
+    _prime_connected(broker, fake_client)
+    info = _spied_message_info()
+    _configure_paho_return(fake_client, info)
+    assert broker.publish("t", b"p") is info
+    info.is_published.assert_not_called()
 
 
-def test_A9_publish_source_NOW_validates_rc_via_normalizer():
+def test_A9_publish_source_NOW_validates_rc_via_normalizer(broker, fake_client):
     """INVERTED: pre-RFC-012 source had no rc check; post-RFC-012
-    delegates to `_normalise_publish_result` which reads .rc."""
-    publish_src = inspect.getsource(MqttBroker.publish)
-    assert "MQTT_ERR_SUCCESS" in publish_src
-    assert "_normalise_publish_result" in publish_src
+    publish reads `.rc` from paho's result. Observed with paho's own
+    MQTTMessageInfo / MQTTErrorCode types (other result shapes:
+    test_B11-test_B23)."""
+    from paho.mqtt.client import MQTTErrorCode, MQTTMessageInfo
+    _prime_connected(broker, fake_client)
+    accepted = MQTTMessageInfo(1)
+    accepted.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+    _configure_paho_return(fake_client, accepted)
+    assert broker.publish("t", b"p") is accepted
+
+    rejected = MQTTMessageInfo(2)
+    rejected.rc = MQTTErrorCode.MQTT_ERR_NOMEM
+    _configure_paho_return(fake_client, rejected)
+    with pytest.raises(MqttPublishError) as exc_info:
+        broker.publish("t", b"p")
+    assert exc_info.value.reason is MqttPublishReason.PAHO_REJECTED
+    assert exc_info.value.rc == MQTT_ERR_NOMEM
 
 
 def test_A10_client_publish_raise_propagates_up(broker, fake_client):
@@ -401,35 +431,37 @@ def test_C28_publish_with_connected_False_uses_gate_not_paho_rc(
     fake_client.publish.assert_not_called()
 
 
-def test_C29_gate_does_NOT_hold_state_lock_across_client_publish_by_source():
+def test_C29_gate_does_NOT_hold_state_lock_across_client_publish_by_source(
+    broker, fake_client,
+):
     """RFC-012 §B modification 2: lock hygiene. State snapshot must
-    be OUTSIDE the state-lock section that wraps client.publish."""
-    src = inspect.getsource(MqttBroker.publish)
-    # Verify shape: 'with self._state_lock:' block precedes but does
-    # NOT contain 'self._client.publish('.
-    lock_pos = src.find("with self._state_lock:")
-    publish_pos = src.find("self._client.publish(")
-    assert lock_pos != -1 and publish_pos != -1
-    # Find end of 'with' block: next non-indented line.
-    # A simpler check: 'self._client.publish(' must not appear inside
-    # the 'with' block. Since 'with' block ends by dedent, and the
-    # publish call is at the same indent level as `with`, we can
-    # verify that 'client.publish' appears AFTER the 'with' block's
-    # last indented line.
-    assert publish_pos > lock_pos
-    # And no 'self._client.publish' inside a `with self._state_lock`
-    # section (check by absence of both on same indent-level line).
-    lock_block = src[lock_pos:publish_pos]
-    assert "self._client.publish" not in lock_block
+    be OUTSIDE the state-lock section that wraps client.publish.
+
+    Observed: while paho's publish() runs, another thread can still
+    read `broker.state`, which takes the state lock."""
+    _prime_connected(broker, fake_client)
+    reads = []
+
+    def paho_publish(*args, **kwargs):
+        reader = threading.Thread(
+            target=lambda: reads.append(broker.state), daemon=True,
+        )
+        reader.start()
+        reader.join(1.0)
+        reads.append('reader done' if not reader.is_alive() else 'reader blocked')
+        return _success_info()
+
+    fake_client.publish.side_effect = paho_publish
+    broker.publish("t", b"p")
+    assert reads == [WorkerState.RUNNING, 'reader done'], (
+        "the state lock is held across client.publish"
+    )
 
 
-def test_C30_gate_is_documented_as_best_effort_snapshot_by_source():
-    """RFC-012 §B modification 2 requires an explicit comment
-    clarifying the gate is NOT a full linearization barrier with stop."""
-    src = inspect.getsource(MqttBroker.publish)
-    lowered = src.lower()
-    assert "pre-call" in lowered or "snapshot" in lowered
-    assert "linearization" in lowered or "concurrent" in lowered
+# test_C30_gate_is_documented_as_best_effort_snapshot_by_source: removed
+# in #74. It pinned the wording of the docstring; doc consistency is not
+# a unit test's job. The best-effort snapshot itself is tested by
+# test_C31 and test_I79.
 
 
 def test_C31_snapshot_race_permitted_publish_may_reach_paho_after_snapshot(
@@ -474,14 +506,23 @@ def test_D32_no_qos_argument_defaults_to_paho_default_qos_0(broker, fake_client)
     assert "qos" not in kwargs
 
 
-def test_D33_wait_for_publish_still_not_called_by_source():
-    src = inspect.getsource(MqttBroker.publish)
-    assert "wait_for_publish" not in src
+@pytest.mark.parametrize("qos", [1, 2])
+def test_D33_wait_for_publish_still_not_called_by_source(broker, fake_client, qos):
+    """Not even at QoS 1 / 2, where paho could wait for the ack."""
+    _prime_connected(broker, fake_client)
+    info = _spied_message_info()
+    _configure_paho_return(fake_client, info)
+    assert broker.publish("t", b"p", qos=qos) is info
+    info.wait_for_publish.assert_not_called()
 
 
-def test_D34_is_published_still_not_called_by_source():
-    src = inspect.getsource(MqttBroker.publish)
-    assert "is_published" not in src
+@pytest.mark.parametrize("qos", [1, 2])
+def test_D34_is_published_still_not_called_by_source(broker, fake_client, qos):
+    _prime_connected(broker, fake_client)
+    info = _spied_message_info()
+    _configure_paho_return(fake_client, info)
+    assert broker.publish("t", b"p", qos=qos) is info
+    info.is_published.assert_not_called()
 
 
 def test_D35_retain_flag_still_not_passed(broker, fake_client):
@@ -579,12 +620,27 @@ def test_E45_rc_failure_and_Exception_both_fast_fail_uniformly(broker, fake_clie
     assert agent.publish("t", "x") is False
 
 
-def test_E46_agent_publish_source_still_fire_and_forget_shape():
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(Agent.publish)
-    assert "try:" in src
-    assert "except Exception" in src
-    assert "_publish_or_raise" in src
+def test_E46_agent_publish_source_still_fire_and_forget_shape(
+    broker, fake_client, monkeypatch,
+):
+    """Agent.publish goes through the strict `_publish_or_raise` path
+    and turns any Exception into False (MqttPublishError and
+    ConnectionError: test_E41, test_E45)."""
+    _prime_connected(broker, fake_client)
+    agent = _make_agent_wired_to(broker)
+    # Any Exception from the broker, not only the expected ones.
+    fake_client.publish.side_effect = LookupError("unexpected paho failure")
+    assert agent.publish("t", "x") is False
+
+    strict_calls = []
+
+    def strict(topic, data=None, *, qos=0):
+        strict_calls.append((topic, data, qos))
+        raise LookupError("strict path failed")
+
+    monkeypatch.setattr(agent, "_publish_or_raise", strict)
+    assert agent.publish("t", "x") is False
+    assert strict_calls == [("t", "x", 0)]
 
 
 def test_E47_publish_sync_finally_registry_cleanup_still_runs_on_MqttPublishError(
@@ -960,13 +1016,34 @@ def test_I77_no_shared_last_publish_error_field_verified_post_failure(broker, fa
     assert not hasattr(broker, 'last_publish_rc')
 
 
-def test_I78_publish_source_has_no_publish_specific_lock(broker):
+def test_I78_publish_source_has_no_publish_specific_lock(broker, fake_client):
     """publish serialisation is delegated to paho's thread-safety;
-    MqttBroker adds no publish-specific lock."""
-    src = inspect.getsource(MqttBroker.publish)
-    # `_state_lock` used only for snapshot (verified in C29); no
-    # other lock acquisition.
-    assert src.count("with self._state_lock:") == 1
+    MqttBroker adds no publish-specific lock. Observed: two publishes
+    are inside paho's publish() at the same time (the state lock
+    around it: test_C29)."""
+    _prime_connected(broker, fake_client)
+    both_inside = threading.Barrier(2, timeout=2.0)
+
+    def paho_publish(*args, **kwargs):
+        both_inside.wait()      # BrokenBarrierError if serialised
+        return _success_info()
+
+    fake_client.publish.side_effect = paho_publish
+    errors = []
+
+    def caller():
+        try:
+            broker.publish("t", b"p")
+        except BaseException as ex:
+            errors.append(ex)
+
+    callers = [threading.Thread(target=caller, daemon=True) for _ in range(2)]
+    for t in callers:
+        t.start()
+    for t in callers:
+        t.join(5.0)
+    assert not any(t.is_alive() for t in callers)
+    assert errors == [], f"publishes were serialised: {errors!r}"
 
 
 def test_I79_publish_during_stop_inline_may_still_reach_paho(broker, fake_client):

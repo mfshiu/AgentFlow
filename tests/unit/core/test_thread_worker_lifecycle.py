@@ -27,7 +27,6 @@ wedged target.
 
 import inspect
 import queue
-import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -292,17 +291,33 @@ def test_B5_start_after_START_FAILED_raises_RuntimeError(monkeypatch):
 
 
 def test_C1_stop_source_uses_bounded_join_with_graceful_timeout_s():
-    """Static evidence: the unbounded `work_thread.join()` from the
-    pre-RFC-009 code is gone; `join(graceful_timeout_s)` is used."""
-    src = inspect.getsource(ThreadWorker.stop)
-    # Must not contain unbounded join.
-    assert '.work_thread.join()' not in src, (
-        "unbounded work_thread.join() should have been replaced"
+    """The unbounded `work_thread.join()` from the pre-RFC-009 code is
+    gone; the join is bounded by `graceful_timeout_s`. Observed on a
+    wedged thread from a probe thread, so an unbounded join fails the
+    test instead of hanging it: stop() waits out the given budget (not
+    a fixed one) and returns."""
+    release = threading.Event()
+    worker = _make_thread_worker(
+        activate=lambda cfg: release.wait(timeout=30.0)
     )
-    # Must contain a bounded join.
-    assert 'join(graceful_timeout_s)' in src, (
-        "expected a bounded join(graceful_timeout_s) call in stop()"
-    )
+    budget_s = 0.6
+    try:
+        worker.start()
+        probe = _StopProbe(worker, graceful_timeout_s=budget_s)
+        t0 = time.monotonic()
+        probe.start()
+        assert probe.returned.wait(budget_s + 2.0), (
+            "stop() did not return: unbounded join"
+        )
+        elapsed = time.monotonic() - t0
+        assert probe.result is False
+        # Well below a fixed 5 s budget, and below the probe's own wait.
+        assert budget_s - 0.1 <= elapsed < budget_s + 1.2, (
+            f"stop() returned after {elapsed:.2f}s with a {budget_s}s budget"
+        )
+    finally:
+        release.set()
+        worker.stop(graceful_timeout_s=2.0)
     # signature carries the timeout with the expected default.
     sig = inspect.signature(ThreadWorker.stop)
     assert 'graceful_timeout_s' in sig.parameters
@@ -488,16 +503,37 @@ def test_E1_concurrent_stop_sends_terminate_exactly_once_via_state_lock():
 def test_E2_concurrent_waiter_uses_bounded_event_wait_by_source_inspection():
     """RFC-009 §E: waiter path must NOT use `.wait()` without a
     timeout. The bounded margin is graceful_timeout_s + a small
-    coordination margin."""
-    src = inspect.getsource(ThreadWorker.stop)
-    # No bare `_stop_complete_event.wait()`.
-    assert '_stop_complete_event.wait()' not in src, (
-        "waiter must not perform an unbounded event.wait()"
+    coordination margin.
+
+    Observed like test_E3 (a completion that never comes), but from a
+    probe thread, so an unbounded wait fails the test instead of
+    hanging it."""
+    release = threading.Event()
+    worker = _make_thread_worker(
+        activate=lambda cfg: release.wait(timeout=30.0)
     )
-    # Some form of `_stop_complete_event.wait(...)` must exist.
-    assert re.search(r'_stop_complete_event\.wait\(\s*\S', src), (
-        "expected a bounded _stop_complete_event.wait(<timeout>) call"
-    )
+    try:
+        worker.start()
+        # Another caller entered STOPPING and never signalled completion.
+        with worker._state_lock:
+            worker._state = WorkerState.STOPPING
+            worker._stop_complete_event.clear()
+
+        probe = _StopProbe(worker, graceful_timeout_s=0.2)
+        probe.start()
+        assert probe.returned.wait(2.0), (
+            "waiter performed an unbounded wait on the completion event"
+        )
+        assert probe.raised is None
+        assert probe.result is False    # the thread is still alive
+    finally:
+        # Release a waiter that did block, then let a retry reclaim
+        # the wedged thread.
+        worker._stop_complete_event.set()
+        with worker._state_lock:
+            worker._state = WorkerState.STOP_TIMEOUT
+        release.set()
+        worker.stop(graceful_timeout_s=2.0)
 
 
 def test_E3_waiter_returns_bounded_when_completion_event_never_fires():
@@ -688,13 +724,24 @@ def test_F2_agent_terminate_returns_bounded_when_handler_wedges(monkeypatch):
 
 
 def test_F3_agent_terminate_dispatcher_stop_still_precedes_worker_stop_by_source_inspection():
-    """RFC-009 §7.16: ordering preserved."""
-    src = inspect.getsource(Agent.terminate)
-    idx_dispatcher = src.find('self._dispatcher.stop')
-    idx_worker = src.find('self._agent_worker.stop')
-    assert idx_dispatcher != -1
-    assert idx_worker != -1
-    assert idx_dispatcher < idx_worker
+    """RFC-009 §7.16: ordering preserved. Observed with a recording
+    dispatcher and worker."""
+    order = []
+
+    class _Dispatcher:
+        def stop(self):
+            order.append('dispatcher')
+
+    class _Worker:
+        def stop(self):
+            order.append('worker')
+            return True
+
+    agent = Agent(name='terminate_order', agent_config={})
+    agent._dispatcher = _Dispatcher()
+    agent._agent_worker = _Worker()
+    agent.terminate()
+    assert order == ['dispatcher', 'worker']
 
 
 def test_F4_agent_terminate_never_raises_when_worker_stop_returns_False(monkeypatch):
@@ -790,16 +837,37 @@ def test_H2_activate_Exception_captured_into_last_exception_state_FAILED():
     assert str(worker.last_exception) == "boom"
 
 
-def test_H3_run_target_catches_Exception_only_not_BaseException_by_source_inspection():
-    """Item #15: safe source inspection. The wrapper must catch
-    Exception explicitly; it must not use bare `except:` and must
-    not catch BaseException."""
-    src = inspect.getsource(ThreadWorker._run_target)
-    assert 'except Exception' in src
-    assert 'except BaseException' not in src
-    assert not re.search(r'except\s*:\s*$', src, flags=re.MULTILINE), (
-        "bare 'except:' would sweep BaseException too"
+def test_H3_run_target_catches_Exception_only_not_BaseException_by_source_inspection(
+    monkeypatch,
+):
+    """Item #15. The wrapper must catch Exception explicitly (test_H2);
+    it must not use bare `except:` and must not catch BaseException.
+
+    Observed: a BaseException from `_activate` escapes the worker
+    thread (it reaches threading.excepthook), is not captured into
+    `last_exception`, and the worker is not marked FAILED; a later
+    stop() reaches STOPPED (RFC-009 §7.11)."""
+    class _Escape(BaseException):
+        pass
+
+    def _activate(cfg):
+        raise _Escape("not an Exception")
+
+    escaped = []
+    monkeypatch.setattr(
+        threading, 'excepthook', lambda args: escaped.append(args.exc_type),
     )
+    worker = _make_thread_worker(activate=_activate)
+    worker.start()
+    worker.work_thread.join(2.0)
+    assert not worker.work_thread.is_alive()
+    assert escaped == [_Escape], (
+        "BaseException was swallowed by the wrapper"
+    )
+    assert worker.last_exception is None
+    assert worker.state is not WorkerState.FAILED
+    assert worker.stop(graceful_timeout_s=1.0) is True
+    assert worker.state is WorkerState.STOPPED
 
 
 def test_H4_stop_from_FAILED_state_returns_True_no_join(monkeypatch):

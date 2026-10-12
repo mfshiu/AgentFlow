@@ -31,12 +31,21 @@ import os
 import subprocess
 import sys
 import tempfile
-import textwrap
 import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import pytest
+
+from tests.helpers.source_checks import (
+    daemon_settings,
+    identifiers,
+    imported_modules,
+    method_calls,
+    os_exit_references,
+    parse_source,
+    string_literals,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -246,20 +255,51 @@ def test_B10_threadworker_never_started_process_exits():
     assert res.markers.get("STATE") == "new"
 
 
+def _start_from_daemon_thread(worker) -> None:
+    """Call `worker.start()` from a daemon thread. A thread created
+    without an explicit daemon flag inherits its creator's, so this
+    tells an explicit `daemon=False` apart from the inherited default
+    (which is also False when started from the main thread)."""
+    errors = []
+
+    def _run():
+        try:
+            worker.start()
+        except BaseException as ex:
+            errors.append(ex)
+
+    starter = threading.Thread(target=_run, daemon=True, name="DaemonStarter")
+    starter.start()
+    starter.join(5.0)
+    assert not starter.is_alive(), "worker.start() did not return"
+    assert not errors, f"worker.start() raised: {errors!r}"
+
+
 def test_B12_threadworker_source_hardcodes_daemon_False():
-    """Baseline source pin: ThreadWorker.start builds its work_thread
-    with `daemon=False`. This is the root of R-10.5."""
-    from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker.start)
-    assert "daemon=False" in src
+    """Baseline pin: ThreadWorker.start builds its work_thread with
+    `daemon=False`. This is the root of R-10.5.
+
+    Observed through the RFC-013 `thread_daemon` property, with the
+    worker started from a daemon thread so that an inherited flag
+    would read True."""
+    worker = _ThreadWorker(_IProcInit(_cooperative_activate))
+    _start_from_daemon_thread(worker)
+    try:
+        assert worker.thread_alive is True
+        assert worker.thread_daemon is False
+    finally:
+        assert worker.stop(graceful_timeout_s=2.0) is True
 
 
 def test_B13_processworker_source_hardcodes_daemon_False_too():
     """ProcessWorker also uses daemon=False for its Process, but has
-    hard containment (SIGTERM/SIGKILL) that ThreadWorker lacks."""
+    hard containment (SIGTERM/SIGKILL) that ThreadWorker lacks.
+
+    The flag of a live child is checked by test_process_worker_lifecycle
+    ::test_start_child_process_daemon_is_false; this pins (on the AST)
+    that start() sets it explicitly rather than inheriting it."""
     from agentflow.core.agent_worker import ProcessWorker
-    src = inspect.getsource(ProcessWorker.start)
-    assert "daemon=False" in src
+    assert daemon_settings(ProcessWorker.start) == [False]
 
 
 # ===========================================================================
@@ -323,18 +363,38 @@ def test_C21_C22_wedged_release_and_retry_stop_converges_to_STOPPED():
 # ===========================================================================
 
 
-def test_D24_source_broker_start_bounded_but_worker_thread_still_non_daemon():
+def _record_calling_thread(mock_call) -> list:
+    """Make a fake paho method record the thread that calls it."""
+    threads = []
+    mock_call.side_effect = (
+        lambda *args, **kwargs: threads.append(threading.current_thread())
+    )
+    return threads
+
+
+def test_D24_source_broker_start_bounded_but_worker_thread_still_non_daemon(
+    broker, fake_client,
+):
     """RFC-011 bounded MqttBroker.start — the STARTUP HELPER is
     daemon=True; but Agent's worker thread waiting on broker.start
-    remains daemon=False (RFC-009 §7.13). Verified via source."""
-    from agentflow.broker.mqtt_broker import MqttBroker
-    from agentflow.core.agent_worker import ThreadWorker
-    start_src = inspect.getsource(MqttBroker.start)
+    remains daemon=False (RFC-009 §7.13).
+
+    Observed at runtime: the thread that runs paho's connect() is the
+    startup helper (started here from the non-daemon main thread, so
+    an inherited flag would read False)."""
+    connect_threads = _record_calling_thread(fake_client.connect)
+    assert broker.start({}) is True
     # RFC-011 startup helper is daemonised.
-    assert "daemon=True" in start_src
+    assert len(connect_threads) == 1
+    assert connect_threads[0] is not threading.current_thread()
+    assert connect_threads[0].daemon is True
     # But the ThreadWorker's OUTER worker thread is not.
-    tw_src = inspect.getsource(ThreadWorker.start)
-    assert "daemon=False" in tw_src
+    worker = _ThreadWorker(_IProcInit(_cooperative_activate))
+    _start_from_daemon_thread(worker)
+    try:
+        assert worker.thread_daemon is False
+    finally:
+        assert worker.stop(graceful_timeout_s=2.0) is True
 
 
 def test_D25_startup_helper_daemon_True_does_not_block_exit_alone():
@@ -346,23 +406,35 @@ def test_D25_startup_helper_daemon_True_does_not_block_exit_alone():
     assert res.markers.get("DAEMON") == "True"
 
 
-def test_E31_source_broker_stop_bounded_but_worker_still_non_daemon():
-    """Same source-shape as D.24 — RFC-010's stop helper daemon=True,
-    worker thread daemon=False."""
-    from agentflow.broker.mqtt_broker import MqttBroker
-    stop_src = inspect.getsource(MqttBroker.stop)
-    # RFC-010 stop-helper daemonised (via _run_stop_helper call
-    # which uses daemon=True; check the caller string).
-    assert "daemon=True" in stop_src
+def test_E31_source_broker_stop_bounded_but_worker_still_non_daemon(
+    broker, fake_client,
+):
+    """Same shape as D.24 — RFC-010's stop helper daemon=True, worker
+    thread daemon=False (the latter: test_D24 / test_B12).
+
+    Observed at runtime: the thread that runs paho's disconnect() is
+    the stop helper."""
+    broker._on_connect(
+        client=fake_client, userdata=None, flags={},
+        reasonCode=0, properties=None,
+    )
+    disconnect_threads = _record_calling_thread(fake_client.disconnect)
+    assert broker.stop(graceful_timeout_s=2.0) is True
+    # RFC-010 stop helper daemonised.
+    assert len(disconnect_threads) == 1
+    assert disconnect_threads[0] is not threading.current_thread()
+    assert disconnect_threads[0].daemon is True
 
 
 def test_E35_root_cause_is_worker_thread_daemon_False_source_pinned():
-    """The precise line that causes R-10.5. Any change to this line
-    is a load-bearing change and requires updating RFC-009 §7.13."""
+    """The precise setting that causes R-10.5. Any change to it is a
+    load-bearing change and requires updating RFC-009 §7.13.
+
+    Pinned on the AST, so formatting and the comment next to it do
+    not matter: the only daemon flag start() sets is the literal
+    False. The runtime value is checked by test_B12."""
     from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker.start)
-    # Ensure the exact string still present.
-    assert "daemon=False,       # RFC-009 §7.13" in src
+    assert daemon_settings(ThreadWorker.start) == [False]
 
 
 # ===========================================================================
@@ -392,13 +464,57 @@ def test_F43_processworker_exitcode_observable_source_pin():
     assert not hasattr(ThreadWorker, "exitcode")
 
 
-def test_F44_processworker_has_terminate_kill_containment_source_pin():
+class _StubbornProcess:
+    """Stands in for a ProcessWorker's child: never spawns, ignores
+    the cooperative 'terminate' message and SIGTERM, and only dies on
+    kill(). Records the containment calls it receives."""
+
+    def __init__(self, target=None, args=(), daemon=None, **kwargs):
+        self.daemon = daemon
+        self.calls = []
+        self.pid = 4242
+        self.exitcode = None
+        self._alive = False
+
+    def start(self):
+        self._alive = True
+
+    def is_alive(self):
+        return self._alive
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def kill(self):
+        self.calls.append("kill")
+        self._alive = False
+        self.exitcode = -9
+
+
+def test_F44_processworker_has_terminate_kill_containment_source_pin(monkeypatch):
     """RFC-008 §D escalation ladder: cooperative → SIGTERM → SIGKILL.
-    Only ProcessWorker can force-reclaim a wedged worker."""
-    from agentflow.core.agent_worker import ProcessWorker
-    src = inspect.getsource(ProcessWorker.stop)
-    assert "terminate()" in src
-    assert "kill()" in src
+    Only ProcessWorker can force-reclaim a wedged worker.
+
+    Observed with a stand-in child that ignores the terminate message
+    and SIGTERM: stop() must escalate to terminate(), then kill(), and
+    report the killed child's exit code. (A real child cannot ignore
+    terminate() on Windows, so the spawn-based escalation tests in
+    test_process_worker_lifecycle.py reach kill() on POSIX only.)"""
+    from agentflow.core import agent_worker
+    monkeypatch.setattr(agent_worker, "_WorkerProcess", _StubbornProcess)
+    worker = agent_worker.ProcessWorker(_IProcInit(_cooperative_activate))
+    worker.start()
+    child = worker.work_process
+    exitcode = worker.stop(
+        graceful_timeout_s=0.05, terminate_timeout_s=0.05, kill_timeout_s=0.05,
+    )
+    assert child.calls == ["terminate", "kill"]
+    assert exitcode == -9
+    assert not child.is_alive()
+    assert worker.state is _WorkerState.STOPPED
 
 
 def test_F45_threadworker_has_no_hard_containment_source_pin():
@@ -406,26 +522,27 @@ def test_F45_threadworker_has_no_hard_containment_source_pin():
     threads have no safe cancellation primitive. RFC-009 §5 Option E
     rejected ctypes-based cancellation.
 
-    Source-pin approach: ThreadWorker's module MUST NOT import
-    ctypes / use `_async_raise` / call `.terminate()` or `.kill()`
-    on a thread object. ProcessWorker's calls to
-    `self.work_process.terminate()` are OK — that's the contrast."""
+    Pinned on the AST: ThreadWorker's module MUST NOT import ctypes /
+    reference `PyThreadState_SetAsyncExc` or `_async_raise`, and
+    ThreadWorker MUST NOT call `.terminate()` or `.kill()` on anything.
+    ProcessWorker's calls to `proc.terminate()` are OK — that's the
+    contrast. (The module's comments name `ctypes` as the rejected
+    option; comments and docstrings are not code, so they don't count.)"""
     from agentflow.core import agent_worker as mod
-    # No ctypes-based thread cancellation. Check IMPORTS and CALL
-    # sites, not string presence (the module has explanatory
-    # comments that mention `ctypes` as the rejected option).
     assert not hasattr(mod, "ctypes"), (
         "ctypes must not be imported into agent_worker"
     )
-    module_src = inspect.getsource(mod)
-    assert "PyThreadState_SetAsyncExc" not in module_src, (
-        "async-exception injection primitive must not be referenced"
+    ctypes_imports = [m for m in imported_modules(mod)
+                      if m.split(".")[0] == "ctypes"]
+    assert ctypes_imports == [], (
+        "ctypes must not be imported into agent_worker, not even locally"
     )
-    # ThreadWorker.stop specifically does not have `work_thread.terminate`
-    # / `work_thread.kill` (Thread has no such methods anyway).
-    stop_src = inspect.getsource(mod.ThreadWorker.stop)
-    assert "work_thread.terminate" not in stop_src
-    assert "work_thread.kill" not in stop_src
+    injection = {"PyThreadState_SetAsyncExc", "_async_raise"} & identifiers(mod)
+    assert not injection, (
+        f"async-exception injection primitive must not be referenced: {injection}"
+    )
+    # Thread has no terminate / kill methods anyway.
+    assert method_calls(mod.ThreadWorker, {"terminate", "kill"}) == []
 
 
 # ===========================================================================
@@ -474,28 +591,28 @@ def test_G48_G49_daemon_change_would_break_broker_cleanup_semantics():
     'visible hang' for 'silent mid-__deactivating corruption'.
 
     Cross-reference: RFC-009 §5 Option C rejected precisely because
-    __deactivating's broker.stop() must complete for graceful teardown."""
-    from agentflow.core.agent import Agent
-    deact_src = inspect.getsource(getattr(Agent, "_Agent__deactivating"))
-    # __deactivating calls broker.stop() which needs the worker
-    # thread alive to complete.
-    assert "self._broker.stop" in deact_src
-    # RFC-009 doc explicitly states the rejection.
-    rfc_path = _REPO_ROOT / "docs" / "rfc" / "RFC-009-thread-worker-lifecycle.md"
-    if rfc_path.exists():
-        text = rfc_path.read_text(encoding='utf-8')
-        # Look for either the option-C rejection or the daemon-policy
-        # discussion (Option §5 C or §7.13).
-        assert "daemon=True" in text or "Option C" in text
+    __deactivating's broker.stop() must complete for graceful teardown.
+    (The RFC text is no longer read: doc consistency is not a unit
+    test's job.)"""
+    stop_threads = []
+
+    class _RecordingBroker:
+        def stop(self):
+            stop_threads.append(threading.current_thread())
+            return True
+
+    agent = _Agent(name="g48_deactivating", agent_config={})
+    agent._broker = _RecordingBroker()
+    agent._Agent__deactivating()
+    # __deactivating calls broker.stop() synchronously, on the thread
+    # that deactivates (the worker thread), so it needs that thread
+    # alive to complete.
+    assert stop_threads == [threading.current_thread()]
 
 
-def test_G52_daemon_change_would_be_load_bearing_and_needs_rfc():
-    """Any change to ThreadWorker's daemon flag would be a breaking
-    lifecycle-contract change. Confirmed by RFC-009 §7.13 explicit
-    decision."""
-    from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker.start)
-    assert "RFC-009 §7.13" in src
+# test_G52_daemon_change_would_be_load_bearing_and_needs_rfc: removed in
+# #74. It only pinned the "RFC-009 §7.13" comment next to the flag; the
+# flag itself is pinned by test_B12 (runtime) and test_E35 (AST).
 
 
 # ===========================================================================
@@ -521,13 +638,43 @@ def test_H54_parent_terminate_reclaims_child_bounded():
     # If we got here, the finally block reclaimed the child.
 
 
-def test_H55_kill_fallback_when_terminate_ignored():
+def test_H55_kill_fallback_when_terminate_ignored(monkeypatch):
     """The `_run_case` harness escalates terminate → kill if
-    terminate doesn't take. Verify by source-inspecting the harness
-    itself (this test module)."""
-    src = inspect.getsource(_run_case)
-    assert "terminate()" in src
-    assert "kill()" in src
+    terminate doesn't take. Verified with a stand-in child that
+    ignores terminate() (a real child on Windows cannot)."""
+    children = []
+
+    class _StubbornChild:
+        def __init__(self, *args, **kwargs):
+            self.calls = []
+            self.returncode = None
+            children.append(self)
+
+        def communicate(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            return "", ""
+
+        def terminate(self):
+            self.calls.append("terminate")
+
+        def kill(self):
+            self.calls.append("kill")
+            self.returncode = -9
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(subprocess, "Popen", _StubbornChild)
+    res = _run_case("baseline_non_daemon_wedged", timeout=0.01)
+    assert res.exited is False
+    assert len(children) == 1
+    assert children[0].calls == ["terminate", "kill"]
+    # Reclaimed by the escalation itself, not by the final safety net.
+    assert res.returncode == -9
 
 
 def test_H57_no_UNRECOVERABLE_state_yet_source_pin():
@@ -565,11 +712,11 @@ def test_I61_threadworker_constructor_has_no_daemon_kwarg():
 
 
 def test_I62_threadworker_start_source_hardcodes_daemon_False():
-    """Precise pin per H.62 requirement."""
+    """Precise pin per H.62 requirement: the only daemon flag
+    ThreadWorker.start sets is the literal False (AST, so formatting
+    and comments do not matter; the runtime value: test_B12)."""
     from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker.start)
-    # The literal `daemon=False` line.
-    assert "daemon=False" in src
+    assert daemon_settings(ThreadWorker.start) == [False]
 
 
 def test_I63_public_worker_type_selection_via_config_key():
@@ -577,42 +724,66 @@ def test_I63_public_worker_type_selection_via_config_key():
     or `Agent.start_thread` / `.start_process`."""
     from agentflow.core import config
     from agentflow.core.agent import Agent
+    from agentflow.core.agent_worker import ProcessWorker, ThreadWorker
     assert hasattr(config, "CONCURRENCY_TYPE")
     assert hasattr(Agent, "start_thread")
     assert hasattr(Agent, "start_process")
-    # And __create_worker dispatches on the config key.
-    src = inspect.getsource(getattr(Agent, "_Agent__create_worker"))
-    assert "CONCURRENCY_TYPE" in src
-    assert "process" in src
+    # And the worker factory dispatches on the config key (building a
+    # worker starts nothing).
+    for mode, expected in (("process", ProcessWorker), ("thread", ThreadWorker)):
+        agent = Agent(name=f"i63_{mode}",
+                      agent_config={config.CONCURRENCY_TYPE: mode})
+        assert type(agent._get_worker()) is expected
 
 
-def test_I64_start_thread_vs_start_process_source_symmetric():
+def test_I64_start_thread_vs_start_process_source_symmetric(monkeypatch):
+    """Both flip CONCURRENCY_TYPE and delegate to start()."""
+    from agentflow.core import config
     from agentflow.core.agent import Agent
-    src_th = inspect.getsource(Agent.start_thread)
-    src_pr = inspect.getsource(Agent.start_process)
-    # Both flip CONCURRENCY_TYPE and delegate to start().
-    for src in (src_th, src_pr):
-        assert "CONCURRENCY_TYPE" in src
-        assert "self.start()" in src
+    for method, mode, other in (("start_thread", "thread", "process"),
+                                ("start_process", "process", "thread")):
+        agent = Agent(name=f"i64_{mode}",
+                      agent_config={config.CONCURRENCY_TYPE: other})
+        seen_modes = []
+        monkeypatch.setattr(
+            agent, "start",
+            lambda agent=agent: seen_modes.append(
+                agent.config[config.CONCURRENCY_TYPE]),
+        )
+        getattr(agent, method)()
+        assert seen_modes == [mode]
 
 
 def test_I65_no_auto_fallback_from_ThreadWorker_to_ProcessWorker():
-    """No policy that switches worker type based on task risk."""
+    """No policy that switches worker type based on task risk: the
+    worker is exactly the configured type, whatever the agent holds
+    (here an attribute that cannot be pickled to a child process), and
+    the factory's code names no fallback / auto-detect concept."""
+    from agentflow.core import config
     from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, "_Agent__create_worker"))
-    # Simple `if 'process' == ... else` — no risk-based routing.
-    assert "ProcessWorker" in src
-    assert "ThreadWorker" in src
-    # No fallback / auto-detect keywords.
+    from agentflow.core.agent_worker import ProcessWorker, ThreadWorker
+    for mode, expected in (("process", ProcessWorker), ("thread", ThreadWorker)):
+        agent = Agent(name=f"i65_{mode}",
+                      agent_config={config.CONCURRENCY_TYPE: mode})
+        agent.unpicklable = threading.Lock()
+        assert type(agent._get_worker()) is expected
+    create_worker = getattr(Agent, "_Agent__create_worker")
+    names = identifiers(create_worker) | string_literals(create_worker)
     for keyword in ("fallback", "auto_select", "risk", "heuristic"):
-        assert keyword not in src
+        assert not [n for n in names if keyword in n.lower()], keyword
 
 
 def test_I66_no_supervisor_callback_source_pin():
+    """No supervisor callback hook: neither the Agent class nor an
+    instance has one, and no code in Agent names one (identifier or
+    config-key literal; comments and docstrings are not code)."""
     from agentflow.core.agent import Agent
-    src = inspect.getsource(Agent)
+    agent = Agent(name="i66", agent_config={})
+    names = identifiers(Agent) | string_literals(Agent)
     for keyword in ("supervisor_callback", "on_worker_hang", "on_timeout"):
-        assert keyword not in src
+        assert not hasattr(Agent, keyword)
+        assert not hasattr(agent, keyword)
+        assert keyword not in names
 
 
 def test_I67_no_restart_policy_source_pin():
@@ -620,11 +791,12 @@ def test_I67_no_restart_policy_source_pin():
     supported."""
     from agentflow.core.agent_worker import ProcessWorker, ThreadWorker
     for cls in (ProcessWorker, ThreadWorker):
-        assert not hasattr(cls, "restart")
-        src = inspect.getsource(cls)
+        worker = cls(_IProcInit(_cooperative_activate))
         # No restart method, no auto-restart hook.
-        assert "def restart" not in src
-        assert "auto_restart" not in src
+        for name in ("restart", "auto_restart"):
+            assert not hasattr(cls, name)
+            assert not hasattr(worker, name)
+        assert "auto_restart" not in identifiers(cls) | string_literals(cls)
 
 
 def test_I68_no_healthcheck_or_heartbeat_source_pin():
@@ -636,10 +808,16 @@ def test_I68_no_healthcheck_or_heartbeat_source_pin():
 
 
 def test_I69_no_fatal_shutdown_hook_source_pin():
+    """No fatal-shutdown hook and no hard exit anywhere in Agent
+    (AST: identifiers, config-key literals and os._exit references)."""
     from agentflow.core.agent import Agent
-    src = inspect.getsource(Agent)
-    for keyword in ("fatal_shutdown", "os._exit", "force_exit"):
-        assert keyword not in src
+    agent = Agent(name="i69", agent_config={})
+    names = identifiers(Agent) | string_literals(Agent)
+    for keyword in ("fatal_shutdown", "force_exit"):
+        assert not hasattr(Agent, keyword)
+        assert not hasattr(agent, keyword)
+        assert keyword not in names
+    assert os_exit_references(Agent) == []
 
 
 def test_I70_no_CLI_service_runner_in_tree_source_pin():
@@ -1087,8 +1265,8 @@ def test_L96_terminate_diagnostics_property_raising_does_not_break_terminate(cap
 
 
 def test_L97_terminate_source_does_not_call_os_exit():
-    src = inspect.getsource(_Agent.terminate)
-    assert "os._exit" not in src
+    """AST: no reference to os._exit in terminate, however spelled."""
+    assert os_exit_references(_Agent.terminate) == []
 
 
 def test_L98_terminate_source_does_not_raise_from_diagnostics_path():
@@ -1100,35 +1278,31 @@ def test_L98_terminate_source_does_not_raise_from_diagnostics_path():
     block legitimately contains the word "raise" ("never-raise
     contract", "a property getter raised"), so a text search reports
     false positives. Only an actual `ast.Raise` node is a violation.
+    The branch is found by its shape (`if <x> is False:`), so renaming
+    the local that holds the stop result does not matter.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(_Agent.terminate)))
+    tree = parse_source(_Agent.terminate)
 
-    # Locate `if stop_result is False:` — the diagnostics branch.
-    diagnostics_branch = None
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        test = node.test
-        if (
-            isinstance(test, ast.Compare)
-            and isinstance(test.left, ast.Name)
-            and test.left.id == "stop_result"
-            and len(test.ops) == 1
-            and isinstance(test.ops[0], ast.Is)
-            and isinstance(test.comparators[0], ast.Constant)
-            and test.comparators[0].value is False
-        ):
-            diagnostics_branch = node
-            break
+    # Locate `if <stop result> is False:` — the diagnostics branch.
+    diagnostics_branches = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Is)
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value is False
+    ]
 
-    assert diagnostics_branch is not None, (
-        "could not locate the `if stop_result is False:` diagnostics "
-        "branch in Agent.terminate — the RFC-013 source pin needs "
-        "updating to match the current structure"
+    assert diagnostics_branches, (
+        "could not locate the `if <stop result> is False:` diagnostics "
+        "branch in Agent.terminate — the RFC-013 pin needs updating to "
+        "match the current structure"
     )
 
     raises = [
-        n for n in ast.walk(diagnostics_branch) if isinstance(n, ast.Raise)
+        n for branch in diagnostics_branches
+        for n in ast.walk(branch) if isinstance(n, ast.Raise)
     ]
     assert not raises, (
         "the requires-restart branch of terminate must never raise; "
@@ -1143,10 +1317,10 @@ def test_L98_terminate_source_does_not_raise_from_diagnostics_path():
 
 
 def test_M99_threadworker_start_source_preserves_daemon_False_marker():
-    """RFC-013 §Acceptance #3."""
+    """RFC-013 §Acceptance #3: start() keeps the literal daemon=False
+    (AST; the comment next to it is prose and no longer pinned)."""
     from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker.start)
-    assert "daemon=False,       # RFC-009 §7.13" in src
+    assert daemon_settings(ThreadWorker.start) == [False]
 
 
 def test_M100_workerstate_has_no_UNRECOVERABLE():
@@ -1156,17 +1330,17 @@ def test_M100_workerstate_has_no_UNRECOVERABLE():
 
 
 def test_M101_agentflow_core_does_not_call_os_exit():
-    """RFC-013 §7.9 policy."""
+    """RFC-013 §7.9 policy (AST: any reference to os._exit)."""
     from agentflow.core import agent, agent_worker
     for mod in (agent, agent_worker):
-        src = inspect.getsource(mod)
-        assert "os._exit" not in src
+        assert os_exit_references(mod) == [], mod.__name__
 
 
 def test_M102_agentflow_core_does_not_use_ctypes_async_cancellation():
     from agentflow.core import agent, agent_worker
     for mod in (agent, agent_worker):
-        # Not imported into the module namespace.
+        # Not imported into the module namespace, nor anywhere in it.
         assert not hasattr(mod, "ctypes")
-        src = inspect.getsource(mod)
-        assert "PyThreadState_SetAsyncExc" not in src
+        assert not [m for m in imported_modules(mod)
+                    if m.split(".")[0] == "ctypes"], mod.__name__
+        assert "PyThreadState_SetAsyncExc" not in identifiers(mod)
