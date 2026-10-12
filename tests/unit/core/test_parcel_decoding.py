@@ -119,7 +119,8 @@ def test_decode_failures_are_counted_not_logged_with_tracebacks(records):
         broker._on_message(MagicMock(), None,
                            SimpleNamespace(topic='sensor/temp', payload=b'{"temp": 21.5}'))
 
-    assert agent.decode_failure_count == 5
+    # Since issue #34 decoding runs on a dispatcher thread.
+    assert FakeBus.wait_until(lambda: agent.decode_failure_count == 5, timeout=3)
     assert [r for r in records if r.exc_info] == []
     assert [r for r in records if r.levelno >= logging.ERROR] == []
     warnings = [r for r in records if r.levelno == logging.WARNING]
@@ -142,7 +143,7 @@ def test_a_valid_message_after_failures_is_still_handled():
                 pass                                # escaped before #15
         broker.deliver('t', TextParcel('ok').payload())
         assert FakeBus.wait_until(lambda: seen == ['ok'], timeout=2)
-        assert agent.decode_failure_count == 2
+        assert FakeBus.wait_until(lambda: agent.decode_failure_count == 2, timeout=2)
     finally:
         agent.terminate()
 
@@ -179,7 +180,7 @@ def test_the_decode_failure_warning_is_escaped_and_bounded(records):
     payload = BinaryParcel.HEAD + _global_ref(forged, 'name')
     broker._on_message(MagicMock(), None, SimpleNamespace(topic='t', payload=payload))
 
-    assert agent.decode_failure_count == 1
+    assert FakeBus.wait_until(lambda: agent.decode_failure_count == 1, timeout=3)
     [warning] = [r for r in records if r.levelno == logging.WARNING]
     text = warning.getMessage()
     assert '\n' not in text
