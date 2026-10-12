@@ -17,7 +17,7 @@ from typing import Callable, final, Optional
 import uuid
 
 from agentflow.core import holon_auth
-from agentflow.core.parcel import Parcel, parse_pickle_globals
+from agentflow.core.parcel import Parcel, ParcelDecodeError, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -261,6 +261,10 @@ class Agent(BrokerNotifier):
         # first; a redelivered id is dropped (see __seen_before).
         self._recent_message_ids: OrderedDict = OrderedDict()
         self._dedup_lock = threading.Lock()
+        # Issue #15: messages dropped because they were not valid
+        # AgentFlow parcels; see decode_failure_count.
+        self._decode_failures = 0
+        self._decode_lock = threading.Lock()
         # Follow-up of #17: messages with no handler that arrive while
         # lifecycle hooks are still registering handlers are held here
         # (see __await_hook) and released once every awaited hook has
@@ -313,6 +317,7 @@ class Agent(BrokerNotifier):
         '_reply_topics_lock',
         '_recent_message_ids',
         '_dedup_lock',
+        '_decode_lock',
         '_early_lock',
         '_early_messages',
         '_awaiting_hooks',
@@ -396,6 +401,7 @@ class Agent(BrokerNotifier):
         self._reply_topics_lock = threading.RLock()
         self._recent_message_ids = OrderedDict()
         self._dedup_lock = threading.Lock()
+        self._decode_lock = threading.Lock()
         self._early_lock = threading.Lock()
         self._early_messages = deque()
         self._awaiting_hooks = set()
@@ -1686,7 +1692,15 @@ class Agent(BrokerNotifier):
     @final
     def _on_message(self, topic:str, data):
         # logger.debug(self.M(f"topic: {topic}, data: {data}"))
-        pcl = Parcel.from_payload(data, **self._codec_options)
+        try:
+            pcl = Parcel.from_payload(data, **self._codec_options)
+        except ParcelDecodeError as ex:
+            # Issue #15: not a valid AgentFlow parcel (another MQTT
+            # client's JSON, an unsupported version, garbage). Count it
+            # instead of letting it escape to the broker callback, which
+            # logged a full traceback for every such message.
+            self.__count_decode_failure(topic, ex)
+            return
         if pcl.message_id is not None and self.__seen_before(pcl.message_id):
             # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
             # whose acknowledgement was lost across a reconnect.
@@ -1897,6 +1911,27 @@ class Agent(BrokerNotifier):
                 return False
             time.sleep(0.002)
         return True
+
+
+    @property
+    def decode_failure_count(self) -> int:
+        """Issue #15: how many received messages were dropped because
+        they could not be decoded as an AgentFlow Parcel."""
+        with self._decode_lock:
+            return self._decode_failures
+
+
+    def __count_decode_failure(self, topic, ex) -> None:
+        """Issue #15: count an undecodable message and log it at WARNING
+        on the 1st, 2nd, 4th, ... failure and at DEBUG otherwise, without
+        a traceback, so that a stream of foreign or malformed messages
+        cannot flood the log."""
+        with self._decode_lock:
+            self._decode_failures += 1
+            count = self._decode_failures
+        level = logging.WARNING if count & (count - 1) == 0 else logging.DEBUG
+        logger.log(level, self.M(
+            f"Dropped an undecodable message on {topic!r}: {ex} ({count} so far)."))
 
 
     def __seen_before(self, message_id: str) -> bool:

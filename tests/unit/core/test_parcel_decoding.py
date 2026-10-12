@@ -39,7 +39,6 @@ from agentflow.core.parcel import (
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_15 = pytest.mark.xfail(strict=True, reason='issue #15: the envelope is not validated')
 
 
 def _text(body) -> bytes:
@@ -54,7 +53,6 @@ def _binary(body) -> bytes:
 # A. Envelope validation
 # ==========================================================================
 
-@xfail_15
 @pytest.mark.parametrize('encode', [_text, _binary], ids=['text', 'binary'])
 @pytest.mark.parametrize('body', [
     {'version': VERSION + 1, 'content': 'x'},
@@ -73,7 +71,6 @@ def test_an_unsupported_or_missing_version_is_refused(encode, body):
         Parcel.from_payload(encode(body))
 
 
-@xfail_15
 @pytest.mark.parametrize('payload', [b'{"temp": 21.5}', b'plain text', b'', b'\x00\x01'])
 def test_a_payload_without_an_agentflow_prefix_is_refused(payload):
     with pytest.raises(ParcelDecodeError, match='AgentFlow'):
@@ -115,7 +112,6 @@ def records():
     root.setLevel(level)
 
 
-@xfail_15
 def test_decode_failures_are_counted_not_logged_with_tracebacks(records):
     agent = Agent('sensor_reader', {})
     broker = MqttBroker(agent, wait=False)
