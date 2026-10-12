@@ -1352,6 +1352,11 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
   - Decoding requires the envelope's `version` to be an int from 1 to `VERSION`, in both encodings. A missing, future, malformed or boolean version raises `ParcelDecodeError` (a `TypeError`). So does a payload without an AgentFlow prefix.
   - Unknown envelope keys are ignored on purpose: additive optional fields (RFC-014 `correlation_id`, RFC-015 `message_id`) must not break older receivers.
   - `Agent._on_message` counts undecodable messages (`decode_failure_count`) and logs them at a rate-limited WARNING without a traceback. Before, each one escaped into `MqttBroker._on_message` and was logged with a full traceback.
+  - Hostile envelopes stay on that path:
+    - the rejected version is never printed in full, because an int too large to print would make the message itself raise;
+    - deeply nested JSON is a decode failure;
+    - anything else a decoder raises is counted the same way;
+    - the logged reason and topic are escaped and length-capped, so a sender cannot forge or flood log lines.
   - Still open, for the envelope redesign (roadmap P2-1):
     - a version in the prefix, checked before the body is parsed or unpickled;
     - a raw codec for consuming non-AgentFlow MQTT traffic;
