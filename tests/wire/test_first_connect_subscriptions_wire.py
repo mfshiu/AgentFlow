@@ -15,8 +15,6 @@ from tests.fakes.mini_mqtt_server import MiniMqttServer
 
 pytestmark = pytest.mark.wire
 
-xfail_54 = pytest.mark.xfail(strict=True, reason='issue #54: not sent on the first CONNACK')
-
 
 class _Notifier:
     def _on_connect(self):
@@ -34,7 +32,6 @@ def _options(server):
             'reconnect_min_delay': 1, 'reconnect_max_delay': 1}
 
 
-@xfail_54
 def test_a_subscribe_while_start_returned_early_reaches_the_broker():
     server = MiniMqttServer()
     server.connack_delay = 0.5
@@ -49,7 +46,6 @@ def test_a_subscribe_while_start_returned_early_reaches_the_broker():
         server.close()
 
 
-@xfail_54
 def test_a_subscribe_from_another_thread_while_start_waits_reaches_the_broker():
     server = MiniMqttServer()
     server.connack_delay = 0.5

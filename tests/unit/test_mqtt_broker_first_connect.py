@@ -17,9 +17,6 @@ Contracts verified (with the mocked paho Client from tests/conftest.py):
 import pytest
 
 
-xfail_54 = pytest.mark.xfail(strict=True, reason='issue #54: not sent on the first CONNACK')
-
-
 def _fire_connect(broker, fake_client):
     broker._on_connect(client=fake_client, userdata=None, flags={},
                        reasonCode=0, properties=None)
@@ -29,7 +26,6 @@ def _subscribed_topics(fake_client):
     return [c.kwargs['topic'] for c in fake_client.subscribe.call_args_list]
 
 
-@xfail_54
 def test_a_subscribe_before_the_first_connack_is_sent_on_it(broker, fake_client):
     assert broker.start({}) is True                 # wait=False: still STARTING
     broker.subscribe('early/topic', 'str')

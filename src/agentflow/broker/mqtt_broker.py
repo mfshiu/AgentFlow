@@ -396,7 +396,6 @@ class MqttBroker(MessageBroker):
                     self._connect_ok = True
                     self._connack_ok = True
                     self._connect_err = None
-                    is_first = not self._ever_connected
                     self._ever_connected = True
                     self._connected = True
                     # NEW / STARTING → RUNNING; other states leave
@@ -405,8 +404,12 @@ class MqttBroker(MessageBroker):
                     # was before). RUNNING → RUNNING is a no-op.
                     if self._state in (WorkerState.NEW, WorkerState.STARTING):
                         self._state = WorkerState.RUNNING
-                    if not is_first:
-                        snapshot = dict(self._registry)
+                    # Every CONNACK, the first included (issue #54):
+                    # subscribe() only records a topic while not
+                    # connected. Taken with _connected under this lock,
+                    # so each topic is either sent by subscribe() or
+                    # replayed here.
+                    snapshot = dict(self._registry)
             if skip:
                 logger.info(
                     "on_connect(rc=0) after stop; fencing "
@@ -1665,7 +1668,8 @@ class MqttBroker(MessageBroker):
 
     def subscribe(self, topic: str, data_type, *, qos: int = 0):
         # RFC-005 §7.3: desired-state first; only forward when currently
-        # connected. Disconnected-time subscribes rely on the next
+        # connected. Disconnected-time subscribes, including those made
+        # before the first CONNACK (issue #54), rely on the next
         # _on_connect to run recovery from the registry.
         check_qos(qos)      # issue #4
         with self._state_lock:
