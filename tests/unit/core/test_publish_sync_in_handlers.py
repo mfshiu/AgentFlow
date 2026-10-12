@@ -36,8 +36,6 @@ from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_7r = pytest.mark.xfail(strict=True, reason='issue #7 review: fixed in the next commit')
-
 
 def _agent(**dispatch):
     agent = Agent('coordinator', {'dispatch': {'shutdown_timeout_s': 1.0, **dispatch}})
@@ -110,7 +108,6 @@ def test_a_reply_is_delivered_while_the_dispatcher_queue_is_full():
         agent.terminate()
 
 
-@xfail_7r
 def test_a_reply_is_delivered_while_the_byte_budget_is_full():
     agent, broker = _agent(workers=1, max_queued_bytes=4096)
     gate, busy = threading.Event(), threading.Event()
@@ -133,7 +130,6 @@ def test_a_reply_is_delivered_while_the_byte_budget_is_full():
         agent.terminate()
 
 
-@xfail_7r
 def test_a_burst_of_replies_is_not_dropped_with_a_small_queue_capacity():
     agent, broker = _agent(workers=8, queue_capacity=1)
     broker.stop_auto_responding()
