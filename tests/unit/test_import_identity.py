@@ -15,28 +15,37 @@ Contracts verified:
   - Importing a test module leaves PYTHONPATH alone.
 """
 
-import importlib
 import os
 import pathlib
+import runpy
 import sys
 
-import pytest
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+TESTS_DIR = REPO_ROOT / 'tests'
 
 
 def test_test_modules_load_under_the_tests_package_only():
     assert __name__ == 'tests.unit.test_import_identity'
-    assert not [name for name in sys.modules if name.split('.')[0] == REPO_ROOT.name]
+    misnamed = []
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, '__file__', None)
+        if path and pathlib.Path(path).resolve().is_relative_to(TESTS_DIR):
+            if name != 'tests' and not name.startswith('tests.'):
+                misnamed.append(name)
+    assert misnamed == []
 
 
 def test_the_repositorys_parent_directory_is_not_on_sys_path():
-    assert REPO_ROOT.parent not in [pathlib.Path(p or '.').resolve() for p in sys.path]
+    # The working directory is left out: `python -m pytest` run from the
+    # parent puts it there, which is not what this guards against.
+    cwd = pathlib.Path.cwd().resolve()
+    entries = [pathlib.Path(p).resolve() for p in sys.path if p]
+    assert REPO_ROOT.parent not in [p for p in entries if p != cwd]
 
 
-def test_importing_a_test_module_leaves_pythonpath_alone(monkeypatch):
+def test_running_a_test_module_leaves_pythonpath_alone(monkeypatch):
     monkeypatch.setenv('PYTHONPATH', 'src')
-    name = 'tests.unit.core.test_process_worker_lifecycle'
-    monkeypatch.delitem(sys.modules, name, raising=False)   # restored afterwards
-    importlib.import_module(name)
+    # Executed, not imported: no second copy of the module stays loaded.
+    module = TESTS_DIR / 'unit' / 'core' / 'test_process_worker_lifecycle.py'
+    runpy.run_path(str(module), run_name='_issue76_probe')
     assert os.environ['PYTHONPATH'] == 'src'
