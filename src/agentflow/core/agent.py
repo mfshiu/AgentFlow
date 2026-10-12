@@ -65,6 +65,9 @@ _CONTROL_QOS = 1
 # Issue #4: how many recently received message ids an agent remembers to
 # drop redeliveries (QoS 1 resends follow a reconnect closely).
 _DEDUP_WINDOW = 4096
+# Issue #21: how many reply topics publish_sync generated and has left
+# are remembered, so that a reply arriving late on one is dropped.
+_RETIRED_REPLY_TOPICS = 1024
 # Follow-up of #17: at most this many messages with no handler are held
 # while the lifecycle hooks are still registering handlers.
 _EARLY_MESSAGE_LIMIT = 4096
@@ -290,6 +293,11 @@ class Agent(BrokerNotifier):
         # first; a redelivered id is dropped (see __seen_before).
         self._recent_message_ids: OrderedDict = OrderedDict()
         self._dedup_lock = threading.Lock()
+        # Issue #21: reply topics publish_sync generated and has left,
+        # oldest first, and the late replies dropped on them; guarded
+        # by _handlers_lock (see late_reply_count).
+        self._retired_reply_topics: OrderedDict = OrderedDict()
+        self._late_replies = 0
         # Issue #15: messages dropped because they were not valid
         # AgentFlow parcels; see decode_failure_count.
         self._decode_failures = 0
@@ -363,6 +371,7 @@ class Agent(BrokerNotifier):
         '_handlers_lock',
         '_reply_topics_lock',
         '_recent_message_ids',
+        '_retired_reply_topics',
         '_dedup_lock',
         '_decode_lock',
         '_queued_bytes_lock',
@@ -449,6 +458,7 @@ class Agent(BrokerNotifier):
         self._handlers_lock = threading.RLock()
         self._reply_topics_lock = threading.RLock()
         self._recent_message_ids = OrderedDict()
+        self._retired_reply_topics = OrderedDict()
         self._dedup_lock = threading.Lock()
         self._decode_lock = threading.Lock()
         self._queued_bytes = 0
@@ -1201,28 +1211,41 @@ class Agent(BrokerNotifier):
         """Publish a request and wait up to `timeout` seconds for its
         reply, which is returned; raises TimeoutError without one. Safe
         to call from a handler (issue #7): replies have their own lane,
-        so the waiting handler does not starve its reply."""
-        if isinstance(data, Parcel):
-            pcl = data
-            if pcl.topic_return:
-                if topic_wait:
-                    logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{pcl.topic_return}'.")
-            elif topic_wait:
-                pcl.topic_return = topic_wait
-            else:
-                pcl.topic_return = self.__generate_return_topic(topic)
-        else:
-            pcl = Parcel.from_content(data)
-            pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
+        so the waiting handler does not starve its reply.
 
-        # RFC-014 (issue #36): a fresh, unpredictable id per request, set
-        # on a copy so that the caller's Parcel is not modified.
+        Issue #21: a Parcel passed as `data` is not modified. Its
+        topic_return, or else `topic_wait`, names the reply topic; else
+        a fresh one is generated for each call, so a retry with the same
+        Parcel gets a new topic. A reply arriving on a generated topic
+        after the call has returned is dropped and counted
+        (late_reply_count). timeout=None (wait forever) is deprecated."""
+        if timeout is None:
+            warnings.warn(
+                "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
+                "(None will be refused in a future release)",
+                DeprecationWarning, stacklevel=2)
+        # Issue #21: the request is a copy (RFC-014 / #36 sets its
+        # correlation id there too), so the caller's Parcel keeps its
+        # topic_return.
+        request = copy.copy(data) if isinstance(data, Parcel) else Parcel.from_content(data)
+        generated = False
+        if request.topic_return:
+            if topic_wait:
+                logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{request.topic_return}'.")
+        elif topic_wait:
+            request.topic_return = topic_wait
+        else:
+            request.topic_return = self.__generate_return_topic(topic)
+            generated = True
+
+        # RFC-014 (issue #36): a fresh, unpredictable id per request.
         correlation_id = secrets.token_hex(16)
-        request = copy.copy(pcl)
         request.correlation_id = correlation_id
 
-        data_event = Agent.DataEvent(self._get_worker().create_event())
-        reply_topic = pcl.topic_return
+        # Issue #21: a plain threading.Event; the wait never crosses
+        # processes, and asking the worker for one could create it.
+        data_event = Agent.DataEvent()
+        reply_topic = request.topic_return
         router = self.__join_reply_topic(reply_topic, correlation_id, data_event)
 
         try:
@@ -1241,7 +1264,7 @@ class Agent(BrokerNotifier):
                 return reply
             raise TimeoutError(f"No response received within timeout period for topic: {reply_topic}.")
         finally:
-            self.__leave_reply_topic(reply_topic, correlation_id, router)
+            self.__leave_reply_topic(reply_topic, correlation_id, router, retire=generated)
 
 
     def __join_reply_topic(self, reply_topic, correlation_id, waiter) -> _ReplyRouter:
@@ -1287,12 +1310,14 @@ class Agent(BrokerNotifier):
         return router
 
 
-    def __leave_reply_topic(self, reply_topic, correlation_id, router) -> None:
+    def __leave_reply_topic(self, reply_topic, correlation_id, router, retire=False) -> None:
         """Unregister a publish_sync call. The last call to leave removes
         the router and unsubscribes the topic. RFC-006 §7.5 / RFC-007
         §7.8 triple check: only a record that still holds this router
         as a PUBLISH_SYNC handler is removed. Under _reply_topics_lock;
-        the broker is called outside _handlers_lock."""
+        the broker is called outside _handlers_lock. Issue #21: a
+        generated topic (`retire`) is remembered, so that a late reply
+        on it is dropped rather than handed to on_message."""
         with self._reply_topics_lock:
             with self._handlers_lock:
                 empty = router.remove(correlation_id)
@@ -1302,6 +1327,10 @@ class Agent(BrokerNotifier):
                         and record.handler is router)
                 if last:
                     self.__topic_handlers.pop(reply_topic, None)
+                    if retire:
+                        self._retired_reply_topics[reply_topic] = None
+                        if len(self._retired_reply_topics) > _RETIRED_REPLY_TOPICS:
+                            self._retired_reply_topics.popitem(last=False)
             if last and self._broker:
                 try:
                     self._broker.unsubscribe(reply_topic)
@@ -1833,6 +1862,13 @@ class Agent(BrokerNotifier):
         dispatch.max_queued_bytes budget. One the queue cannot take is
         dropped, without decoding unless it is small enough to be
         answered (see __drop)."""
+        late = self.__count_late_reply(topic)
+        if late:
+            # Issue #21: a reply to a publish_sync call that has already
+            # returned, on the topic it generated. Expected after a
+            # timeout; on_message is not the place for it.
+            logger.debug(self.M(f"Dropped a late reply on {topic!r} ({late} so far)."))
+            return
         with self._early_lock:
             if (self._awaiting_hooks and not self.__has_handler(topic)
                     and not self.__subscribed_in_session(topic)):
@@ -2140,6 +2176,25 @@ class Agent(BrokerNotifier):
                 return False
             time.sleep(0.002)
         return True
+
+
+    def __count_late_reply(self, topic) -> int:
+        """Issue #21: if `topic` is a reply topic publish_sync generated
+        and has left, count a late reply and return the count; else 0."""
+        with self._handlers_lock:
+            if topic not in self._retired_reply_topics or topic in self.__topic_handlers:
+                return 0
+            self._late_replies += 1
+            return self._late_replies
+
+
+    @property
+    def late_reply_count(self) -> int:
+        """Issue #21: replies dropped because they arrived on a reply
+        topic publish_sync generated after the call had returned
+        (typically after its timeout)."""
+        with self._handlers_lock:
+            return self._late_replies
 
 
     @property

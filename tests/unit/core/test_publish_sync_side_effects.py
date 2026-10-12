@@ -31,8 +31,6 @@ from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_21 = pytest.mark.xfail(strict=True, reason='issue #21: publish_sync side effects')
-
 
 class Recorder(Agent):
     def __init__(self):
@@ -57,7 +55,6 @@ def _requests(broker, topic='svc'):
     return [Parcel.from_payload(p) for t, p in broker.publish_calls if t == topic]
 
 
-@xfail_21
 def test_the_callers_parcel_is_not_modified(agent_and_broker):
     agent, broker = agent_and_broker
     broker.auto_respond_with('pong')
@@ -68,7 +65,6 @@ def test_the_callers_parcel_is_not_modified(agent_and_broker):
     assert _requests(broker, 'notify')[0].topic_return is None
 
 
-@xfail_21
 def test_a_retry_with_the_same_parcel_gets_a_new_reply_topic(agent_and_broker):
     agent, broker = agent_and_broker
     parcel = Parcel.from_content('q')
@@ -90,7 +86,6 @@ def test_a_topic_wait_or_a_preset_topic_return_is_still_used(agent_and_broker):
     assert preset.topic_return == 'preset/replies'
 
 
-@xfail_21
 def test_publish_sync_does_not_touch_the_worker(agent_and_broker):
     agent, broker = agent_and_broker
     agent._agent_worker = None
@@ -99,7 +94,6 @@ def test_publish_sync_does_not_touch_the_worker(agent_and_broker):
     assert agent._agent_worker is None
 
 
-@xfail_21
 def test_timeout_none_is_deprecated(agent_and_broker):
     agent, broker = agent_and_broker
     broker.auto_respond_with('pong')
@@ -115,7 +109,6 @@ def test_a_positive_timeout_does_not_warn(agent_and_broker):
         agent.publish_sync('svc', 'q', timeout=2)
 
 
-@xfail_21
 def test_a_late_reply_on_a_generated_topic_is_dropped_and_counted(agent_and_broker):
     agent, broker = agent_and_broker
     with pytest.raises(TimeoutError):
