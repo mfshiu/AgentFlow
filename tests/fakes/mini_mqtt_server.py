@@ -19,6 +19,10 @@ Failure injection:
                             immediately without a CONNACK
                             (simulates a broker that is down)
   - connack_rc              return code sent in every CONNACK
+  - stall(index)            stops reading one client connection, so that
+                            its TCP buffers, then the client's own
+                            outgoing queue, fill up (a slow or stuck
+                            link); resume(index) reads it again
 
 All threads are daemon threads; close() tears everything down.
 """
@@ -65,6 +69,8 @@ class MiniMqttServer:
         self.deliver_on_connect: List[Tuple[str, bytes]] = []
 
         self._lock = threading.Lock()
+        self._unstalled = threading.Condition(self._lock)
+        self._stalled: Set[int] = set()
         self._closed = False
         self._conns: List[_Conn] = []
         # Observations (read via the snapshot helpers below).
@@ -130,6 +136,18 @@ class MiniMqttServer:
             self._conns = [c for c in self._conns if c.index != index]
         for c in conns:
             self._hard_close(c.sock)
+
+    def stall(self, index: int) -> None:
+        """Stop reading the client connection with this index (after the
+        packet being read, if any)."""
+        with self._lock:
+            self._stalled.add(index)
+
+    def resume(self, index: int) -> None:
+        """Read the client connection with this index again."""
+        with self._unstalled:
+            self._stalled.discard(index)
+            self._unstalled.notify_all()
 
     def publish(self, topic: str, payload: bytes) -> int:
         """Send a QoS 0 PUBLISH to every connection subscribed to
@@ -236,6 +254,9 @@ class MiniMqttServer:
     def _serve(self, conn: _Conn) -> None:
         try:
             while True:
+                with self._unstalled:
+                    while conn.index in self._stalled and not self._closed:
+                        self._unstalled.wait(0.1)
                 first, body = self._read_packet(conn.sock)
                 ptype = first >> 4
                 if ptype == 1:      # CONNECT
