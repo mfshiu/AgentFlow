@@ -19,7 +19,10 @@ Contracts verified:
   - dispatch.max_queued_bytes bounds the bytes of queued, and of held
     (follow-up of #17), messages. Releasing held messages waits for
     room in the byte budget.
-  - A dispatcher that fails to start leaves no bytes reserved.
+  - A dispatcher that fails to start leaves no bytes reserved; a message
+    dropped over the byte budget does not start one.
+  - A request whose "overloaded" reply could not be sent runs when it
+    is redelivered.
   - Malformed limits fail at construction.
 """
 
@@ -36,6 +39,8 @@ from tests.fakes.fake_bus import FakeBus
 
 MiB = 1024 * 1024
 SETTLE_S = 0.3
+
+xfail_34s = pytest.mark.xfail(strict=True, reason='issue #34 second review: fixed in the next commit')
 
 
 def _wait_until(predicate, timeout=3.0):
@@ -193,6 +198,26 @@ def test_a_request_answered_overloaded_is_not_run_when_redelivered():
         agent.terminate()
 
 
+@xfail_34s
+def test_a_request_whose_overloaded_reply_failed_runs_when_redelivered():
+    agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
+    handled = []
+    agent.subscribe('svc', topic_handler=lambda topic, pcl: handled.append(pcl.content) or 'done')
+    gate = _blocked_worker(agent, broker)
+    try:
+        broker.deliver('other', TextParcel('filler').payload())  # fills the queue
+        broker.publish_exception = RuntimeError('link down')
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # dropped; its reply fails
+        broker.publish_exception = None
+        gate.set()
+        assert _wait_until(lambda: agent._get_dispatcher().queue_depth == 0)
+        broker.deliver('svc', _request('do-it', 'reply/1'))    # its redelivery
+        assert _wait_until(lambda: handled == ['do-it'])
+    finally:
+        gate.set()
+        agent.terminate()
+
+
 def test_the_release_of_held_messages_waits_for_room_in_the_byte_budget(monkeypatch):
     monkeypatch.setattr(agent_module, '_REPLAY_ROOM_TIMEOUT_S', 10.0)
     agent, broker = _agent({'dispatch': {'workers': 1, 'max_queued_bytes': 10_000}})
@@ -222,6 +247,16 @@ def test_a_dispatcher_that_fails_to_start_leaves_no_bytes_reserved():
             with pytest.raises(ValueError, match='workers'):
                 broker.deliver('t', TextParcel('m').payload())
         assert agent._queued_bytes == 0
+    finally:
+        agent.terminate()
+
+
+@xfail_34s
+def test_a_message_dropped_over_the_byte_budget_does_not_start_the_dispatcher():
+    agent, broker = _agent({'dispatch': {'max_queued_bytes': 1000}})
+    try:
+        broker.deliver('t', TextParcel('x' * 2000).payload())
+        assert agent._dispatcher is None
     finally:
         agent.terminate()
 
