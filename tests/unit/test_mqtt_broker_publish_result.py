@@ -30,6 +30,8 @@ from agentflow.broker.message_broker import MessageBroker
 from agentflow.broker.mqtt_broker import MqttBroker
 from agentflow.core.agent_worker import WorkerState
 
+from tests.helpers.source_checks import method_calls
+
 
 # Paho MQTT error codes (subset).
 MQTT_ERR_SUCCESS = 0
@@ -72,6 +74,33 @@ def _spied_message_info(rc=MQTT_ERR_SUCCESS, mid=1):
 
 def _configure_paho_return(fake_client, message_info):
     fake_client.publish.return_value = message_info
+
+
+@pytest.fixture(params=[False, True], ids=['wait=False', 'wait=True'])
+def any_wait_broker(request, patched_client_class, notifier):
+    """A MqttBroker built with wait=False (as the `broker` fixture) and
+    with wait=True (as production brokers are)."""
+    return MqttBroker(notifier=notifier, wait=request.param)
+
+
+_ACCEPTED_AND_QUEUED_RCS = pytest.mark.parametrize(
+    "rc", [MQTT_ERR_SUCCESS, MQTT_ERR_NO_CONN], ids=["rc=SUCCESS", "rc=NO_CONN"],
+)
+
+
+def _publish_spied(broker, fake_client, rc, qos):
+    """Publish once on the connected `broker`, paho returning a spied
+    result with `rc`; return the spy. At QoS 0 an rc of NO_CONN is a
+    rejection (MqttPublishError); at QoS 1 / 2 paho queued the message
+    and publish returns its result (issue #4)."""
+    _prime_connected(broker, fake_client)
+    info = _spied_message_info(rc=rc)
+    _configure_paho_return(fake_client, info)
+    try:
+        assert broker.publish("t", b"p", qos=qos) is info
+    except MqttPublishError:
+        assert qos == 0 and rc != MQTT_ERR_SUCCESS
+    return info
 
 
 def _prime_connected(broker, fake_client):
@@ -146,22 +175,27 @@ def test_A6_publish_success_returns_original_paho_result_unchanged(broker, fake_
     assert result is info
 
 
-def test_A7_publish_source_still_does_NOT_call_wait_for_publish(broker, fake_client):
+@_ACCEPTED_AND_QUEUED_RCS
+def test_A7_publish_source_still_does_NOT_call_wait_for_publish(
+    any_wait_broker, fake_client, rc,
+):
     """RFC-012 §Out of scope: QoS 1/2 acknowledgment deferred —
-    publish returns paho's result without waiting on it."""
-    _prime_connected(broker, fake_client)
-    info = _spied_message_info()
-    _configure_paho_return(fake_client, info)
-    assert broker.publish("t", b"p") is info
+    publish returns paho's result without waiting on it (QoS 0 here;
+    QoS 1 / 2: test_D33). Also pinned on the AST for paths no case
+    reaches: no MqttBroker code calls wait_for_publish."""
+    info = _publish_spied(any_wait_broker, fake_client, rc, qos=0)
     info.wait_for_publish.assert_not_called()
+    assert method_calls(MqttBroker, {"wait_for_publish"}) == []
 
 
-def test_A8_publish_source_still_does_NOT_call_is_published(broker, fake_client):
-    _prime_connected(broker, fake_client)
-    info = _spied_message_info()
-    _configure_paho_return(fake_client, info)
-    assert broker.publish("t", b"p") is info
+@_ACCEPTED_AND_QUEUED_RCS
+def test_A8_publish_source_still_does_NOT_call_is_published(
+    any_wait_broker, fake_client, rc,
+):
+    """As test_A7, for is_published (QoS 1 / 2: test_D34)."""
+    info = _publish_spied(any_wait_broker, fake_client, rc, qos=0)
     info.is_published.assert_not_called()
+    assert method_calls(MqttBroker, {"is_published"}) == []
 
 
 def test_A9_publish_source_NOW_validates_rc_via_normalizer(broker, fake_client):
@@ -507,21 +541,22 @@ def test_D32_no_qos_argument_defaults_to_paho_default_qos_0(broker, fake_client)
 
 
 @pytest.mark.parametrize("qos", [1, 2])
-def test_D33_wait_for_publish_still_not_called_by_source(broker, fake_client, qos):
-    """Not even at QoS 1 / 2, where paho could wait for the ack."""
-    _prime_connected(broker, fake_client)
-    info = _spied_message_info()
-    _configure_paho_return(fake_client, info)
-    assert broker.publish("t", b"p", qos=qos) is info
+@_ACCEPTED_AND_QUEUED_RCS
+def test_D33_wait_for_publish_still_not_called_by_source(
+    any_wait_broker, fake_client, rc, qos,
+):
+    """Not even at QoS 1 / 2, where paho could wait for the ack, and
+    not for a message paho queued while disconnected (rc=NO_CONN)."""
+    info = _publish_spied(any_wait_broker, fake_client, rc, qos)
     info.wait_for_publish.assert_not_called()
 
 
 @pytest.mark.parametrize("qos", [1, 2])
-def test_D34_is_published_still_not_called_by_source(broker, fake_client, qos):
-    _prime_connected(broker, fake_client)
-    info = _spied_message_info()
-    _configure_paho_return(fake_client, info)
-    assert broker.publish("t", b"p", qos=qos) is info
+@_ACCEPTED_AND_QUEUED_RCS
+def test_D34_is_published_still_not_called_by_source(
+    any_wait_broker, fake_client, rc, qos,
+):
+    info = _publish_spied(any_wait_broker, fake_client, rc, qos)
     info.is_published.assert_not_called()
 
 

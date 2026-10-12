@@ -42,6 +42,8 @@ from agentflow.core.agent_worker import (
     WorkerState,
 )
 
+from tests.helpers.source_checks import call_arguments
+
 
 # ---------------------------------------------------------------------------
 # Helper: minimal duck-typed initiator agent
@@ -292,32 +294,45 @@ def test_B5_start_after_START_FAILED_raises_RuntimeError(monkeypatch):
 
 def test_C1_stop_source_uses_bounded_join_with_graceful_timeout_s():
     """The unbounded `work_thread.join()` from the pre-RFC-009 code is
-    gone; the join is bounded by `graceful_timeout_s`. Observed on a
-    wedged thread from a probe thread, so an unbounded join fails the
-    test instead of hanging it: stop() waits out the given budget (not
-    a fixed one) and returns."""
-    release = threading.Event()
-    worker = _make_thread_worker(
-        activate=lambda cfg: release.wait(timeout=30.0)
-    )
-    budget_s = 0.6
+    gone; the join is bounded by `graceful_timeout_s`. Observed on two
+    wedged threads, stopped at once from probe threads (so an unbounded
+    join fails the test instead of hanging it) with a short and a long
+    budget: each stop() waits out its own budget and returns — not a
+    fixed, floored or scaled one. The tolerance is for slow CI; the AST
+    check below pins that join() gets the budget itself."""
+    budgets = (0.1, 1.5)
+    releases, workers, probes, started = [], [], [], []
     try:
-        worker.start()
-        probe = _StopProbe(worker, graceful_timeout_s=budget_s)
-        t0 = time.monotonic()
-        probe.start()
-        assert probe.returned.wait(budget_s + 2.0), (
-            "stop() did not return: unbounded join"
-        )
-        elapsed = time.monotonic() - t0
-        assert probe.result is False
-        # Well below a fixed 5 s budget, and below the probe's own wait.
-        assert budget_s - 0.1 <= elapsed < budget_s + 1.2, (
-            f"stop() returned after {elapsed:.2f}s with a {budget_s}s budget"
-        )
+        for _ in budgets:
+            release = threading.Event()
+            worker = _make_thread_worker(
+                activate=lambda cfg, release=release: release.wait(timeout=30.0)
+            )
+            worker.start()
+            releases.append(release)
+            workers.append(worker)
+        for worker, budget in zip(workers, budgets):
+            probe = _StopProbe(worker, graceful_timeout_s=budget)
+            started.append(time.monotonic())
+            probe.start()
+            probes.append(probe)
+        for probe, budget, t0 in zip(probes, budgets, started):
+            assert probe.returned.wait(budget + 3.0), (
+                f"stop({budget}) did not return: unbounded join"
+            )
+            elapsed = time.monotonic() - t0
+            assert probe.result is False
+            # A floor of 1 s fails the short budget; twice the budget
+            # fails the long one.
+            assert budget - 0.1 <= elapsed < budget + 0.8, (
+                f"stop() returned after {elapsed:.2f}s with a {budget}s budget"
+            )
     finally:
-        release.set()
-        worker.stop(graceful_timeout_s=2.0)
+        for release in releases:
+            release.set()
+        for worker in workers:
+            worker.stop(graceful_timeout_s=2.0)
+    assert call_arguments(ThreadWorker.stop, 'join') == [['graceful_timeout_s']]
     # signature carries the timeout with the expected default.
     sig = inspect.signature(ThreadWorker.stop)
     assert 'graceful_timeout_s' in sig.parameters
@@ -840,23 +855,42 @@ def test_H2_activate_Exception_captured_into_last_exception_state_FAILED():
 def test_H3_run_target_catches_Exception_only_not_BaseException_by_source_inspection(
     monkeypatch,
 ):
-    """Item #15. The wrapper must catch Exception explicitly (test_H2);
-    it must not use bare `except:` and must not catch BaseException.
+    """Item #15. The wrapper must catch Exception explicitly — all of
+    it, not only some built-in kinds; it must not use bare `except:`
+    and must not catch BaseException.
 
-    Observed: a BaseException from `_activate` escapes the worker
-    thread (it reaches threading.excepthook), is not captured into
-    `last_exception`, and the worker is not marked FAILED; a later
-    stop() reaches STOPPED (RFC-009 §7.11)."""
+    Observed: an Exception of no built-in kind is captured into
+    `last_exception` with state FAILED (test_H2 uses ValueError). A
+    BaseException from `_activate` escapes the worker thread (it
+    reaches threading.excepthook), is not captured, and the worker is
+    not marked FAILED; a later stop() reaches STOPPED (RFC-009 §7.11)."""
+    escaped = []
+    monkeypatch.setattr(
+        threading, 'excepthook', lambda args: escaped.append(args.exc_type),
+    )
+
+    class _Unusual(Exception):
+        pass
+
+    unusual = _Unusual("an Exception of no built-in kind")
+
+    def _activate_unusual(cfg):
+        raise unusual
+
+    worker = _make_thread_worker(activate=_activate_unusual)
+    worker.start()
+    worker.work_thread.join(2.0)
+    assert not worker.work_thread.is_alive()
+    assert escaped == [], "an Exception escaped the wrapper"
+    assert worker.last_exception is unusual
+    assert worker.state is WorkerState.FAILED
+
     class _Escape(BaseException):
         pass
 
     def _activate(cfg):
         raise _Escape("not an Exception")
 
-    escaped = []
-    monkeypatch.setattr(
-        threading, 'excepthook', lambda args: escaped.append(args.exc_type),
-    )
     worker = _make_thread_worker(activate=_activate)
     worker.start()
     worker.work_thread.join(2.0)

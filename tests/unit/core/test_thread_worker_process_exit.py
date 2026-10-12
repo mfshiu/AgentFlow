@@ -42,7 +42,9 @@ from tests.helpers.source_checks import (
     identifiers,
     imported_modules,
     method_calls,
+    names_used,
     os_exit_references,
+    os_function_references,
     parse_source,
     string_literals,
 )
@@ -517,29 +519,34 @@ def test_F44_processworker_has_terminate_kill_containment_source_pin(monkeypatch
     assert worker.state is _WorkerState.STOPPED
 
 
+def _async_cancellation_refs(mod) -> list:
+    """Imports of ctypes, and names (identifiers, or strings that a
+    getattr / importlib call could use) of ctypes or its async-exception
+    primitive, anywhere in the code of `mod`."""
+    imports = [m for m in imported_modules(mod) if m.split(".")[0] == "ctypes"]
+    names = {"ctypes", "PyThreadState_SetAsyncExc", "_async_raise"} & names_used(mod)
+    return sorted(set(imports) | names)
+
+
 def test_F45_threadworker_has_no_hard_containment_source_pin():
     """ThreadWorker cannot force-reclaim a wedged worker — Python
     threads have no safe cancellation primitive. RFC-009 §5 Option E
     rejected ctypes-based cancellation.
 
     Pinned on the AST: ThreadWorker's module MUST NOT import ctypes /
-    reference `PyThreadState_SetAsyncExc` or `_async_raise`, and
-    ThreadWorker MUST NOT call `.terminate()` or `.kill()` on anything.
-    ProcessWorker's calls to `proc.terminate()` are OK — that's the
-    contrast. (The module's comments name `ctypes` as the rejected
-    option; comments and docstrings are not code, so they don't count.)"""
+    reference `PyThreadState_SetAsyncExc` or `_async_raise` (also not
+    by name, through importlib or getattr), and ThreadWorker MUST NOT
+    call `.terminate()` or `.kill()` on anything. ProcessWorker's calls
+    to `proc.terminate()` are OK — that's the contrast. (The module's
+    comments name `ctypes` as the rejected option; comments and
+    docstrings are not code, so they don't count.)"""
     from agentflow.core import agent_worker as mod
     assert not hasattr(mod, "ctypes"), (
         "ctypes must not be imported into agent_worker"
     )
-    ctypes_imports = [m for m in imported_modules(mod)
-                      if m.split(".")[0] == "ctypes"]
-    assert ctypes_imports == [], (
-        "ctypes must not be imported into agent_worker, not even locally"
-    )
-    injection = {"PyThreadState_SetAsyncExc", "_async_raise"} & identifiers(mod)
-    assert not injection, (
-        f"async-exception injection primitive must not be referenced: {injection}"
+    refs = _async_cancellation_refs(mod)
+    assert refs == [], (
+        f"ctypes async-exception injection must not be referenced: {refs}"
     )
     # Thread has no terminate / kill methods anyway.
     assert method_calls(mod.ThreadWorker, {"terminate", "kill"}) == []
@@ -775,15 +782,16 @@ def test_I65_no_auto_fallback_from_ThreadWorker_to_ProcessWorker():
 
 def test_I66_no_supervisor_callback_source_pin():
     """No supervisor callback hook: neither the Agent class nor an
-    instance has one, and no code in Agent names one (identifier or
-    config-key literal; comments and docstrings are not code)."""
+    instance has one, and no name in Agent's code contains one: an
+    identifier (e.g. `_supervisor_callback`), or a string a getattr()
+    or config lookup could use. Comments and docstrings are not code."""
     from agentflow.core.agent import Agent
     agent = Agent(name="i66", agent_config={})
-    names = identifiers(Agent) | string_literals(Agent)
+    names = names_used(Agent)
     for keyword in ("supervisor_callback", "on_worker_hang", "on_timeout"):
         assert not hasattr(Agent, keyword)
         assert not hasattr(agent, keyword)
-        assert keyword not in names
+        assert not [n for n in names if keyword in n.lower()], keyword
 
 
 def test_I67_no_restart_policy_source_pin():
@@ -796,7 +804,14 @@ def test_I67_no_restart_policy_source_pin():
         for name in ("restart", "auto_restart"):
             assert not hasattr(cls, name)
             assert not hasattr(worker, name)
-        assert "auto_restart" not in identifiers(cls) | string_literals(cls)
+        # Nor under another name: no method (or other name) starting
+        # with "restart" (`restart_after_failure`), and no name or
+        # config key containing "auto_restart" (`self._auto_restart`).
+        restart_names = [n for n in identifiers(cls)
+                         if n.lstrip("_").lower().startswith("restart")]
+        assert restart_names == [], f"{cls.__name__}: {restart_names}"
+        auto_restart = [n for n in names_used(cls) if "auto_restart" in n.lower()]
+        assert auto_restart == [], f"{cls.__name__}: {auto_restart}"
 
 
 def test_I68_no_healthcheck_or_heartbeat_source_pin():
@@ -809,15 +824,16 @@ def test_I68_no_healthcheck_or_heartbeat_source_pin():
 
 def test_I69_no_fatal_shutdown_hook_source_pin():
     """No fatal-shutdown hook and no hard exit anywhere in Agent
-    (AST: identifiers, config-key literals and os._exit references)."""
+    (AST: names containing the keywords, e.g. `_force_exit`, and
+    references to os._exit / os.abort)."""
     from agentflow.core.agent import Agent
     agent = Agent(name="i69", agent_config={})
-    names = identifiers(Agent) | string_literals(Agent)
+    names = names_used(Agent)
     for keyword in ("fatal_shutdown", "force_exit"):
         assert not hasattr(Agent, keyword)
         assert not hasattr(agent, keyword)
-        assert keyword not in names
-    assert os_exit_references(Agent) == []
+        assert not [n for n in names if keyword in n.lower()], keyword
+    assert os_function_references(Agent, ("_exit", "abort")) == []
 
 
 def test_I70_no_CLI_service_runner_in_tree_source_pin():
@@ -1341,6 +1357,4 @@ def test_M102_agentflow_core_does_not_use_ctypes_async_cancellation():
     for mod in (agent, agent_worker):
         # Not imported into the module namespace, nor anywhere in it.
         assert not hasattr(mod, "ctypes")
-        assert not [m for m in imported_modules(mod)
-                    if m.split(".")[0] == "ctypes"], mod.__name__
-        assert "PyThreadState_SetAsyncExc" not in identifiers(mod)
+        assert _async_cancellation_refs(mod) == [], mod.__name__

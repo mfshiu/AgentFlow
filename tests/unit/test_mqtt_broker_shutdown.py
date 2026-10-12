@@ -975,8 +975,10 @@ class _StubBroker:
 
 def test_I52_agent_deactivating_source_observes_broker_stop_result(caplog):
     """__deactivating calls broker.stop() once and observes its result:
-    False → one WARNING naming the broker state. An exception from
-    stop() is logged, never raised, and teardown still completes."""
+    False → one WARNING naming the broker state. Any Exception from
+    stop() — not only the broker-shaped ones (LookupError here) — is
+    logged, never raised, and teardown still completes (on_terminated
+    runs)."""
     stub = _StubBroker(result=False)
     records, terminated = _deactivate_with(stub, caplog)
     assert stub.stop_calls == 1
@@ -986,11 +988,12 @@ def test_I52_agent_deactivating_source_observes_broker_stop_result(caplog):
     assert terminated
 
     # never-raise contract preserved.
-    failing = _StubBroker(error=RuntimeError('paho exploded'))
-    records, terminated = _deactivate_with(failing, caplog)
-    assert failing.stop_calls == 1
-    assert [r for r in records if r.levelno == logging.ERROR]
-    assert terminated
+    for error in (RuntimeError('paho exploded'), LookupError('unexpected')):
+        failing = _StubBroker(error=error)
+        records, terminated = _deactivate_with(failing, caplog)
+        assert failing.stop_calls == 1
+        assert [r for r in records if r.levelno == logging.ERROR], error
+        assert terminated, error
 
 
 def test_I53_agent_deactivating_treats_None_return_as_success(caplog):

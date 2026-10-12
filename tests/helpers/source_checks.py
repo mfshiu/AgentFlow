@@ -47,17 +47,28 @@ def daemon_settings(obj) -> List[Any]:
 
 
 def identifiers(obj) -> Set[str]:
-    """Every identifier the code of `obj` uses: names, attribute names
-    and imported names. Strings, comments and docstrings are not
-    code, so a word that only appears there is not reported."""
+    """Every identifier the code of `obj` uses or defines: names,
+    attribute names, imported names, function and class names,
+    parameter names and keyword-argument names. Strings, comments and
+    docstrings are not code, so a word that only appears there is not
+    reported."""
     names = set()
     for node in ast.walk(parse_source(obj)):
         if isinstance(node, ast.Name):
             names.add(node.id)
         elif isinstance(node, ast.Attribute):
             names.add(node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            names.add(node.arg)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(alias.name.split('.')[-1] for alias in node.names)
+            for alias in node.names:
+                names.add(alias.name.split('.')[-1])
+                if alias.asname:
+                    names.add(alias.asname)
     return names
 
 
@@ -78,6 +89,14 @@ def string_literals(obj) -> Set[str]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
         and id(node) not in docstrings
     }
+
+
+def names_used(obj) -> Set[str]:
+    """`identifiers(obj)` plus every string literal that is itself an
+    identifier: a name the code may reach through getattr() or
+    importlib, or a config key. Log messages and other prose are not
+    identifiers, so they are left out."""
+    return identifiers(obj) | {s for s in string_literals(obj) if s.isidentifier()}
 
 
 def imported_modules(obj) -> Set[str]:
@@ -107,16 +126,57 @@ def method_calls(obj, method_names: Iterable[str]) -> List[str]:
     ]
 
 
-def os_exit_references(obj) -> List[str]:
-    """Every reference to `os._exit` in `obj`, however it is spelled:
-    any `<expr>._exit` attribute (`os._exit`, an aliased module), or
-    `_exit` imported from os / posix / nt."""
+def call_arguments(obj, method_name: str) -> List[List[str]]:
+    """Source text of the arguments (positional, then keyword) of every
+    call `<expr>.<method_name>(...)` in `obj`."""
+    return [
+        [ast.unparse(arg) for arg in node.args]
+        + [ast.unparse(kw) for kw in node.keywords]
+        for node in ast.walk(parse_source(obj))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == method_name
+    ]
+
+
+_OS_MODULES = ('os', 'posix', 'nt')
+
+
+def os_function_references(obj, functions: Iterable[str]) -> List[str]:
+    """Every reference in `obj` to one of the os-module `functions`
+    (e.g. `_exit`, `abort`), however it is spelled: `<m>.<function>`
+    where `<m>` is bound to os / posix / nt by an import in the module
+    of `obj` (`import os`, `import os as _os`), a use of a name bound by
+    `from os import <function> [as alias]`, and such an import itself.
+    An attribute of anything else (`self._exit`) is not a reference."""
+    wanted = set(functions)
+    module_tree = parse_source(inspect.getmodule(obj))
+    module_names = set()
+    function_names = set()
+    for node in ast.walk(module_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _OS_MODULES:
+                    module_names.add(alias.asname or alias.name)
+                elif alias.name.split('.')[0] in _OS_MODULES and not alias.asname:
+                    module_names.add(alias.name.split('.')[0])   # import os.path
+        elif isinstance(node, ast.ImportFrom) and node.module in _OS_MODULES:
+            function_names.update(alias.asname or alias.name
+                                  for alias in node.names if alias.name in wanted)
     refs = []
     for node in ast.walk(parse_source(obj)):
-        if isinstance(node, ast.Attribute) and node.attr == '_exit':
+        if (isinstance(node, ast.Attribute) and node.attr in wanted
+                and isinstance(node.value, ast.Name)
+                and node.value.id in module_names):
             refs.append(ast.unparse(node))
-        elif (isinstance(node, ast.ImportFrom)
-              and node.module in ('os', 'posix', 'nt')
-              and any(alias.name == '_exit' for alias in node.names)):
-            refs.append(f'from {node.module} import _exit')
+        elif isinstance(node, ast.Name) and node.id in function_names:
+            refs.append(node.id)
+        elif (isinstance(node, ast.ImportFrom) and node.module in _OS_MODULES
+              and any(alias.name in wanted for alias in node.names)):
+            refs.append(ast.unparse(node))
     return refs
+
+
+def os_exit_references(obj) -> List[str]:
+    """Every reference to `os._exit` in `obj` (see os_function_references)."""
+    return os_function_references(obj, ('_exit',))
