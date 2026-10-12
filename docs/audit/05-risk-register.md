@@ -258,7 +258,9 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 - Subscription results were never checked (issue #53). *Resolved 2026-10-12 (#53):*
   - *A SUBACK refusal is logged at WARNING. It is counted in `failed_subscriptions` instead of `active_subscriptions`, and retried on the next CONNACK.*
   - *A resubscribe's paho rc is checked.*
-  - *An invalid filter raises before it enters the registry.*
+  - *An invalid filter raises before it enters the registry, and before `Agent.subscribe` registers anything.*
+  - *A failed topic counts as active again only once a SUBACK grants it.*
+  - *SUBACKs are matched to their topic only on the connection their SUBSCRIBE went out on.*
   - *See RFC-005 §7.12, `tests/unit/test_mqtt_broker_subscribe_results.py` and `tests/wire/test_suback_wire.py`.*
 - Publishes made while disconnected are still dropped by `Agent.publish` (issue #4).
 

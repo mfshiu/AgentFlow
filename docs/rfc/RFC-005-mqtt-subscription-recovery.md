@@ -401,10 +401,14 @@ Yes. Recovery snapshots the registry under the lock, then iterates the snapshot 
 - **SUBACK.** `on_subscribe` is bound, and each SUBSCRIBE's mid is mapped to its topic.
   - A reason code ≥ 0x80 (an ACL, a resource limit) is logged at WARNING.
   - Such a topic, or one whose SUBSCRIBE paho raised on or did not send, is counted in `failed_subscriptions` rather than `active_subscriptions`.
-  - It stays in the registry, so the next CONNACK retries it. A later successful SUBSCRIBE or a granted SUBACK clears it, and so does `unsubscribe`.
+  - It stays in the registry, so the next CONNACK retries it. Only a granted SUBACK clears it (sending again does not), and so does `unsubscribe`.
   - A SUBACK that arrives before `subscribe()` records its mid is kept until it does.
+  - A SUBACK is matched to its topic only on the connection its SUBSCRIBE went out on, because paho reuses mids. One settled after a connection loss is not recorded; the CONNACK replay sends it again.
+  - A refusal for a topic that was unsubscribed meanwhile, or after `stop()`, is not counted and logged only at DEBUG.
   - `on_subscribe` never raises, because paho would let the exception end its network thread.
 - **Filters.** `subscribe()` checks the filter with paho's own rules before the registry changes. An invalid filter (`a+/b`, `a/#/b`, an empty one) raises `ValueError` and is never recorded or replayed.
+  - The check is `agentflow.broker.message_broker.check_filter`.
+  - `Agent.subscribe` calls it before it registers the handler or the session topic, so an invalid filter leaves nothing behind.
 
 ### 7.13 Logging + metrics
 - INFO on `subscribe` / `unsubscribe` after stop ("dropping topic X")
