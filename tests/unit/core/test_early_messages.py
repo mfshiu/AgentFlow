@@ -18,8 +18,9 @@ Contracts verified:
   - Messages with a handler are never held.
   - The gate opens only when every awaited hook has returned.
   - The hold is bounded; overflow is dropped and counted.
-  - Held messages are replayed despite their message id having been
-    seen, and a held request is answered (RFC-003 / RFC-014).
+  - A held message with a message id is replayed (since #34 its id is
+    recorded when it is handled, not when it arrives), and a held
+    request is answered (RFC-003 / RFC-014).
   - Agents outside the lifecycle (no _activate) are never gated.
 """
 
@@ -130,7 +131,7 @@ def test_the_hold_is_bounded():
         agent.terminate()
 
 
-def test_a_held_message_is_replayed_although_its_id_was_seen(agent_and_broker):
+def test_a_held_message_with_a_message_id_is_replayed(agent_and_broker):
     agent, broker = agent_and_broker
     _await(agent, 'on_activate')
     parcel = TextParcel('j1')

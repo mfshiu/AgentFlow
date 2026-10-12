@@ -375,9 +375,10 @@ class TextParcel(Parcel):
         # never unpickle, so they do not apply here.
         if not isinstance(payload, (bytes, bytearray)):
             raise TypeError("payload must be bytes for TextParcel")
-        raw = bytes(payload)[len(TextParcel.HEAD):]
+        # Issue #34: decode from a view, without a sliced copy.
+        raw = memoryview(payload)[len(TextParcel.HEAD):]
         try:
-            data = json.loads(raw.decode("utf-8", "replace"))
+            data = json.loads(str(raw, "utf-8", "replace"))
         except (ValueError, RecursionError) as ex:
             # Issue #15: RecursionError for deeply nested JSON.
             raise ParcelDecodeError(f"invalid TextParcel payload: {ex}") from ex

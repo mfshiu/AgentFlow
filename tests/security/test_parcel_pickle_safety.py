@@ -28,6 +28,7 @@ Contracts verified:
 import datetime
 import pickle
 import threading
+import time
 
 import pytest
 
@@ -76,6 +77,15 @@ def _global_ref_payload(module, name):
     body = (b'\x80\x02}X\x07\x00\x00\x00content'
             + b'c' + f'{module}\n{name}\n'.encode() + b's.')
     return BinaryParcel.HEAD + body
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def _agent(config=None):
@@ -215,7 +225,7 @@ def test_gadget_delivered_to_agent_is_not_executed_and_not_dispatched():
     got, done = _subscribe_recorder(agent)
     try:
         broker.deliver('svc/in', _binary_payload(_managed(_Gadget())))
-        assert agent.decode_failure_count == 1      # issue #15: counted, not raised
+        assert _wait_for(lambda: agent.decode_failure_count == 1)   # #15: counted, not raised
         assert not done.wait(0.3)
         assert got == []
         assert _GADGET_CALLS == []
@@ -326,7 +336,7 @@ def test_agent_can_refuse_pickle_payloads_entirely():
     got, done = _subscribe_recorder(agent)
     try:
         broker.deliver('svc/in', BinaryParcel({'content': b'x'}).payload())
-        assert agent.decode_failure_count == 1      # issue #15: counted, not raised
+        assert _wait_for(lambda: agent.decode_failure_count == 1)   # #15: counted, not raised
         assert not done.wait(0.3)
         broker.deliver('svc/in', TextParcel({'ok': 1}).payload())
         assert done.wait(3)

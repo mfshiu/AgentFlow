@@ -1570,6 +1570,51 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ---
 
+## R-28 — Payloads decoded on the network thread, without size or byte limits
+
+- **Status**: **RESOLVED** (2026-10-12, issue #34). The outbound direction (#35) remains **Open**.
+- **Severity**: Medium
+- **Category**: Resource management
+- **File / Function / Line**:
+  - `src/agentflow/core/agent.py` `_on_message`, which decoded before enqueuing;
+  - `src/agentflow/core/dispatcher.py`, whose queue was bounded by count only;
+  - `src/agentflow/core/parcel.py`, where TextParcel made a sliced copy before decoding.
+- **Trigger**: a large or slow-to-decode payload; a stream of large messages while the dispatcher is saturated.
+- **Impact**:
+  - The paho network thread was blocked while decoding, delaying every subscription and PINGREQ.
+  - Messages the full queue was about to drop were decoded anyway.
+  - Up to 1024 large messages could sit in memory, against CLAUDE.md invariant 5.
+- **Confidence**: High (reproduced; see the issue).
+
+### Payload limits and off-thread decoding (2026-10-12, issue #34)
+
+**Change.**
+- `_on_message` (network thread) only does cheap, topic-based work:
+  - the size gate: a payload over `codec.max_payload_bytes`, default 16 MiB, is dropped undecoded and counted in `decode_failure_count`;
+  - the early-message gate (#17);
+  - the handler lookup;
+  - enqueuing the raw bytes.
+- `__handle` on a dispatcher thread decodes, deduplicates (#4) and handles the message.
+- `dispatch.max_queued_bytes` (default 256 MiB) bounds the payload bytes waiting for a dispatcher thread, and the bytes held by the early-message gate.
+- A message the queue cannot take is dropped without decoding. A request (RFC-003) of at most 64 KiB is decoded on the receiving thread only to answer it "overloaded" (#4). Its message id is recorded then, so neither a copy still waiting in the queue nor a later redelivery runs a request whose requester was told it was dropped. This holds within the 4096-id deduplication window. If the reply cannot be sent, the id is released, so that a redelivery runs.
+- Held messages are released within the byte budget as well as the queue capacity.
+- TextParcel decodes from a `memoryview`, without a sliced copy.
+
+**Compatibility.**
+- Payloads over 16 MiB are now dropped. Raise `codec.max_payload_bytes` if a deployment sends larger messages.
+- Decode failures and deduplication now happen on dispatcher threads, so their counters update asynchronously.
+
+**Verification**: `tests/unit/core/test_payload_limits.py`:
+- oversized payloads not decoded, and the default limit;
+- decoding off the receiving thread;
+- no decode for queue-full drops;
+- byte budget, for queued and held messages;
+- config validation.
+
+**Still open**: the outbound direction (#35).
+
+---
+
 ## Summary table (sorted by severity, then confidence)
 
 | ID | Severity | Confidence | Status | Title |
@@ -1594,6 +1639,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-19 | Medium | High | **Resolved 2026-10-12 (#15)**: version validated, undecodable messages counted with rate-limited logging | Parcel `version` never validated |
 | R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
+| R-28 | Medium | High | **Resolved 2026-10-12 (#34)**: payload size limit before decoding, decoding on dispatcher threads, byte-bounded queue; outbound (#35) still open | Payloads decoded on the network thread without limits |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
