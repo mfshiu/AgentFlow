@@ -1,6 +1,6 @@
 # RFC-004 — bounded message dispatch
 
-- **Status**: **Implemented (2026-07-26)**
+- **Status**: **Implemented (2026-07-26)**; §9 amended 2026-10-12 (issue #7): publish_sync replies have their own lane.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-04; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md), [RFC-002](RFC-002-publish-error-propagation.md), [RFC-003](RFC-003-auto-reply-contract.md)
 - **Scope**: `Agent._on_message` dispatch strategy — bounded concurrency, bounded queue depth, explicit backpressure, graceful shutdown
@@ -520,7 +520,7 @@ None. No wire protocol, Parcel field, or broker interaction changes.
 
 ## 9. Interaction with RFC-001 / RFC-002 / RFC-003
 
-- **RFC-001 (R-02 publish_sync cleanup)**: unaffected. `publish_sync` runs on its caller's thread (test main or user thread), not on a dispatcher consumer. Cleanup semantics unchanged. `test_publish_sync_late_reply_after_cleanup_is_silently_dropped` continues to work because the late reply now travels through the dispatcher but still falls through to `on_message` (silent per RFC-003).
+- **RFC-001 (R-02 publish_sync cleanup)**: unaffected. `publish_sync` runs on its caller's thread (test main or user thread), not on a dispatcher consumer. *Amended 2026-10-12 (issue #7): that assumption was wrong. A handler runs on a consumer, and a handler calling `publish_sync` held the consumer its reply needed. With one worker every nested call timed out; with 8 workers, 8 concurrent nested calls stalled until their timeouts; a full queue dropped the reply. Replies to `publish_sync` (messages on a topic whose handler is the PUBLISH_SYNC `_ReplyRouter`) now go to their own one-consumer `MessageDispatcher` (`Agent._get_reply_dispatcher`), created on the first reply. It only decodes a reply and wakes the waiting call, never a user handler, so it cannot be starved; decoding stays off the network thread (#34). `terminate()` stops it after the dispatcher. The legacy per-message-thread mode is unchanged.* Cleanup semantics unchanged. `test_publish_sync_late_reply_after_cleanup_is_silently_dropped` continues to work because the late reply now travels through the dispatcher but still falls through to `on_message` (silent per RFC-003).
 - **RFC-002 (R-13 fast-fail)**: unaffected. `publish_sync` calls `_publish_or_raise` on the caller's thread; broker exceptions still propagate. Dispatcher is not in this path.
 - **RFC-003 (R-05 auto-reply contract)**: fully preserved. The `handle_message` body (with R-fallback-silent / R-strip-topic_return / R-exception-fresh) becomes the body of the dispatched task. Consumer thread runs it exactly as the per-message thread did. All 21 R-05 tests should continue to pass unchanged.
 
