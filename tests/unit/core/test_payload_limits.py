@@ -29,7 +29,6 @@ from agentflow.core.parcel import Parcel, TextParcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_34 = pytest.mark.xfail(strict=True, reason='issue #34: no size limit; decoding on the receiving thread')
 
 MiB = 1024 * 1024
 SETTLE_S = 0.3
@@ -84,7 +83,6 @@ def _blocked_worker(agent, broker, topic='busy'):
     return gate
 
 
-@xfail_34
 def test_an_oversized_payload_is_dropped_before_decoding(decoded):
     agent, broker = _agent({'codec': {'max_payload_bytes': 1000}})
     seen = []
@@ -100,7 +98,6 @@ def test_an_oversized_payload_is_dropped_before_decoding(decoded):
         agent.terminate()
 
 
-@xfail_34
 def test_the_default_limit_is_16_mib(decoded):
     agent, broker = _agent()
     try:
@@ -114,7 +111,6 @@ def test_the_default_limit_is_16_mib(decoded):
         agent.terminate()
 
 
-@xfail_34
 def test_decoding_runs_off_the_receiving_thread(decoded):
     agent, broker = _agent()
     seen = []
@@ -127,7 +123,6 @@ def test_decoding_runs_off_the_receiving_thread(decoded):
         agent.terminate()
 
 
-@xfail_34
 def test_a_message_the_full_queue_drops_is_not_decoded(decoded):
     agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
     gate = _blocked_worker(agent, broker)
@@ -143,7 +138,6 @@ def test_a_message_the_full_queue_drops_is_not_decoded(decoded):
         agent.terminate()
 
 
-@xfail_34
 def test_the_queue_is_bounded_in_bytes():
     agent, broker = _agent({'dispatch': {'workers': 1, 'max_queued_bytes': 10_000}})
     gate = _blocked_worker(agent, broker)
@@ -166,7 +160,6 @@ def test_the_queue_is_bounded_in_bytes():
         agent.terminate()
 
 
-@xfail_34
 def test_held_messages_are_bounded_in_bytes():
     agent, broker = _agent({'dispatch': {'max_queued_bytes': 10_000}})
     try:
@@ -179,7 +172,6 @@ def test_held_messages_are_bounded_in_bytes():
         agent.terminate()
 
 
-@xfail_34
 @pytest.mark.parametrize('config, error, match', [
     ({'codec': {'max_payload_bytes': 0}}, ValueError, "max_payload_bytes' must be"),
     ({'codec': {'max_payload_bytes': -1}}, ValueError, "max_payload_bytes' must be"),

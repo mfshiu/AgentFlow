@@ -17,7 +17,7 @@ from typing import Callable, final, Optional
 import uuid
 
 from agentflow.core import holon_auth
-from agentflow.core.parcel import Parcel, ParcelDecodeError, ensure_size, parse_pickle_globals
+from agentflow.core.parcel import Parcel, ensure_size, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
@@ -32,7 +32,31 @@ import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
-_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
+_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals', 'max_payload_bytes'})
+
+# Issue #34: payload limits. A payload larger than codec.max_payload_bytes
+# is dropped without decoding; at most dispatch.max_queued_bytes of
+# received payloads wait for a dispatcher thread (or are held, see #17).
+_DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+_DEFAULT_MAX_QUEUED_BYTES = 256 * 1024 * 1024
+# A dropped request is decoded on the receiving thread, to be answered
+# "overloaded" (issue #4), only up to this size.
+_DROP_REPLY_DECODE_LIMIT = 64 * 1024
+
+
+def _payload_size(data) -> int:
+    try:
+        return len(data)
+    except TypeError:
+        return 0
+
+
+def _positive_int(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"Agent config '{name}' must be a positive int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"Agent config '{name}' must be a positive int, got {value!r}")
+    return value
 
 # Issue #4: holon control messages and publish_sync requests / replies
 # travel at QoS 1 (at least once), and the topics they arrive on are
@@ -219,6 +243,8 @@ class Agent(BrokerNotifier):
         # Issue #1: inbound decoding policy, validated up front so a bad
         # `codec` config fails at construction rather than per message.
         self._codec_options = self.__parse_codec_config()
+        # Issue #34: payload size limits (codec / dispatch sections).
+        self._max_payload_bytes, self._max_queued_bytes = self.__parse_payload_limits()
         # Issue #13: holon control-plane policy, validated the same way.
         self._holon_options = self.__parse_holon_config()
         self.name = name
@@ -265,6 +291,11 @@ class Agent(BrokerNotifier):
         # AgentFlow parcels; see decode_failure_count.
         self._decode_failures = 0
         self._decode_lock = threading.Lock()
+        # Issue #34: bytes of received payloads queued for a dispatcher
+        # thread, and drops for exceeding that budget.
+        self._queued_bytes = 0
+        self._byte_budget_drops = 0
+        self._queued_bytes_lock = threading.Lock()
         # Follow-up of #17: messages with no handler that arrive while
         # lifecycle hooks are still registering handlers are held here
         # (see __await_hook) and released once every awaited hook has
@@ -273,6 +304,7 @@ class Agent(BrokerNotifier):
         self._early_messages: deque = deque()
         self._awaiting_hooks: set = set()
         self._early_dropped = 0
+        self._held_bytes = 0
         self._lifecycle_gating = False
         self._gate_timer: Optional[threading.Timer] = None
         # Topics passed to subscribe() in this process (guarded by
@@ -318,6 +350,7 @@ class Agent(BrokerNotifier):
         '_recent_message_ids',
         '_dedup_lock',
         '_decode_lock',
+        '_queued_bytes_lock',
         '_early_lock',
         '_early_messages',
         '_awaiting_hooks',
@@ -402,6 +435,8 @@ class Agent(BrokerNotifier):
         self._recent_message_ids = OrderedDict()
         self._dedup_lock = threading.Lock()
         self._decode_lock = threading.Lock()
+        self._queued_bytes = 0
+        self._queued_bytes_lock = threading.Lock()
         self._early_lock = threading.Lock()
         self._early_messages = deque()
         self._awaiting_hooks = set()
@@ -483,6 +518,21 @@ class Agent(BrokerNotifier):
             'accept_pickle': accept_pickle,
             'pickle_allowed_globals': parse_pickle_globals(allowed),
         }
+
+
+    def __parse_payload_limits(self):
+        """Issue #34: `codec.max_payload_bytes` (default 16 MiB; larger
+        payloads are dropped without decoding) and
+        `dispatch.max_queued_bytes` (default 256 MiB; received payloads
+        waiting for a dispatcher thread, or held before the handlers
+        exist, may not exceed it). Raises TypeError / ValueError unless
+        each is a positive int."""
+        codec = self.config.get('codec') or {}
+        dispatch = self.config.get('dispatch') or {}
+        max_payload = codec.get('max_payload_bytes', _DEFAULT_MAX_PAYLOAD_BYTES)
+        max_queued = dispatch.get('max_queued_bytes', _DEFAULT_MAX_QUEUED_BYTES)
+        return (_positive_int(max_payload, 'codec.max_payload_bytes'),
+                _positive_int(max_queued, 'dispatch.max_queued_bytes'))
 
 
     def __parse_holon_config(self) -> _HolonOptions:
@@ -1691,37 +1741,38 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
-        # logger.debug(self.M(f"topic: {topic}, data: {data}"))
-        try:
-            pcl = Parcel.from_payload(data, **self._codec_options)
-        except Exception as ex:
-            # Issue #15: not a valid AgentFlow parcel (another MQTT
-            # client's JSON, an unsupported version, garbage). Count it
-            # instead of letting it escape to the broker callback, which
-            # logged a full traceback for every such message. Decoders
-            # raise ParcelDecodeError; anything else they raise on
-            # untrusted bytes is counted the same way.
-            self.__count_decode_failure(topic, ex)
+        """BrokerNotifier callback, on the broker's network thread.
+
+        Issue #34: only cheap, topic-based work happens here, so that a
+        large or slow payload cannot stall network I/O and keepalive. A
+        payload over codec.max_payload_bytes is dropped at once.
+        Everything else is routed as raw bytes, and decoded on a
+        dispatcher thread (__handle)."""
+        size = _payload_size(data)
+        if size > self._max_payload_bytes:
+            self.__count_decode_failure(topic, ValueError(
+                f"payload of {size} bytes exceeds codec.max_payload_bytes="
+                f"{self._max_payload_bytes}"))
             return
-        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
-            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
-            # whose acknowledgement was lost across a reconnect.
-            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
-            return
-        self.__route(topic, pcl)
+        self.__route(topic, data, size)
 
 
-    def __route(self, topic, pcl):
-        """Hand a decoded, deduplicated message to its handler through
-        the dispatcher (RFC-003 / RFC-004 / RFC-007). Follow-up of #17:
-        while lifecycle hooks are still registering handlers, a message
-        on a topic that has no handler and was not subscribed in this
-        process (a resumed session's leftover) is held instead, and
-        replayed here once they have returned."""
+    def __route(self, topic, data, size):
+        """Queue a received message for its handler (RFC-004 / RFC-007).
+
+        Follow-up of #17: while lifecycle hooks are still registering
+        handlers, a message on a topic that has no handler and was not
+        subscribed in this process (a resumed session's leftover) is
+        held instead, and replayed here once they have returned.
+
+        Issue #34: the message is queued undecoded, within the
+        dispatch.max_queued_bytes budget. One the queue cannot take is
+        dropped, without decoding unless it is small enough to be
+        answered (see __drop)."""
         with self._early_lock:
             if (self._awaiting_hooks and not self.__has_handler(topic)
                     and not self.__subscribed_in_session(topic)):
-                self.__hold(topic, pcl)
+                self.__hold(topic, data, size)
                 return
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
@@ -1738,6 +1789,44 @@ class Agent(BrokerNotifier):
             else:
                 is_specific_handler = False
                 topic_handler = self.on_message
+
+        if not self.__reserve_queued_bytes(size):
+            self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
+            return
+
+        def task():
+            self.__release_queued_bytes(size)
+            self.__handle(topic, data, is_specific_handler, topic_handler)
+
+        # RFC-004: dispatch via the bounded message dispatcher instead
+        # of spawning one Thread per message. enqueue() never raises
+        # (broker-callback safety invariant, §7.3); the dispatcher counts
+        # and logs its own drops.
+        if not self._get_dispatcher().enqueue(task, topic=topic):
+            self.__release_queued_bytes(size)
+            self.__drop(topic, data, size, is_specific_handler, over_byte_budget=False)
+
+
+    def __handle(self, topic, data, is_specific_handler, topic_handler):
+        """Decode, deduplicate and handle one message, on a dispatcher
+        thread (issue #34)."""
+        try:
+            pcl = Parcel.from_payload(data, **self._codec_options)
+        except Exception as ex:
+            # Issue #15: not a valid AgentFlow parcel (another MQTT
+            # client's JSON, an unsupported version, garbage). Count it
+            # instead of letting it escape, which logged a full
+            # traceback for every such message. Decoders raise
+            # ParcelDecodeError; anything else they raise on untrusted
+            # bytes is counted the same way.
+            self.__count_decode_failure(topic, ex)
+            return
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
+            # whose acknowledgement was lost across a reconnect.
+            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
+            return
+
         # RFC-003 R-fallback-silent: only topics with a specifically
         # registered handler in __topic_handlers may trigger an
         # auto-reply.
@@ -1752,52 +1841,86 @@ class Agent(BrokerNotifier):
                 f"Withheld the reply to {topic!r}: topic_return "
                 f"{pcl.topic_return!r} is a holon control topic.")
 
-        def handle_message():
-            if should_auto_reply:
-                try:
-                    logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
-                    data_resp = topic_handler(topic, pcl)
-                except Exception as ex:
-                    logger.exception(ex)
-                    # RFC-003 R-exception-fresh: build a new parcel for
-                    # the error echo; do NOT mutate or reuse pcl.
-                    err_pcl = Parcel.from_content(None)
-                    err_pcl.error = str(ex)
-                    data_resp = err_pcl
-                    logger.debug(data_resp)
-                # RFC-003 R-strip-topic_return: the auto-reply must
-                # never carry topic_return. RFC-014 (issue #36): it
-                # carries the request's correlation id. If the handler
-                # returned a Parcel that differs in either, reply with a
-                # shallow copy instead of mutating the caller's object;
-                # a copy keeps a subclass's own state and never calls
-                # its constructor.
-                if not isinstance(data_resp, Parcel):
-                    data_resp = Parcel.from_content(data_resp)
-                elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
-                    data_resp = copy.copy(data_resp)
-                    data_resp.topic_return = None
-                data_resp.correlation_id = pcl.correlation_id
-                self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
-            else:
-                try:
-                    topic_handler(topic, pcl)
-                except Exception as ex:
-                    logger.exception(ex)
+        if should_auto_reply:
+            try:
+                logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
+                data_resp = topic_handler(topic, pcl)
+            except Exception as ex:
+                logger.exception(ex)
+                # RFC-003 R-exception-fresh: build a new parcel for
+                # the error echo; do NOT mutate or reuse pcl.
+                err_pcl = Parcel.from_content(None)
+                err_pcl.error = str(ex)
+                data_resp = err_pcl
+                logger.debug(data_resp)
+            # RFC-003 R-strip-topic_return: the auto-reply must
+            # never carry topic_return. RFC-014 (issue #36): it
+            # carries the request's correlation id. If the handler
+            # returned a Parcel that differs in either, reply with a
+            # shallow copy instead of mutating the caller's object;
+            # a copy keeps a subclass's own state and never calls
+            # its constructor.
+            if not isinstance(data_resp, Parcel):
+                data_resp = Parcel.from_content(data_resp)
+            elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
+                data_resp = copy.copy(data_resp)
+                data_resp.topic_return = None
+            data_resp.correlation_id = pcl.correlation_id
+            self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
+        else:
+            try:
+                topic_handler(topic, pcl)
+            except Exception as ex:
+                logger.exception(ex)
 
-        # RFC-004: dispatch via the bounded message dispatcher instead
-        # of spawning one Thread per message. enqueue() never raises
-        # (broker-callback safety invariant, §7.3).
-        if not self._get_dispatcher().enqueue(handle_message, topic=topic) and should_auto_reply:
-            # Issue #4: the dispatcher dropped a request (queue full, or
-            # stopping); the dispatcher has counted and logged it. Tell
-            # the requester now rather than let it wait for its timeout.
-            # publish never raises and does not block on the broker.
-            dropped = Parcel.from_content(None)
-            dropped.error = ("overloaded: the request was dropped before it was handled "
-                             "(dispatcher queue full or stopping)")
-            dropped.correlation_id = pcl.correlation_id
-            self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+
+    def __drop(self, topic, data, size, is_specific_handler, *, over_byte_budget):
+        """A message the queue could not take (queue full or stopping, or
+        over dispatch.max_queued_bytes).
+
+        Issue #4: a dropped request is answered "overloaded" at once so
+        that its requester fails fast. That needs its topic_return and
+        correlation id, so it is decoded here, on the receiving thread,
+        only when small enough (_DROP_REPLY_DECODE_LIMIT) and only when
+        it would have been auto-replied to (RFC-003)."""
+        if over_byte_budget:
+            with self._queued_bytes_lock:
+                self._byte_budget_drops += 1
+                drops = self._byte_budget_drops
+            level = logging.WARNING if drops & (drops - 1) == 0 else logging.DEBUG
+            logger.log(level, self.M(
+                f"Dropped a message of {size} bytes on {ensure_size(repr(topic), 200)}: "
+                f"dispatch.max_queued_bytes={self._max_queued_bytes} would be exceeded "
+                f"({drops} dropped so far)."))
+        if not is_specific_handler or size > _DROP_REPLY_DECODE_LIMIT:
+            return
+        try:
+            pcl = Parcel.from_payload(data, **self._codec_options)
+        except Exception as ex:
+            self.__count_decode_failure(topic, ex)
+            return
+        if not pcl.topic_return or _is_holon_control_topic(pcl.topic_return):
+            return
+        dropped = Parcel.from_content(None)
+        dropped.error = ("overloaded: the request was dropped before it was handled "
+                         "(dispatcher queue or byte budget full, or stopping)")
+        dropped.correlation_id = pcl.correlation_id
+        self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+
+
+    def __reserve_queued_bytes(self, size) -> bool:
+        """Issue #34: account `size` against dispatch.max_queued_bytes.
+        Returns False, reserving nothing, if it does not fit."""
+        with self._queued_bytes_lock:
+            if self._queued_bytes + size > self._max_queued_bytes:
+                return False
+            self._queued_bytes += size
+            return True
+
+
+    def __release_queued_bytes(self, size) -> None:
+        with self._queued_bytes_lock:
+            self._queued_bytes -= size
 
 
     def __has_handler(self, topic) -> bool:
@@ -1805,20 +1928,23 @@ class Agent(BrokerNotifier):
             return topic in self.__topic_handlers
 
 
-    def __hold(self, topic, pcl) -> None:
-        """Follow-up of #17: keep a message for release by __hook_done.
-        Called under _early_lock. Beyond _EARLY_MESSAGE_LIMIT the message
-        is dropped and counted; logged at WARNING on the 1st, 2nd, 4th,
-        ... drop."""
-        if len(self._early_messages) >= _EARLY_MESSAGE_LIMIT:
+    def __hold(self, topic, data, size) -> None:
+        """Follow-up of #17: keep a message, undecoded, for release by
+        __hook_done. Called under _early_lock. Beyond _EARLY_MESSAGE_LIMIT
+        messages or dispatch.max_queued_bytes (issue #34) the message is
+        dropped and counted; logged at WARNING on the 1st, 2nd, 4th, ...
+        drop."""
+        if (len(self._early_messages) >= _EARLY_MESSAGE_LIMIT
+                or self._held_bytes + size > self._max_queued_bytes):
             self._early_dropped += 1
             dropped = self._early_dropped
             level = logging.WARNING if dropped & (dropped - 1) == 0 else logging.DEBUG
             logger.log(level, self.M(
                 f"Dropped a message on {topic!r} that arrived before the handlers were "
-                f"registered: {_EARLY_MESSAGE_LIMIT} already held ({dropped} dropped so far)."))
+                f"registered: the hold is full ({dropped} dropped so far)."))
             return
-        self._early_messages.append((topic, pcl))
+        self._early_messages.append((topic, data, size))
+        self._held_bytes += size
 
 
     def __subscribed_in_session(self, topic) -> bool:
@@ -1855,6 +1981,7 @@ class Agent(BrokerNotifier):
                 return
             held = list(self._early_messages)
             self._early_messages.clear()
+            self._held_bytes = 0
             timer, self._gate_timer = self._gate_timer, None
         if timer is not None:
             timer.cancel()
@@ -1872,6 +1999,7 @@ class Agent(BrokerNotifier):
             self._awaiting_hooks.clear()
             held = list(self._early_messages)
             self._early_messages.clear()
+            self._held_bytes = 0
             self._gate_timer = None
         logger.warning(self.M(
             f"Stopped holding early messages after {_EARLY_MESSAGE_MAX_HOLD_S:g} s although "
@@ -1895,10 +2023,10 @@ class Agent(BrokerNotifier):
             dispatcher = self._get_dispatcher()
             capacity = getattr(dispatcher, 'queue_capacity', None)
             throttle = capacity is not None
-            for topic, pcl in held:
+            for topic, data, size in held:
                 if throttle:
                     throttle = self.__wait_for_queue_room(dispatcher, capacity)
-                self.__route(topic, pcl)
+                self.__route(topic, data, size)
         threading.Thread(target=run, name=f'{self.name_tag}-early-replay', daemon=True).start()
 
 
@@ -1918,7 +2046,8 @@ class Agent(BrokerNotifier):
     @property
     def decode_failure_count(self) -> int:
         """Issue #15: how many received messages were dropped because
-        they could not be decoded as an AgentFlow Parcel."""
+        they could not be decoded as an AgentFlow Parcel, including those
+        refused undecoded for exceeding codec.max_payload_bytes (#34)."""
         with self._decode_lock:
             return self._decode_failures
 

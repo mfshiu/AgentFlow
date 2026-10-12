@@ -243,6 +243,8 @@ def test_the_deduplication_window_is_bounded():
     try:
         for i in range(window + 100):
             broker.deliver('t', _with_message_id(i, f'm-{i}'))
+        # Since issue #34 deduplication runs on the dispatcher threads.
+        assert _wait_until(lambda: agent._get_dispatcher().processed_count >= window + 100, timeout=10)
         assert len(agent._recent_message_ids) == window
     finally:
         agent.terminate()
