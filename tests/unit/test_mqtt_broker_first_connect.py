@@ -10,7 +10,9 @@ broker, while recovery_metrics() counted it as active.
 Contracts verified (with the mocked paho Client from tests/conftest.py):
   - The first CONNACK sends every topic subscribed before it, at its
     QoS, and counts the replay as a recovery run.
-  - A topic unsubscribed before the first CONNACK is not sent.
+  - A topic unsubscribed before the first CONNACK is not sent; one
+    unsubscribed while the replay is sending it ends unsubscribed
+    (RFC-005 §7.10).
   - A first CONNACK with an empty registry runs no recovery.
 """
 
@@ -47,6 +49,33 @@ def test_a_topic_unsubscribed_before_the_first_connack_is_not_sent(broker, fake_
     broker.unsubscribe('early/topic')
     _fire_connect(broker, fake_client)
     assert _subscribed_topics(fake_client) == []
+
+
+xfail_54r = pytest.mark.xfail(strict=True, reason='issue #54 review: fixed in the next commit')
+
+
+def _subscription_calls(fake_client, topic):
+    calls = []
+    for name, args, kwargs in fake_client.mock_calls:
+        if name in ('subscribe', 'unsubscribe') and (kwargs.get('topic') or args[0]) == topic:
+            calls.append(name)
+    return calls
+
+
+@xfail_54r
+def test_an_unsubscribe_during_the_replay_wins(broker, fake_client):
+    assert broker.start({}) is True
+    broker.subscribe('early/topic', 'str')
+    replay_subscribe = broker._client_subscribe
+
+    def unsubscribed_meanwhile(topic, qos):
+        # Another thread, between the replay's registry check and its
+        # paho call: connected by now, so it sends UNSUBSCRIBE at once.
+        broker.unsubscribe(topic)
+        return replay_subscribe(topic, qos)
+    broker._client_subscribe = unsubscribed_meanwhile
+    _fire_connect(broker, fake_client)
+    assert _subscription_calls(fake_client, 'early/topic')[-1] == 'unsubscribe'
 
 
 def test_a_first_connack_with_no_subscriptions_runs_no_recovery(broker, fake_client):
