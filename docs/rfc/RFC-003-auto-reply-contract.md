@@ -1,6 +1,6 @@
 # RFC-003 — auto-reply contract
 
-- **Status**: **Implemented (2026-07-26)**
+- **Status**: **Implemented (2026-07-26)**; §3 rule 3 amended 2026-10-13 (issue #68): an error reply names the exception type only, by default.
 - **Author**: Audit follow-up
 - **Depends on**: `docs/audit/05-risk-register.md` R-05; consistent with [RFC-001](RFC-001-publish-sync-subscription-lifecycle.md) and [RFC-002](RFC-002-publish-error-propagation.md)
 - **Scope**: `Agent._on_message` auto-reply semantics: specific-handler vs fall-through-on_message dispatch, return-type rules, whether reply parcels preserve `topic_return`, and how to prevent self-loop / multi-agent loop
@@ -316,7 +316,7 @@ After RFC-003, the contract that `Agent._on_message` implements is:
 2. **Auto-reply eligibility**: an auto-reply is emitted **iff** the incoming parcel's `topic_return` is truthy **and** the dispatch was specific-handler.
 3. **Reply payload**:
    - If the specific handler returned a value, that value becomes the reply body (`Parcel.from_content` wraps non-Parcels; `Parcel` values pass through).
-   - If the specific handler raised, the reply body is a fresh `TextParcel(None)` with `.error` set to `str(ex)`.
+   - If the specific handler raised, the reply body is a fresh `TextParcel(None)` with `.error` set to `str(ex)`. *Amended 2026-10-13 (issue #68): `.error` names the exception type only, for example `"ConnectionError (details are in the responder's log)"`. `str(ex)` may hold connection strings, hosts or credentials, and anyone subscribed to the reply topic reads the reply. The responder still logs the message with its traceback. The Agent config `errors: {expose_details: true}` restores `str(ex)`. On the requester side, `publish_sync(..., raise_on_error=True)` raises `RemoteError` (topic, error, reply) for a reply carrying an error; by default the Parcel is returned as before.*
 4. **Reply `topic_return`**: always `None`. The framework strips any `topic_return` from the handler's returned parcel before publishing.
 5. **Non-mutation guarantee**: the incoming parcel `p` is never mutated by `_on_message`. Handlers may safely read `p` (e.g., cache it) without observing later mutations.
 
