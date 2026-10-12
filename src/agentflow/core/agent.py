@@ -21,7 +21,7 @@ from agentflow.core.parcel import Parcel, ensure_size, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
-from agentflow.broker.message_broker import check_qos
+from agentflow.broker.message_broker import PublishBackpressureError, check_qos
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
@@ -299,6 +299,10 @@ class Agent(BrokerNotifier):
         self._queued_bytes = 0
         self._byte_budget_drops = 0
         self._queued_bytes_lock = threading.Lock()
+        # Issue #35: publishes the broker refused because its outgoing
+        # queue was full; see publish_backpressure_count. Guarded by
+        # _queued_bytes_lock too.
+        self._publish_backpressure = 0
         # Follow-up of #17: messages with no handler that arrive while
         # lifecycle hooks are still registering handlers are held here
         # (see __await_hook) and released once every awaited hook has
@@ -1110,9 +1114,33 @@ class Agent(BrokerNotifier):
         try:
             self._publish_or_raise(topic, data, qos=qos)
             return True
+        except PublishBackpressureError as ex:
+            self.__count_backpressure(topic, ex)
+            return False
         except Exception as ex:
             logger.exception(ex)
             return False
+
+
+    @property
+    def publish_backpressure_count(self) -> int:
+        """Issue #35: how many publishes the broker refused because its
+        outgoing queue was full (Agent.publish returned False)."""
+        with self._queued_bytes_lock:
+            return self._publish_backpressure
+
+
+    def __count_backpressure(self, topic, ex) -> None:
+        """Issue #35: an expected condition under load, not a fault:
+        count it and log it at WARNING on the 1st, 2nd, 4th, ... refusal
+        and at DEBUG otherwise, without a traceback."""
+        with self._queued_bytes_lock:
+            self._publish_backpressure += 1
+            count = self._publish_backpressure
+        level = logging.WARNING if count & (count - 1) == 0 else logging.DEBUG
+        logger.log(level, self.M(
+            f"Publish to {ensure_size(repr(topic), 200)} refused, the broker's outgoing "
+            f"queue is full: {ex} ({count} so far)."))
 
 
     def _publish_or_raise(self, topic, data=None, *, qos=0) -> None:
