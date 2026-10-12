@@ -1179,7 +1179,7 @@ Signature and return type unchanged; **never-raise preserved** — the diagnosti
 
 - **Status**: **RESOLVED** (2026-10-13). `__topic_handlers` was fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md) on 2026-07-27. `_children` / `_parents` followed:
   - **Issues #6 / #13:** writes happen under `_holon_lock`.
-  - **Issue #57, copy-on-write:** each registration replaces the dict instead of mutating it, so code iterating one, such as a user hook while other members register, never sees it change size, and readers need no lock.
+  - **Issue #57, copy-on-write:** a new member replaces the dict instead of growing it. Code iterating one, such as a user hook while other members register, never sees it change size, and readers need no lock. A known member's re-registration (#6) updates its entry in place: the keys do not change, and no copy is made, so a round of re-registrations stays linear.
   - **Issue #57, hooks:** a raising `on_register_child` no longer skips the `register_parent` answer, and a raising `on_register_parent` no longer escapes the handler. Both are logged.
   - **Verification:** `tests/unit/core/test_holon_registry_concurrency.py`.
 - **Severity**: Medium
