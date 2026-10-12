@@ -19,6 +19,8 @@ Failure injection:
                             immediately without a CONNACK
                             (simulates a broker that is down)
   - connack_rc              return code sent in every CONNACK
+  - connack_delay           seconds to wait before sending each CONNACK
+                            (a slow broker: the client is STARTING)
   - stall(index)            stops reading one client connection, so that
                             its TCP buffers, then the client's own
                             outgoing queue, fill up (a slow or stuck
@@ -64,6 +66,7 @@ def _encode_str(s: str) -> bytes:
 class MiniMqttServer:
     def __init__(self, *, connack_rc: int = 0):
         self.connack_rc = connack_rc
+        self.connack_delay = 0.0
         self.reject_connections = False
         self.withhold_puback = False
         self.deliver_on_connect: List[Tuple[str, bytes]] = []
@@ -293,6 +296,8 @@ class MiniMqttServer:
         with self._lock:
             self.connects.append((conn.index, conn.client_id))
             self.clean_sessions.append((conn.index, clean_session))
+        if self.connack_delay:
+            time.sleep(self.connack_delay)
         conn.send(bytes([0x20, 0x02, 0x00, self.connack_rc]))
         if self.connack_rc == 0:
             for topic, payload in list(self.deliver_on_connect):
