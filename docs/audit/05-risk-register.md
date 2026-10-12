@@ -566,6 +566,13 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 - **Impact**: Publish emits `logger.error("Cannot publish: _broker is None.")` and returns `None`. Caller cannot detect the failure. `agent._children` returns empty in parent even after children register.
 - **Confidence**: High
 - **Recommended verification test**: Start an agent with process mode, call `agent.publish('test', 'x')` from the main thread of the parent, and observe with a second subscribed agent that no message arrives.
+- **Partially resolved 2026-10-13 (issue #9, roadmap P0-5: warnings only):**
+  - Agent's docstring describes the controller contract.
+  - On the controller, `publish`, `publish_sync`, `subscribe` and the data API warn (`RuntimeWarning`).
+  - `start()` in the default process mode warns that the default will become `'thread'` (`FutureWarning`).
+  - Unpicklable attributes are named when the start fails.
+  - Verified by `tests/unit/core/test_process_controller.py`.
+  - **Still open (P1-5):** refusing these calls, and switching the default mode.
 
 ---
 
