@@ -319,9 +319,11 @@ class Agent(BrokerNotifier):
         self.interval_seconds = 0
         self._agent_worker: Optional["Worker"] = None
 
-        # Issue #57: replaced, never mutated, on each registration (under
-        # _holon_lock), so that code iterating them, e.g. a hook while
-        # other members register, never sees them change size.
+        # Issue #57: a new member replaces the dict (copy-on-write, under
+        # _holon_lock) instead of growing it, so that code iterating one,
+        # e.g. a hook while other members register, never sees it change
+        # size. A known member's entry is updated in place: the keys do
+        # not change, and re-registrations (#6) need no copy.
         self._children: dict = {}
         self._parents: dict = {}
         # Issue #6: makes "is this a new member?" + insert atomic, so a
@@ -1580,7 +1582,10 @@ class Agent(BrokerNotifier):
             is_new = child_id not in self._children
             refused = is_new and cap is not None and len(self._children) >= cap
             if not refused:
-                self._children = {**self._children, child_id: child_info}     # issue #57
+                if is_new:
+                    self._children = {**self._children, child_id: child_info}     # issue #57
+                else:
+                    self._children[child_id] = child_info
                 total = len(self._children)
                 if is_new:
                     self._children_registering.add(child_id)
@@ -1617,7 +1622,10 @@ class Agent(BrokerNotifier):
         parent_info['child_id'] = self.agent_id
         with self._holon_lock:
             is_new = parent_id not in self._parents
-            self._parents = {**self._parents, parent_id: parent_info}       # issue #57
+            if is_new:
+                self._parents = {**self._parents, parent_id: parent_info}       # issue #57
+            else:
+                self._parents[parent_id] = parent_info
             total = len(self._parents)
             pending = self._pending_terminates.pop(parent_id, None)
         if is_new:

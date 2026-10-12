@@ -30,8 +30,6 @@ from agentflow.core.parcel import Parcel
 from tests.fakes.fake_broker import FakeBroker, FakeWorker
 from tests.fakes.fake_bus import FakeBus
 
-xfail_57r = pytest.mark.xfail(strict=True, reason='issue #57 review: fixed in the next commit')
-
 
 class Parent(Agent):
     def __init__(self):
@@ -155,7 +153,6 @@ def test_the_parent_registry_is_replaced_for_a_new_parent():
         child.terminate()
 
 
-@xfail_57r
 def test_a_known_members_reregistration_does_not_copy_the_registry():
     parent = Parent()
     broker = _attach(parent)
