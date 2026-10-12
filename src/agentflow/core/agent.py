@@ -72,6 +72,9 @@ _EARLY_MESSAGE_LIMIT = 4096
 # after the gate closed, even if a hook (e.g. a long-running
 # on_connected loop) has not returned.
 _EARLY_MESSAGE_MAX_HOLD_S = 10.0
+# Releasing held messages waits at most this long for room in the
+# dispatcher queue and byte budget before it stops waiting.
+_REPLAY_ROOM_TIMEOUT_S = 1.0
 
 
 def _topic_matches(subscription: str, topic: str) -> bool:
@@ -1790,6 +1793,9 @@ class Agent(BrokerNotifier):
                 is_specific_handler = False
                 topic_handler = self.on_message
 
+        # Created first: a dispatcher that fails to start must not leave
+        # bytes reserved.
+        dispatcher = self._get_dispatcher()
         if not self.__reserve_queued_bytes(size):
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
             return
@@ -1802,7 +1808,7 @@ class Agent(BrokerNotifier):
         # of spawning one Thread per message. enqueue() never raises
         # (broker-callback safety invariant, §7.3); the dispatcher counts
         # and logs its own drops.
-        if not self._get_dispatcher().enqueue(task, topic=topic):
+        if not dispatcher.enqueue(task, topic=topic):
             self.__release_queued_bytes(size)
             self.__drop(topic, data, size, is_specific_handler, over_byte_budget=False)
 
@@ -1901,6 +1907,12 @@ class Agent(BrokerNotifier):
             return
         if not pcl.topic_return or _is_holon_control_topic(pcl.topic_return):
             return
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # A redelivered copy of a request that was handled, answered,
+            # or is still waiting in the queue. Recording the id here
+            # makes "overloaded" true: a waiting original, or a later
+            # redelivery, is then dropped as a duplicate instead of run.
+            return
         dropped = Parcel.from_content(None)
         dropped.error = ("overloaded: the request was dropped before it was handled "
                          "(dispatcher queue or byte budget full, or stopping)")
@@ -1916,6 +1928,11 @@ class Agent(BrokerNotifier):
                 return False
             self._queued_bytes += size
             return True
+
+
+    def __queued_bytes_fit(self, size) -> bool:
+        with self._queued_bytes_lock:
+            return self._queued_bytes + size <= self._max_queued_bytes
 
 
     def __release_queued_bytes(self, size) -> None:
@@ -2010,10 +2027,10 @@ class Agent(BrokerNotifier):
     def __replay(self, held) -> None:
         """Follow-up of #17: route held messages, in arrival order, on a
         background thread so that the hook that opened the gate is not
-        delayed. They skip deduplication, which recorded their ids when
-        they arrived. Each one waits for room in the dispatcher queue,
-        so that the release does not burst past it and turn requests
-        into 'overloaded' drops."""
+        delayed. Each one waits for room in the dispatcher queue and in
+        the byte budget (#34), so that the release does not burst past
+        them and turn requests into 'overloaded' drops. Deduplication
+        runs when each is handled."""
         if not held:
             return
         logger.info(self.M(
@@ -2022,21 +2039,22 @@ class Agent(BrokerNotifier):
         def run():
             dispatcher = self._get_dispatcher()
             capacity = getattr(dispatcher, 'queue_capacity', None)
-            throttle = capacity is not None
+            throttle = True
             for topic, data, size in held:
                 if throttle:
-                    throttle = self.__wait_for_queue_room(dispatcher, capacity)
+                    throttle = self.__wait_for_room(dispatcher, capacity, size)
                 self.__route(topic, data, size)
         threading.Thread(target=run, name=f'{self.name_tag}-early-replay', daemon=True).start()
 
 
-    @staticmethod
-    def __wait_for_queue_room(dispatcher, capacity, timeout=1.0) -> bool:
-        """Wait until the dispatcher queue has room. Returns False if it
-        stayed full for `timeout` (its consumers are stuck), so that the
-        caller stops waiting."""
-        deadline = time.monotonic() + timeout
-        while dispatcher.queue_depth >= capacity:
+    def __wait_for_room(self, dispatcher, capacity, size) -> bool:
+        """Wait until the dispatcher queue has room for one more message
+        (if it is bounded) and the byte budget for `size` more bytes.
+        Returns False if there was none for _REPLAY_ROOM_TIMEOUT_S (the
+        consumers are stuck), so that the caller stops waiting."""
+        deadline = time.monotonic() + _REPLAY_ROOM_TIMEOUT_S
+        while ((capacity is not None and dispatcher.queue_depth >= capacity)
+               or not self.__queued_bytes_fit(size)):
             if time.monotonic() >= deadline or dispatcher.is_stopped:
                 return False
             time.sleep(0.002)

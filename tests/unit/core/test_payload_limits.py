@@ -37,8 +37,6 @@ from tests.fakes.fake_bus import FakeBus
 MiB = 1024 * 1024
 SETTLE_S = 0.3
 
-xfail_34r = pytest.mark.xfail(strict=True, reason='issue #34 review: fixed in the next commit')
-
 
 def _wait_until(predicate, timeout=3.0):
     return FakeBus.wait_until(predicate, timeout=timeout)
@@ -156,7 +154,6 @@ def _replies(broker, topic):
     return [Parcel.from_payload(p) for t, p in broker.publish_calls if t == topic]
 
 
-@xfail_34r
 def test_a_redelivered_copy_of_a_waiting_request_is_not_answered_twice():
     agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
     handled = []
@@ -177,7 +174,6 @@ def test_a_redelivered_copy_of_a_waiting_request_is_not_answered_twice():
         agent.terminate()
 
 
-@xfail_34r
 def test_a_request_answered_overloaded_is_not_run_when_redelivered():
     agent, broker = _agent({'dispatch': {'workers': 1, 'queue_capacity': 1}})
     handled = []
@@ -197,9 +193,8 @@ def test_a_request_answered_overloaded_is_not_run_when_redelivered():
         agent.terminate()
 
 
-@xfail_34r
 def test_the_release_of_held_messages_waits_for_room_in_the_byte_budget(monkeypatch):
-    monkeypatch.setattr(agent_module, '_REPLAY_ROOM_TIMEOUT_S', 10.0, raising=False)
+    monkeypatch.setattr(agent_module, '_REPLAY_ROOM_TIMEOUT_S', 10.0)
     agent, broker = _agent({'dispatch': {'workers': 1, 'max_queued_bytes': 10_000}})
     gate = _blocked_worker(agent, broker)
     agent.subscribe('live', topic_handler=lambda topic, pcl: None)
@@ -220,7 +215,6 @@ def test_the_release_of_held_messages_waits_for_room_in_the_byte_budget(monkeypa
         agent.terminate()
 
 
-@xfail_34r
 def test_a_dispatcher_that_fails_to_start_leaves_no_bytes_reserved():
     agent, broker = _agent({'dispatch': {'workers': 0}})
     try:
