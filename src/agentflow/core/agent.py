@@ -1,4 +1,6 @@
 import copy
+import io
+from multiprocessing.reduction import ForkingPickler
 from collections import OrderedDict, deque
 import inspect
 import logging
@@ -24,7 +26,7 @@ from agentflow.broker.broker_maker import BrokerMaker
 from agentflow.broker.message_broker import PublishBackpressureError, check_filter, check_qos
 from agentflow.core import config
 from agentflow.core.config import EventHandler
-from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
+from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker, WorkerState
 from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 
 
@@ -550,9 +552,12 @@ class Agent(BrokerNotifier):
 
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
+        # Issue #9: the mode stays unset until start() unless the caller
+        # chooses it (here, with set_config, or start_thread / start_
+        # process), so that start() can tell and warn of the coming
+        # change of default.
+        self.config.pop(config.CONCURRENCY_TYPE, None)
         self.config.update(agent_config)
-        # Issue #9: whether the caller chose the mode; start() warns if not.
-        self._concurrency_explicit = config.CONCURRENCY_TYPE in agent_config
         logger.debug(f'self.config: {_config_for_log(self.config)}')
 
 
@@ -760,14 +765,19 @@ class Agent(BrokerNotifier):
 
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
-            self.config[config.CONCURRENCY_TYPE] = 'process'
-        if self.config[config.CONCURRENCY_TYPE] == 'process' and not self._concurrency_explicit:
+            self.config[config.CONCURRENCY_TYPE] = config.default_config[config.CONCURRENCY_TYPE]
             warnings.warn(
                 "Agent.start() runs the agent in a child process by default, and this "
                 "object then only controls it; the default will become 'thread' in a "
                 "future major version. Call start_thread() or start_process(), or set "
                 "CONCURRENCY_TYPE, to choose explicitly.",
                 FutureWarning, stacklevel=2)
+        worker = self._agent_worker
+        if worker is not None and getattr(worker, 'state', None) is WorkerState.START_FAILED:
+            # Issue #9: a failed start left nothing running; start again
+            # with a fresh worker (e.g. start_thread() after start_process()
+            # failed), instead of refusing to restart the failed one.
+            self._agent_worker = None
         logger.info(self.M(f"self.config: {_config_for_log(self.config)}"))
         self.work_process = self._get_worker().start()
         
@@ -780,13 +790,11 @@ class Agent(BrokerNotifier):
         
     def start_process(self):
         self.config[config.CONCURRENCY_TYPE] = 'process'
-        self._concurrency_explicit = True
         self.start()
         
         
     def start_thread(self):
         self.config[config.CONCURRENCY_TYPE] = 'thread'
-        self._concurrency_explicit = True
         self.start()
 
 
@@ -806,11 +814,23 @@ class Agent(BrokerNotifier):
 
     def _unpicklable_attributes(self) -> list:
         """Issue #9: the names of the attributes that cannot be pickled
-        to a spawned child (see __getstate__)."""
+        to a spawned child (see __getstate__). Each is pickled the way
+        spawning does (ForkingPickler), with references to this agent
+        left out, so that an attribute referring back to it is not
+        blamed for another one; a multiprocessing primitive, which can
+        only be pickled while spawning, is taken as fine."""
+        agent = self
+
+        class _Pickler(ForkingPickler):
+            def persistent_id(self, obj):
+                return 'agent' if obj is agent else None
+
         names = []
         for name, value in self.__getstate__().items():
             try:
-                pickle.dumps(value)
+                _Pickler(io.BytesIO()).dump(value)
+            except RuntimeError:
+                pass        # e.g. a multiprocessing Event: shared when spawning
             except Exception:
                 names.append(name)
         return names
@@ -1021,6 +1041,7 @@ class Agent(BrokerNotifier):
         
         
     def start_interval_loop(self, interval_seconds):
+        self._warn_if_controller('start_interval_loop')
         logger.debug(f"{self.agent_id}> Start interval loop.")
         self.interval_seconds = interval_seconds
 
@@ -1521,6 +1542,7 @@ class Agent(BrokerNotifier):
         RFC-007 §7.4: refuses to remove a publish_sync-owned entry;
         raises TopicWaitCollisionError instead.
         """
+        self._warn_if_controller('unsubscribe')
         # RFC-007: lock + owner check + pop under lock.
         with self._handlers_lock:
             existing = self.__topic_handlers.get(topic)

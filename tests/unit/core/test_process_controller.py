@@ -43,8 +43,6 @@ from tests.fakes.fake_broker import FakeBroker, FakeWorker
 
 EMPTY_BROKER = {'broker': {'broker_name': 'b', 'b': {'broker_type': 'empty'}}}
 
-xfail_9r = pytest.mark.xfail(strict=True, reason='issue #9 review: fixed in the next commit')
-
 
 class _StartableWorker(FakeWorker):
     def start(self):
@@ -122,7 +120,6 @@ def test_an_explicit_mode_does_not_warn(start):
         getattr(agent, 'start' if start == 'explicit' else start)()
 
 
-@xfail_9r
 @pytest.mark.parametrize('call', [
     lambda a: a.unsubscribe('t'),
     lambda a: a.start_interval_loop(0),
@@ -146,7 +143,6 @@ def test_the_default_mode_warning_points_at_the_caller():
     assert caught[0].filename == __file__
 
 
-@xfail_9r
 def test_a_mode_set_after_construction_counts_as_chosen():
     agent = Agent('sub', {})
     agent.set_config('CONCURRENCY_TYPE', 'process')
@@ -183,7 +179,6 @@ class _WithSharedEventAndLambda(Agent):
         self.callback = lambda: None                  # cannot be pickled
 
 
-@xfail_9r
 def test_only_the_attributes_at_fault_are_named_and_the_type_is_kept():
     agent = _WithSharedEventAndLambda()
     with pytest.raises((AttributeError, pickle.PicklingError)) as raised:
@@ -193,7 +188,6 @@ def test_only_the_attributes_at_fault_are_named_and_the_type_is_kept():
     assert "'ready'" not in notes and "'helper'" not in notes
 
 
-@xfail_9r
 def test_start_thread_works_after_a_failed_process_start():
     agent = _WithLock()
     with pytest.raises(TypeError):

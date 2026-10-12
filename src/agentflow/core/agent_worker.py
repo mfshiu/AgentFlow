@@ -213,7 +213,8 @@ class ProcessWorker(Worker):
                 self._state = WorkerState.START_FAILED
             detail = self._unpicklable_detail(ex)
             if detail:
-                raise TypeError(detail) from ex
+                # Keeps the exception's type, so existing handlers match.
+                ex.add_note(detail)
             raise
 
         with self._state_lock:
@@ -240,7 +241,7 @@ class ProcessWorker(Worker):
             return None
         if not names:
             return None
-        return (f"{ex}. Agent attribute(s) {', '.join(map(repr, names))} cannot be "
+        return (f"Agent attribute(s) {', '.join(map(repr, names))} cannot be "
                 f"pickled to the child process; create them in on_activating(), which "
                 f"runs in the child, or use start_thread().")
 
