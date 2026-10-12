@@ -17,9 +17,9 @@ from agentflow.core.parcel import Parcel, TextParcel
 class FakeWorker:
     """Duck-typed stub for agentflow.core.agent_worker.Worker.
 
-    Agent.publish_sync (agent.py:336) only calls .create_event() on the
-    worker. Returning None causes Agent.DataEvent (agent.py:297) to fall
-    back to threading.Event(), which needs no multiprocessing setup.
+    Agent.publish_sync no longer calls the worker (issue #21): its
+    Agent.DataEvent is a plain threading.Event. create_event() is kept
+    for any caller that still uses it.
 
     Agent.terminate calls self._agent_worker.stop(); FakeWorker.stop is
     a no-op because there is no real worker to signal.

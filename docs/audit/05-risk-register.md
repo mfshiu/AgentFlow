@@ -116,6 +116,11 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
   - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
   - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
+  - **Side effects of `publish_sync`** (issue #21, found 2026-10-09): it wrote its reply topic into the caller's Parcel, asked the worker for an event, waited forever on `timeout=None` silently, and handed late replies to `on_message`. *Resolved 2026-10-13 (#21):*
+    - *The caller's Parcel is untouched, and the waiter is a `threading.Event`.*
+    - *`timeout=None` is deprecated.*
+    - *Late replies on generated topics are dropped and counted.*
+    - *See RFC-014 §2.2 and `tests/unit/core/test_publish_sync_side_effects.py`. The retry returning an earlier call's late reply was already fixed by correlation ids (#36).*
   - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details. **Superseded 2026-10-12 ([RFC-014 §8](../rfc/RFC-014-request-reply-correlation.md), #36)**: concurrent `publish_sync` calls now share the `topic_wait` and each takes the reply carrying its own correlation id. The fail-fast remains against normal subscribe handlers.
 
 ---
