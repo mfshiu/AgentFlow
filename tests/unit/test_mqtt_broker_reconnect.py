@@ -534,6 +534,8 @@ def test_recovery_metrics_returns_all_keys(broker, fake_client):
         'resubscribe_success_count', 'resubscribe_error_count',
         'recovery_run_count', 'active_subscriptions',
         'connected', 'stopping', 'ever_connected',
+        # Issue #35: the outbound limit's pending publishes.
+        'pending_publish_count', 'pending_publish_bytes',
     }
 
 
