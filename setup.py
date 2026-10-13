@@ -17,5 +17,14 @@ setup(
         #     'agentflow-cli=agentflow.cli:main',
         # ],
     },
-    python_requires='>=3.11',  # Specify the Python version you require
+    # Issue #77: the floor is the lowest Python the CI matrix tests
+    # (.github/workflows/ci.yml), and the classifiers name the versions it
+    # tests; tests/unit/test_packaging_metadata.py keeps them in step.
+    python_requires='>=3.11',
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.13",
+    ],
 )

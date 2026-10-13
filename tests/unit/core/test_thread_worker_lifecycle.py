@@ -679,8 +679,8 @@ def test_F1_agent_terminate_returns_bounded_when_broker_stop_wedges_and_logs_WAR
             # set(terminate_event)` helper; then `queue.get(timeout=1)`
             # may need one full timeout after the event fires to
             # observe it, giving a ~2s minimum before __deactivating
-            # runs and calls broker.stop. Allow 4s headroom for slower
-            # Python 3.9 sleep scheduling.
+            # runs and calls broker.stop. Allow 4s headroom for slow
+            # CI runners' sleep scheduling.
             assert broker.stop_started.wait(4.0), (
                 "broker.stop was never invoked from the worker thread"
             )
