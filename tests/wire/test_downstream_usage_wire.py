@@ -6,11 +6,13 @@ process. These cover what they do not:
   - the request style FlowDepot's agents and tests use: a service
     registers `subscribe(topic, "str", handler)` and its handler returns
     a dict; the client publishes a BinaryParcel carrying `topic_return`
-    and reads the reply in on_message;
-  - a process-mode (spawned) service answering publish_sync from its
-    own process;
+    and reads the reply in on_message; with the service in a thread and
+    in its own (spawned) process;
+  - a process-mode service answering publish_sync from its own process,
+    and exiting cleanly on terminate();
   - a holon whose child runs in its own process: it registers with its
-    parent, and the parent's terminate ends the child process.
+    parent, and the terminate the parent publishes ends the child
+    process cleanly.
 
 All against the in-process loopback server (127.0.0.1 only).
 """
@@ -21,7 +23,7 @@ import threading
 import pytest
 
 from agentflow.core.agent import Agent
-from agentflow.core.parcel import BinaryParcel
+from agentflow.core.parcel import BinaryParcel, Parcel
 from tests.fakes.mini_mqtt_server import MiniMqttServer
 
 pytestmark = pytest.mark.wire
@@ -94,12 +96,17 @@ class HolonMember(Agent):
         super().__init__(name, _config(port))
 
 
-def test_a_binary_request_gets_its_reply_in_on_message():
+def _exited_cleanly(server, process):
+    return server.wait_until(lambda: not process.is_alive(), 20) and process.exitcode == 0
+
+
+@pytest.mark.parametrize('service_mode', ['thread', 'process'])
+def test_a_binary_request_gets_its_reply_in_on_message(service_mode):
     server = MiniMqttServer()
     service, requester = RecognizeService(server.port), Requester(server.port)
     try:
-        service.start_thread()
-        assert server.wait_until(lambda: _subscribed(server, RECOGNIZE), 10)
+        getattr(service, f'start_{service_mode}')()
+        assert server.wait_until(lambda: _subscribed(server, RECOGNIZE), SPAWN_TIMEOUT_S)
         requester.start_thread()
         assert server.wait_until(lambda: _subscribed(server, 'return_topic'), 10)
 
@@ -129,7 +136,11 @@ def test_a_process_mode_service_answers_from_its_own_process():
         reply = client.publish_sync(WHOAMI, 'ping', timeout=10)
 
         assert reply.content['echo'] == 'ping'
-        assert reply.content['pid'] == service._agent_worker.work_process.pid != os.getpid()
+        process = service._agent_worker.work_process
+        assert reply.content['pid'] == process.pid != os.getpid()
+
+        service.terminate()
+        assert _exited_cleanly(server, process), f'exit code {process.exitcode}'
     finally:
         client.terminate()
         service.terminate()
@@ -150,8 +161,11 @@ def test_a_parent_stops_its_process_mode_child():
 
         parent.terminate()
 
-        assert server.wait_until(lambda: not process.is_alive(), 20), \
-            "the parent's terminate did not end the child process"
+        assert _exited_cleanly(server, process), \
+            f"the child process did not exit cleanly (exit code {process.exitcode})"
+        terminates = [p for t, p in server.published() if t == 'to_child.p'
+                      and (Parcel.from_payload(p).content or {}).get('subject') == 'terminate']
+        assert len(terminates) == 1, 'the parent did not publish one terminate'
     finally:
         child.terminate()
         parent.terminate()
