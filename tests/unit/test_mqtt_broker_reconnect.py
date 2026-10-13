@@ -7,9 +7,9 @@ No real broker, socket, or network is used.
 Contracts verified:
   - MqttBroker holds a `_registry: dict[topic, data_type]` maintained
     thread-safely by subscribe/unsubscribe.
-  - `_on_connect(rc=0)` distinguishes first-connect from reconnect via
-    `_ever_connected`; reconnect resubscribes every entry in the
-    registry snapshot.
+  - `_on_connect(rc=0)` resubscribes every entry in the registry
+    snapshot, on the first connect too since issue #54 (see
+    test_mqtt_broker_first_connect.py).
   - `_on_connect` / subscribe / unsubscribe short-circuit after
     `stop()` has flipped `_stopping`.
   - `_on_disconnect` classifies planned vs unexpected, clears
@@ -59,8 +59,8 @@ def test_first_on_connect_notifies_notifier(broker, fake_client, notifier):
 
 
 def test_first_on_connect_does_not_run_recovery(broker, fake_client):
-    """First successful connect: registry is empty and _ever_connected
-    was False, so no snapshot is taken and no resubscribe fires."""
+    """First successful connect with an empty registry: nothing to
+    replay, so no recovery runs (issue #54 replays a non-empty one)."""
     _fire_connect(broker, fake_client)
     metrics = broker.recovery_metrics()
     assert metrics['recovery_run_count'] == 0
@@ -436,8 +436,11 @@ def test_client_subscribe_exception_propagates_when_connected(
     fake_client.subscribe.side_effect = RuntimeError('paho failure')
     with pytest.raises(RuntimeError, match='paho failure'):
         broker.subscribe('T', 'str')
-    # Registry was updated BEFORE the client call raised.
-    assert broker.recovery_metrics()['active_subscriptions'] == 1
+    # Registry was updated BEFORE the client call raised, so the next
+    # CONNACK replays it; issue #53: but it is not counted as active.
+    assert broker._registry.keys() == {'T'}
+    assert broker.recovery_metrics()['active_subscriptions'] == 0
+    assert broker.recovery_metrics()['failed_subscriptions'] == 1
 
 
 def test_client_unsubscribe_exception_propagates_when_connected(
@@ -534,6 +537,10 @@ def test_recovery_metrics_returns_all_keys(broker, fake_client):
         'resubscribe_success_count', 'resubscribe_error_count',
         'recovery_run_count', 'active_subscriptions',
         'connected', 'stopping', 'ever_connected',
+        # Issue #35: the outbound limit's pending publishes.
+        'pending_publish_count', 'pending_publish_bytes',
+        # Issue #53: topics the broker refused or that failed to send.
+        'failed_subscriptions',
     }
 
 

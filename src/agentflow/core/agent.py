@@ -1,8 +1,11 @@
 import copy
+import io
+from multiprocessing.reduction import ForkingPickler
 from collections import OrderedDict, deque
 import inspect
 import logging
 import math
+import os
 import pickle
 import queue
 import re
@@ -15,25 +18,52 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, final, Optional
 import uuid
+import weakref
 
 from agentflow.core import holon_auth
-from agentflow.core.parcel import Parcel, parse_pickle_globals
+from agentflow.core.parcel import Parcel, ensure_size, parse_pickle_globals
 from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
-from agentflow.broker.message_broker import check_qos
+from agentflow.broker.message_broker import PublishBackpressureError, check_filter, check_qos
+from agentflow.broker.placeholder_broker import BrokerNotAvailableError
 from agentflow.core import config
 from agentflow.core.config import EventHandler
-from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker
+from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker, WorkerState
 from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 from agentflow.logging import redact_config
 
 
-import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
-_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals'})
+_CODEC_KEYS = frozenset({'accept_pickle', 'pickle_allowed_globals', 'max_payload_bytes'})
+# Issue #68: the keys of the optional `errors` config section.
+_ERRORS_KEYS = frozenset({'expose_details'})
+
+# Issue #34: payload limits. A payload larger than codec.max_payload_bytes
+# is dropped without decoding; at most dispatch.max_queued_bytes of
+# received payloads wait for a dispatcher thread (or are held, see #17).
+_DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+_DEFAULT_MAX_QUEUED_BYTES = 256 * 1024 * 1024
+# A dropped request is decoded on the receiving thread, to be answered
+# "overloaded" (issue #4), only up to this size.
+_DROP_REPLY_DECODE_LIMIT = 64 * 1024
+
+
+def _payload_size(data) -> int:
+    try:
+        return len(data)
+    except TypeError:
+        return 0
+
+
+def _positive_int(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"Agent config '{name}' must be a positive int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"Agent config '{name}' must be a positive int, got {value!r}")
+    return value
 
 # Issue #4: holon control messages and publish_sync requests / replies
 # travel at QoS 1 (at least once), and the topics they arrive on are
@@ -42,6 +72,37 @@ _CONTROL_QOS = 1
 # Issue #4: how many recently received message ids an agent remembers to
 # drop redeliveries (QoS 1 resends follow a reconnect closely).
 _DEDUP_WINDOW = 4096
+# Issue #21: how many reply topics publish_sync generated and has left
+# are remembered, so that a reply arriving late on one is dropped.
+_RETIRED_REPLY_TOPICS = 1024
+# Issue #21: publish_sync(timeout=None) is also logged, once per process,
+# since Python hides its DeprecationWarning outside __main__.
+_TIMEOUT_NONE_LOGGED = False
+# Issue #70: classes whose deprecated on_begining() override has been
+# reported in this process.
+_LEGACY_HOOK_WARNED: 'weakref.WeakSet[type]' = weakref.WeakSet()
+_LEGACY_HOOK_LOCK = threading.Lock()
+
+
+def _claim_legacy_hook_warning(cls: type) -> bool:
+    """True the first time per process for `cls` (issue #70), and
+    always for a class that cannot be hashed."""
+    try:
+        with _LEGACY_HOOK_LOCK:
+            if cls in _LEGACY_HOOK_WARNED:
+                return False
+            _LEGACY_HOOK_WARNED.add(cls)
+            return True
+    except TypeError:
+        return True
+
+
+def _release_legacy_hook_warning(cls: type) -> None:
+    try:
+        with _LEGACY_HOOK_LOCK:
+            _LEGACY_HOOK_WARNED.discard(cls)
+    except TypeError:
+        pass
 # Follow-up of #17: at most this many messages with no handler are held
 # while the lifecycle hooks are still registering handlers.
 _EARLY_MESSAGE_LIMIT = 4096
@@ -49,6 +110,9 @@ _EARLY_MESSAGE_LIMIT = 4096
 # after the gate closed, even if a hook (e.g. a long-running
 # on_connected loop) has not returned.
 _EARLY_MESSAGE_MAX_HOLD_S = 10.0
+# Releasing held messages waits at most this long for room in the
+# dispatcher queue and byte budget before it stops waiting.
+_REPLAY_ROOM_TIMEOUT_S = 1.0
 
 
 def _topic_matches(subscription: str, topic: str) -> bool:
@@ -112,6 +176,33 @@ class TopicWaitCollisionError(RuntimeError):
     The exception message distinguishes the context. Concurrent
     publish_sync calls on one topic_wait no longer raise it; they
     share the topic (RFC-014 §8, superseding RFC-006's fail-fast)."""
+
+
+class RemoteError(RuntimeError):
+    """Issue #68: raised by publish_sync(..., raise_on_error=True) when
+    the reply carries an error, e.g. because the responder's handler
+    raised. Attributes: `topic` (the request's), `error` (the reply's)
+    and `reply` (the reply Parcel). The message quotes the error
+    escaped and bounded: it is text from the network."""
+
+    def __init__(self, topic, error, reply):
+        super().__init__(
+            f"The request to {topic!r} failed at the responder: {ensure_size(repr(error), 200)}")
+        self.topic = topic
+        self.error = error
+        self.reply = reply
+
+    def __reduce__(self):
+        # Rebuilt from the attributes, so that it crosses processes.
+        return (type(self), (self.topic, self.error, self.reply))
+
+
+def _withheld_error(ex: BaseException) -> str:
+    """Issue #68: the error an automatic reply carries for a handler
+    exception, unless errors.expose_details: its type only. Its message
+    may hold internals (connection strings, hosts, credentials) that
+    anyone subscribed to the reply topic would read."""
+    return f"{type(ex).__name__} (details are in the responder's log)"
 
 
 class _HandlerOwnerType(Enum):
@@ -202,7 +293,32 @@ class _ReplyRouter:
 
 
 class Agent(BrokerNotifier):
-    def __init__(self, name:str, agent_config:dict={}):
+    """A named participant on the message bus: it subscribes handlers to
+    topics, publishes, answers requests (RFC-003) and joins a holon.
+
+    Concurrency (config `CONCURRENCY_TYPE`):
+      - 'thread' (`start_thread()`): the agent runs in this process, on
+        a worker thread. This object is the agent: publish, subscribe,
+        publish_sync and the data API (get_data / put_data / pop_data)
+        work on it.
+      - 'process' (`start_process()`, and `start()` by default): the
+        agent runs in a spawned child process. This object only
+        controls its lifecycle (terminate()). It has no broker and no
+        data store, so publishing, subscribing or using the data API
+        on it does not reach the running agent (RFC-008 §F); those
+        calls warn (issue #9). Do that work in the agent's own hooks
+        (on_activate and handlers run in the child), use start_thread(),
+        or create a separate Agent connected to the same broker.
+        Attributes are pickled to the child: create unpicklable ones
+        (locks, clients) in on_activating(), which runs there.
+
+    start() without an explicit CONCURRENCY_TYPE uses 'process' and warns
+    (FutureWarning) that the default will become 'thread'."""
+
+    def __init__(self, name:str, agent_config: Optional[dict] = None):
+        # Issue #75: None, not a mutable default shared by every Agent.
+        if agent_config is None:
+            agent_config = {}
         logger.debug('name: %s, agent_config: %s', name, redact_config(agent_config))
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
@@ -211,8 +327,12 @@ class Agent(BrokerNotifier):
         # Issue #1: inbound decoding policy, validated up front so a bad
         # `codec` config fails at construction rather than per message.
         self._codec_options = self.__parse_codec_config()
+        # Issue #34: payload size limits (codec / dispatch sections).
+        self._max_payload_bytes, self._max_queued_bytes = self.__parse_payload_limits()
         # Issue #13: holon control-plane policy, validated the same way.
         self._holon_options = self.__parse_holon_config()
+        # Issue #68: whether an error reply carries the exception message.
+        self._expose_error_details = self.__parse_errors_config()
         self.name = name
         self.tag = f'{self.agent_id[:4]}'
         self.name_tag = f'{name}:{self.tag}'
@@ -221,6 +341,11 @@ class Agent(BrokerNotifier):
         self.interval_seconds = 0
         self._agent_worker: Optional["Worker"] = None
 
+        # Issue #57: a new member replaces the dict (copy-on-write, under
+        # _holon_lock) instead of growing it, so that code iterating one,
+        # e.g. a hook while other members register, never sees it change
+        # size. A known member's entry is updated in place: the keys do
+        # not change, and re-registrations (#6) need no copy.
         self._children: dict = {}
         self._parents: dict = {}
         # Issue #6: makes "is this a new member?" + insert atomic, so a
@@ -237,7 +362,6 @@ class Agent(BrokerNotifier):
         # Issue #13: refused holon messages per kind, for logging.
         self._holon_rejections: dict = {}
 
-        self._message_broker = None
         self.__topic_handlers: dict[str, _HandlerRecord] = {}
         # RFC-006: guards atomic collision-check-and-register and
         # atomic identity-check-and-pop for publish_sync. Uses RLock
@@ -253,6 +377,28 @@ class Agent(BrokerNotifier):
         # first; a redelivered id is dropped (see __seen_before).
         self._recent_message_ids: OrderedDict = OrderedDict()
         self._dedup_lock = threading.Lock()
+        # Issue #21: reply topics publish_sync generated and has left,
+        # oldest first, and the late replies dropped on them; guarded
+        # by _handlers_lock (see late_reply_count).
+        self._retired_reply_topics: OrderedDict = OrderedDict()
+        self._late_replies = 0
+        # Issue #15: messages dropped because they were not valid
+        # AgentFlow parcels; see decode_failure_count.
+        self._decode_failures = 0
+        self._decode_lock = threading.Lock()
+        # Issue #34: bytes of received payloads queued for a dispatcher
+        # thread, and drops for exceeding that budget.
+        self._queued_bytes = 0
+        # Issue #7: publish_sync replies have a byte budget of their own,
+        # of the same size, so that ordinary messages cannot crowd out
+        # a reply a handler is waiting for. Guarded by _queued_bytes_lock.
+        self._reply_queued_bytes = 0
+        self._byte_budget_drops = 0
+        self._queued_bytes_lock = threading.Lock()
+        # Issue #35: publishes the broker refused because its outgoing
+        # queue was full; see publish_backpressure_count. Guarded by
+        # _queued_bytes_lock too.
+        self._publish_backpressure = 0
         # Follow-up of #17: messages with no handler that arrive while
         # lifecycle hooks are still registering handlers are held here
         # (see __await_hook) and released once every awaited hook has
@@ -261,6 +407,7 @@ class Agent(BrokerNotifier):
         self._early_messages: deque = deque()
         self._awaiting_hooks: set = set()
         self._early_dropped = 0
+        self._held_bytes = 0
         self._lifecycle_gating = False
         self._gate_timer: Optional[threading.Timer] = None
         # Topics passed to subscribe() in this process (guarded by
@@ -282,6 +429,10 @@ class Agent(BrokerNotifier):
         # message flows.
         self._dispatcher = None
         self._dispatcher_init_lock = threading.Lock()
+        # Issue #7: the lane for publish_sync replies (see
+        # _get_reply_dispatcher); closed by terminate().
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         if self.config.get('dispatch', {}).get('mode') == 'per_message_thread':
             warnings.warn(
                 "Agent dispatch mode 'per_message_thread' is deprecated "
@@ -304,16 +455,19 @@ class Agent(BrokerNotifier):
         '_handlers_lock',
         '_reply_topics_lock',
         '_recent_message_ids',
+        '_retired_reply_topics',
         '_dedup_lock',
+        '_decode_lock',
+        '_queued_bytes_lock',
         '_early_lock',
         '_early_messages',
         '_awaiting_hooks',
         '_gate_timer',
         '_dispatcher_init_lock',
         '_dispatcher',
+        '_reply_dispatcher',
         '_broker',
         '_agent_worker',
-        '_message_broker',
         '_children',
         '_parents',
         '_holon_lock',
@@ -387,16 +541,22 @@ class Agent(BrokerNotifier):
         self._handlers_lock = threading.RLock()
         self._reply_topics_lock = threading.RLock()
         self._recent_message_ids = OrderedDict()
+        self._retired_reply_topics = OrderedDict()
         self._dedup_lock = threading.Lock()
+        self._decode_lock = threading.Lock()
+        self._queued_bytes = 0
+        self._reply_queued_bytes = 0
+        self._queued_bytes_lock = threading.Lock()
         self._early_lock = threading.Lock()
         self._early_messages = deque()
         self._awaiting_hooks = set()
         self._gate_timer = None
-        self._dispatcher_init_lock = threading.RLock()
+        self._dispatcher_init_lock = threading.Lock()     # as in __init__ (issue #75)
         self._dispatcher = None
+        self._reply_dispatcher = None
+        self._reply_lane_closed = False
         self._broker = None
         self._agent_worker = None
-        self._message_broker = None
         self._children = {}
         self._parents = {}
         self._holon_lock = threading.Lock()
@@ -416,6 +576,11 @@ class Agent(BrokerNotifier):
 
     def __init_config(self, agent_config):
         self.config = config.default_config.copy()
+        # Issue #9: the mode stays unset until start() unless the caller
+        # chooses it (here, with set_config, or start_thread / start_
+        # process), so that start() can tell and warn of the coming
+        # change of default.
+        self.config.pop(config.CONCURRENCY_TYPE, None)
         self.config.update(agent_config)
         logger.debug('self.config: %s', redact_config(self.config))
 
@@ -469,6 +634,48 @@ class Agent(BrokerNotifier):
             'accept_pickle': accept_pickle,
             'pickle_allowed_globals': parse_pickle_globals(allowed),
         }
+
+
+    def __parse_errors_config(self) -> bool:
+        """Issue #68: the optional `errors` config section.
+
+          expose_details (bool, default False) — when a handler raises,
+                         the automatic error reply carries str(ex), as
+                         before #68, instead of the exception type only.
+                         The message is always logged by the responder.
+
+        Raises TypeError / ValueError on a malformed section."""
+        errors = self.config.get('errors')
+        if errors is None:
+            return False
+        if not isinstance(errors, dict):
+            raise TypeError(
+                f"Agent config 'errors' must be a dict, got {type(errors).__name__}")
+        unknown = set(errors) - _ERRORS_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent config 'errors' keys {sorted(map(str, unknown))}; "
+                f"expected {sorted(_ERRORS_KEYS)}")
+        expose = errors.get('expose_details', False)
+        if not isinstance(expose, bool):
+            raise TypeError(
+                f"Agent config 'errors.expose_details' must be a bool, got {expose!r}")
+        return expose
+
+
+    def __parse_payload_limits(self):
+        """Issue #34: `codec.max_payload_bytes` (default 16 MiB; larger
+        payloads are dropped without decoding) and
+        `dispatch.max_queued_bytes` (default 256 MiB; received payloads
+        waiting for a dispatcher thread, or held before the handlers
+        exist, may not exceed it). Raises TypeError / ValueError unless
+        each is a positive int."""
+        codec = self.config.get('codec') or {}
+        dispatch = self.config.get('dispatch') or {}
+        max_payload = codec.get('max_payload_bytes', _DEFAULT_MAX_PAYLOAD_BYTES)
+        max_queued = dispatch.get('max_queued_bytes', _DEFAULT_MAX_QUEUED_BYTES)
+        return (_positive_int(max_payload, 'codec.max_payload_bytes'),
+                _positive_int(max_queued, 'dispatch.max_queued_bytes'))
 
 
     def __parse_holon_config(self) -> _HolonOptions:
@@ -582,7 +789,19 @@ class Agent(BrokerNotifier):
 
     def start(self):
         if not config.CONCURRENCY_TYPE in self.config:
-            self.config[config.CONCURRENCY_TYPE] = 'process'
+            self.config[config.CONCURRENCY_TYPE] = config.default_config[config.CONCURRENCY_TYPE]
+            warnings.warn(
+                "Agent.start() runs the agent in a child process by default, and this "
+                "object then only controls it; the default will become 'thread' in a "
+                "future major version. Call start_thread() or start_process(), or set "
+                "CONCURRENCY_TYPE, to choose explicitly.",
+                FutureWarning, stacklevel=2)
+        worker = self._agent_worker
+        if worker is not None and getattr(worker, 'state', None) is WorkerState.START_FAILED:
+            # Issue #9: a failed start left nothing running; start again
+            # with a fresh worker (e.g. start_thread() after start_process()
+            # failed), instead of refusing to restart the failed one.
+            self._agent_worker = None
         logger.info(self.M("Starting agent."))
         logger.debug(self.M("self.config: %s"), redact_config(self.config))
         self.work_process = self._get_worker().start()
@@ -591,6 +810,10 @@ class Agent(BrokerNotifier):
         
         
     def _on_start(self):
+        """Hook: runs in the caller's process right after start() has
+        started the worker (in process mode, the child process has been
+        spawned; on_activate runs there, not here). Override for
+        caller-side follow-up; the default does nothing."""
         pass
         
         
@@ -604,12 +827,53 @@ class Agent(BrokerNotifier):
         self.start()
 
 
+    def _warn_if_controller(self, api: str) -> None:
+        """Issue #9: warn when `api` is called on the object that only
+        controls a process-mode agent (RFC-008 §F); see the class
+        docstring. In the child, and in thread mode, it is silent."""
+        if isinstance(self._agent_worker, ProcessWorker) and self._broker is None:
+            warnings.warn(
+                f"Agent.{api}() was called on the object that controls a process-mode "
+                f"agent: the agent runs in a child process, and this object has no "
+                f"broker or data store, so the call does not reach it. Use "
+                f"start_thread(), do this in the agent's hooks or handlers, or create "
+                f"a separate Agent connected to the same broker.",
+                RuntimeWarning, stacklevel=3)
+
+
+    def _unpicklable_attributes(self) -> list:
+        """Issue #9: the names of the attributes that cannot be pickled
+        to a spawned child (see __getstate__). Each is pickled the way
+        spawning does (ForkingPickler), with references to this agent
+        left out, so that an attribute referring back to it is not
+        blamed for another one; a multiprocessing primitive, which can
+        only be pickled while spawning, is taken as fine."""
+        agent = self
+
+        class _Pickler(ForkingPickler):
+            def persistent_id(self, obj):
+                return 'agent' if obj is agent else None
+
+        names = []
+        for name, value in self.__getstate__().items():
+            try:
+                _Pickler(io.BytesIO()).dump(value)
+            except RuntimeError:
+                pass        # e.g. a multiprocessing Event: shared when spawning
+            except Exception:
+                names.append(name)
+        return names
+
+
     def terminate(self):
         """Fire-and-forget termination — never raises.
 
-        Order (unchanged, RFC-004 / RFC-009 §7.16):
+        Order (RFC-004 / RFC-009 §7.16):
           1. dispatcher.stop() — bounded per RFC-004
-          2. worker.stop()     — bounded per RFC-008 (ProcessWorker)
+          2. the publish_sync reply lane's stop() (issue #7), after the
+             dispatcher, whose draining handlers may still wait for
+             replies; no lane is started afterwards
+          3. worker.stop()     — bounded per RFC-008 (ProcessWorker)
                                  or RFC-009 (ThreadWorker)
 
         RFC-009 §E: this method inspects the worker.stop() return
@@ -638,6 +902,19 @@ class Agent(BrokerNotifier):
                 # any exception and continue to worker.stop().
                 logger.exception(self.M(
                     f"terminate: dispatcher.stop() raised: {ex!r}"
+                ))
+        # Issue #7: the reply lane after the dispatcher, whose draining
+        # handlers may still be waiting in publish_sync. Closed under
+        # the init lock, so that no lane is created afterwards.
+        with self._dispatcher_init_lock:
+            self._reply_lane_closed = True
+            reply_lane = self._reply_dispatcher
+        if reply_lane is not None:
+            try:
+                reply_lane.stop()
+            except Exception as ex:
+                logger.exception(self.M(
+                    f"terminate: reply dispatcher stop() raised: {ex!r}"
                 ))
 
         if not self._agent_worker:
@@ -774,6 +1051,50 @@ class Agent(BrokerNotifier):
 
     def on_activating(self):
         pass
+
+
+    def on_begining(self):
+        """Deprecated name of on_activating (issue #70). A subclass
+        written for 2025.5.24 that overrides it still has it called,
+        right after on_activating, with a warning."""
+        pass
+
+
+    def __call_legacy_on_begining(self):
+        # Issue #70: 2025.5.24 called on_begining() here. It became
+        # on_activating() without a warning, so overrides silently
+        # stopped running.
+        cls = type(self)
+        if cls.on_begining is Agent.on_begining:
+            return
+        owner = next(c for c in cls.__mro__ if 'on_begining' in c.__dict__)
+        if owner is Agent or 'on_activating' in owner.__dict__:
+            # A class that defines both names was written for both
+            # versions (e.g. on_begining = on_activating); on_activating
+            # has already run.
+            return
+        if _claim_legacy_hook_warning(cls):
+            message = (f"{cls.__qualname__}.on_begining() is deprecated; "
+                       f"rename it to on_activating()")
+            logger.warning(self.M(message))
+            try:
+                code = getattr(cls.on_begining, '__code__', None)
+                if code is not None:
+                    # Point at the override, so the default filter for
+                    # __main__ shows it for a class defined there; spawn
+                    # imports the main script as __mp_main__.
+                    module = owner.__module__
+                    if module == '__mp_main__':
+                        module = '__main__'
+                    warnings.warn_explicit(message, DeprecationWarning, code.co_filename,
+                                           code.co_firstlineno, module=module)
+                else:
+                    warnings.warn(message, DeprecationWarning, stacklevel=2)
+            except BaseException:
+                # An 'error' filter raised: the next agent warns again.
+                _release_legacy_hook_warning(cls)
+                raise
+        self.on_begining()
     
     
     def on_activate(self, config=None):
@@ -793,6 +1114,7 @@ class Agent(BrokerNotifier):
         
         
     def start_interval_loop(self, interval_seconds):
+        self._warn_if_controller('start_interval_loop')
         logger.debug(f"{self.agent_id}> Start interval loop.")
         self.interval_seconds = interval_seconds
 
@@ -814,6 +1136,7 @@ class Agent(BrokerNotifier):
         self.__connected_event = threading.Event()
 
         self.on_activating()
+        self.__call_legacy_on_begining()
 
         # Create broker with retry
         broker_config_all = self.get_config("broker", {'broker_type': BrokerType.Empty})
@@ -850,6 +1173,11 @@ class Agent(BrokerNotifier):
                 for _ in range(interval):
                     if self.__terminate_event.is_set(): return False
                     time.sleep(1)
+            except BrokerNotAvailableError as e:
+                # Issue #42: a reserved broker type (redis, ros). The
+                # same configuration can never start, so stop now.
+                logger.error(self.M(f"Broker not available: {e}"))
+                return False
             except Exception as e:
                 logger.exception(self.M(f"Unexpected error starting broker: {e}"))
                 return False
@@ -870,11 +1198,12 @@ class Agent(BrokerNotifier):
         try:
             activated = self.__activating()
             if activated:
+                # on_activate() or on_activate(config). Issue #75: a branch
+                # meant to pass the agent itself never ran (a bound
+                # method's signature has no 'self') and was removed.
                 sig = inspect.signature(self.on_activate)
                 if len(sig.parameters) == 0:
                     self.on_activate()
-                elif isinstance(sig.parameters.get('self'), Agent):
-                    self.on_activate(self)
                 else:
                     self.on_activate(self.config)
         finally:
@@ -998,11 +1327,13 @@ class Agent(BrokerNotifier):
 # ============
     @final
     def get_data(self, key:str):
+        self._warn_if_controller('get_data')
         return self.__data.get(key)
 
 
     @final
     def pop_data(self, key:str):
+        self._warn_if_controller('pop_data')
         data = None
         self.__data_lock.acquire()
         if key in self.__data:
@@ -1013,6 +1344,7 @@ class Agent(BrokerNotifier):
 
     @final
     def put_data(self, key:str, data):
+        self._warn_if_controller('put_data')
         self.__data_lock.acquire()
         self.__data[key] = data
         self.__data_lock.release()
@@ -1023,7 +1355,6 @@ class Agent(BrokerNotifier):
 # =====================
     class DataEvent:
         def __init__(self, event=None):
-            import threading
             self.event = event if event is not None else threading.Event()
             self.data: 'Parcel' = None  # type: ignore
 
@@ -1040,13 +1371,38 @@ class Agent(BrokerNotifier):
         # Returns True when the broker accepted the message and False
         # when it did not (the failure is logged); it used to return
         # None either way.
+        self._warn_if_controller('publish')
         check_qos(qos)
         try:
             self._publish_or_raise(topic, data, qos=qos)
             return True
+        except PublishBackpressureError as ex:
+            self.__count_backpressure(topic, ex)
+            return False
         except Exception as ex:
             logger.exception(ex)
             return False
+
+
+    @property
+    def publish_backpressure_count(self) -> int:
+        """Issue #35: how many publishes the broker refused because its
+        outgoing queue was full (Agent.publish returned False)."""
+        with self._queued_bytes_lock:
+            return self._publish_backpressure
+
+
+    def __count_backpressure(self, topic, ex) -> None:
+        """Issue #35: an expected condition under load, not a fault:
+        count it and log it at WARNING on the 1st, 2nd, 4th, ... refusal
+        and at DEBUG otherwise, without a traceback."""
+        with self._queued_bytes_lock:
+            self._publish_backpressure += 1
+            count = self._publish_backpressure
+        level = logging.WARNING if count & (count - 1) == 0 else logging.DEBUG
+        logger.log(level, self.M(
+            f"Publish to {ensure_size(repr(topic), 200)} refused, the broker's outgoing "
+            f"queue is full: {ex} ({count} so far)."))
 
 
     def _publish_or_raise(self, topic, data=None, *, qos=0) -> None:
@@ -1075,28 +1431,57 @@ class Agent(BrokerNotifier):
         return f"{self.tag}-{rand}/{topic}"
 
     @final
-    def publish_sync(self, topic, data=None, topic_wait=None, timeout=30)->Parcel:
-        if isinstance(data, Parcel):
-            pcl = data
-            if pcl.topic_return:
-                if topic_wait:
-                    logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{pcl.topic_return}'.")
-            elif topic_wait:
-                pcl.topic_return = topic_wait
-            else:
-                pcl.topic_return = self.__generate_return_topic(topic)
-        else:
-            pcl = Parcel.from_content(data)
-            pcl.topic_return = topic_wait if topic_wait else self.__generate_return_topic(topic)
+    def publish_sync(self, topic, data=None, topic_wait=None, timeout=30, *,
+                     raise_on_error=False)->Parcel:
+        """Publish a request and wait up to `timeout` seconds for its
+        reply, which is returned; raises TimeoutError without one. Safe
+        to call from a handler (issue #7): replies have their own lane,
+        so the waiting handler does not starve its reply.
 
-        # RFC-014 (issue #36): a fresh, unpredictable id per request, set
-        # on a copy so that the caller's Parcel is not modified.
+        Issue #21: a Parcel passed as `data` is not modified. Its
+        topic_return, or else `topic_wait`, names the reply topic; else
+        a fresh one is generated for each call, so a retry with the same
+        Parcel gets a new topic. A reply arriving on a generated topic
+        after the call has returned is dropped and counted
+        (late_reply_count). timeout=None (wait forever) is deprecated.
+
+        Issue #68: a reply carrying a non-empty error (the responder's
+        handler raised, or it was overloaded) is returned like any other
+        unless `raise_on_error`, which raises RemoteError instead."""
+        self._warn_if_controller('publish_sync')
+        if timeout is None:
+            warnings.warn(
+                "publish_sync(timeout=None) waits forever; pass a timeout in seconds "
+                "(None will be refused in a future release)",
+                DeprecationWarning, stacklevel=2)
+            global _TIMEOUT_NONE_LOGGED
+            if not _TIMEOUT_NONE_LOGGED:
+                _TIMEOUT_NONE_LOGGED = True
+                logger.warning(self.M(
+                    "publish_sync(timeout=None) waits forever and is deprecated; "
+                    "pass a timeout in seconds."))
+        # Issue #21: the request is a copy (RFC-014 / #36 sets its
+        # correlation id there too), so the caller's Parcel keeps its
+        # topic_return.
+        request = copy.copy(data) if isinstance(data, Parcel) else Parcel.from_content(data)
+        generated = False
+        if request.topic_return:
+            if topic_wait:
+                logger.warning(f"The passed parameter topic_wait: {topic_wait} has been replaced with '{request.topic_return}'.")
+        elif topic_wait:
+            request.topic_return = topic_wait
+        else:
+            request.topic_return = self.__generate_return_topic(topic)
+            generated = True
+
+        # RFC-014 (issue #36): a fresh, unpredictable id per request.
         correlation_id = secrets.token_hex(16)
-        request = copy.copy(pcl)
         request.correlation_id = correlation_id
 
-        data_event = Agent.DataEvent(self._get_worker().create_event())
-        reply_topic = pcl.topic_return
+        # Issue #21: a plain threading.Event; the wait never crosses
+        # processes, and asking the worker for one could create it.
+        data_event = Agent.DataEvent()
+        reply_topic = request.topic_return
         router = self.__join_reply_topic(reply_topic, correlation_id, data_event)
 
         try:
@@ -1112,10 +1497,12 @@ class Agent(BrokerNotifier):
                 # does not carry a foreign id that requester would
                 # ignore. The Parcel was decoded for this call alone.
                 reply.correlation_id = None
+                if raise_on_error and reply.error:
+                    raise RemoteError(topic, reply.error, reply)
                 return reply
             raise TimeoutError(f"No response received within timeout period for topic: {reply_topic}.")
         finally:
-            self.__leave_reply_topic(reply_topic, correlation_id, router)
+            self.__leave_reply_topic(reply_topic, correlation_id, router, retire=generated)
 
 
     def __join_reply_topic(self, reply_topic, correlation_id, waiter) -> _ReplyRouter:
@@ -1161,12 +1548,14 @@ class Agent(BrokerNotifier):
         return router
 
 
-    def __leave_reply_topic(self, reply_topic, correlation_id, router) -> None:
+    def __leave_reply_topic(self, reply_topic, correlation_id, router, retire=False) -> None:
         """Unregister a publish_sync call. The last call to leave removes
         the router and unsubscribes the topic. RFC-006 §7.5 / RFC-007
         §7.8 triple check: only a record that still holds this router
         as a PUBLISH_SYNC handler is removed. Under _reply_topics_lock;
-        the broker is called outside _handlers_lock."""
+        the broker is called outside _handlers_lock. Issue #21: a
+        generated topic (`retire`) is remembered, so that a late reply
+        on it is dropped rather than handed to on_message."""
         with self._reply_topics_lock:
             with self._handlers_lock:
                 empty = router.remove(correlation_id)
@@ -1176,6 +1565,10 @@ class Agent(BrokerNotifier):
                         and record.handler is router)
                 if last:
                     self.__topic_handlers.pop(reply_topic, None)
+                    if retire:
+                        self._retired_reply_topics[reply_topic] = None
+                        if len(self._retired_reply_topics) > _RETIRED_REPLY_TOPICS:
+                            self._retired_reply_topics.popitem(last=False)
             if last and self._broker:
                 try:
                     self._broker.unsubscribe(reply_topic)
@@ -1186,10 +1579,12 @@ class Agent(BrokerNotifier):
     @final
     def subscribe(self, topic, data_type:str="str", topic_handler=None, *, qos=0):
         logger.debug(self.M(f"topic: {topic}, data_type:{data_type}"))
+        self._warn_if_controller('subscribe')
 
         if not isinstance(data_type, str):
             raise TypeError(f"Expected data_type to be of type 'str', but got {type(data_type).__name__}. The subscribtion of topic '{topic}' is failed.")
         check_qos(qos)      # issue #4: before anything is registered
+        check_filter(topic)     # issue #53: likewise
         with self._early_lock:
             self._session_topics.add(topic)
 
@@ -1226,6 +1621,7 @@ class Agent(BrokerNotifier):
         RFC-007 §7.4: refuses to remove a publish_sync-owned entry;
         raises TopicWaitCollisionError instead.
         """
+        self._warn_if_controller('unsubscribe')
         # RFC-007: lock + owner check + pop under lock.
         with self._handlers_lock:
             existing = self.__topic_handlers.get(topic)
@@ -1260,7 +1656,10 @@ class Agent(BrokerNotifier):
             is_new = child_id not in self._children
             refused = is_new and cap is not None and len(self._children) >= cap
             if not refused:
-                self._children[child_id] = child_info
+                if is_new:
+                    self._children = {**self._children, child_id: child_info}     # issue #57
+                else:
+                    self._children[child_id] = child_info
                 total = len(self._children)
                 if is_new:
                     self._children_registering.add(child_id)
@@ -1276,6 +1675,10 @@ class Agent(BrokerNotifier):
         try:
             logger.info(self.M(f"Add a child: {child_id}, total: {total}"))
             self.on_register_child(child_id, child_info)
+        except Exception:
+            # Issue #57: the child is registered; a failing hook must not
+            # keep it from being answered with register_parent.
+            logger.exception(self.M(f"on_register_child raised for {child_id!r}"))
         finally:
             with self._holon_lock:
                 self._children_registering.discard(child_id)
@@ -1293,12 +1696,20 @@ class Agent(BrokerNotifier):
         parent_info['child_id'] = self.agent_id
         with self._holon_lock:
             is_new = parent_id not in self._parents
-            self._parents[parent_id] = parent_info
+            if is_new:
+                self._parents = {**self._parents, parent_id: parent_info}       # issue #57
+            else:
+                self._parents[parent_id] = parent_info
             total = len(self._parents)
             pending = self._pending_terminates.pop(parent_id, None)
         if is_new:
             logger.info(self.M(f"Add a parent: {parent_id}, total: {total}"))
-            self.on_register_parent(parent_id, parent_info)
+            try:
+                self.on_register_parent(parent_id, parent_info)
+            except Exception:
+                # Issue #57: the parent is registered, and a terminate it
+                # sent earlier must still be acted on.
+                logger.exception(self.M(f"on_register_parent raised for {parent_id!r}"))
         else:
             logger.debug(self.M(f"Parent re-registered: {parent_id}"))
         if pending is not None and pending[0] >= time.monotonic():
@@ -1678,27 +2089,45 @@ class Agent(BrokerNotifier):
 
     @final
     def _on_message(self, topic:str, data):
-        # logger.debug(self.M(f"topic: {topic}, data: {data}"))
-        pcl = Parcel.from_payload(data, **self._codec_options)
-        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
-            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
-            # whose acknowledgement was lost across a reconnect.
-            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
+        """BrokerNotifier callback, on the broker's network thread.
+
+        Issue #34: only cheap, topic-based work happens here, so that a
+        large or slow payload cannot stall network I/O and keepalive. A
+        payload over codec.max_payload_bytes is dropped at once.
+        Everything else is routed as raw bytes, and decoded on a
+        dispatcher thread (__handle)."""
+        size = _payload_size(data)
+        if size > self._max_payload_bytes:
+            self.__count_decode_failure(topic, ValueError(
+                f"payload of {size} bytes exceeds codec.max_payload_bytes="
+                f"{self._max_payload_bytes}"))
             return
-        self.__route(topic, pcl)
+        self.__route(topic, data, size)
 
 
-    def __route(self, topic, pcl):
-        """Hand a decoded, deduplicated message to its handler through
-        the dispatcher (RFC-003 / RFC-004 / RFC-007). Follow-up of #17:
-        while lifecycle hooks are still registering handlers, a message
-        on a topic that has no handler and was not subscribed in this
-        process (a resumed session's leftover) is held instead, and
-        replayed here once they have returned."""
+    def __route(self, topic, data, size):
+        """Queue a received message for its handler (RFC-004 / RFC-007).
+
+        Follow-up of #17: while lifecycle hooks are still registering
+        handlers, a message on a topic that has no handler and was not
+        subscribed in this process (a resumed session's leftover) is
+        held instead, and replayed here once they have returned.
+
+        Issue #34: the message is queued undecoded, within the
+        dispatch.max_queued_bytes budget. One the queue cannot take is
+        dropped, without decoding unless it is small enough to be
+        answered (see __drop)."""
+        late = self.__count_late_reply(topic)
+        if late:
+            # Issue #21: a reply to a publish_sync call that has already
+            # returned, on the topic it generated. Expected after a
+            # timeout; on_message is not the place for it.
+            logger.debug(self.M(f"Dropped a late reply on {topic!r} ({late} so far)."))
+            return
         with self._early_lock:
             if (self._awaiting_hooks and not self.__has_handler(topic)
                     and not self.__subscribed_in_session(topic)):
-                self.__hold(topic, pcl)
+                self.__hold(topic, data, size)
                 return
 
         # RFC-007 §7.7: atomic single-snapshot read of the handler
@@ -1715,6 +2144,61 @@ class Agent(BrokerNotifier):
             else:
                 is_specific_handler = False
                 topic_handler = self.on_message
+            retired = record is None and topic in self._retired_reply_topics
+        if retired and not self.__subscribed_exactly(topic):
+            # Issue #21: the call gave up, and retired its topic, after
+            # the check at the top of this method.
+            late = self.__note_late_reply()
+            logger.debug(self.M(f"Dropped a late reply on {topic!r} ({late} so far)."))
+            return
+        # Issue #7: a publish_sync reply takes its own lane, so that a
+        # handler waiting in publish_sync cannot starve it.
+        is_reply = record is not None and record.owner_type is _HandlerOwnerType.PUBLISH_SYNC
+
+        if not self.__reserve_queued_bytes(size, reply=is_reply):
+            self.__drop(topic, data, size, is_specific_handler, over_byte_budget=True)
+            return
+        try:
+            dispatcher = self._get_reply_dispatcher() if is_reply else self._get_dispatcher()
+        except BaseException:
+            # A dispatcher that fails to start must not leave bytes
+            # reserved.
+            self.__release_queued_bytes(size, reply=is_reply)
+            raise
+
+        def task():
+            self.__release_queued_bytes(size, reply=is_reply)
+            self.__handle(topic, data, is_specific_handler, topic_handler)
+
+        # RFC-004: dispatch via the bounded message dispatcher instead
+        # of spawning one Thread per message. enqueue() never raises
+        # (broker-callback safety invariant, §7.3); the dispatcher counts
+        # and logs its own drops.
+        if not dispatcher.enqueue(task, topic=topic):
+            self.__release_queued_bytes(size, reply=is_reply)
+            self.__drop(topic, data, size, is_specific_handler, over_byte_budget=False)
+
+
+    def __handle(self, topic, data, is_specific_handler, topic_handler):
+        """Decode, deduplicate and handle one message, on a dispatcher
+        thread (issue #34)."""
+        try:
+            pcl = Parcel.from_payload(data, **self._codec_options)
+        except Exception as ex:
+            # Issue #15: not a valid AgentFlow parcel (another MQTT
+            # client's JSON, an unsupported version, garbage). Count it
+            # instead of letting it escape, which logged a full
+            # traceback for every such message. Decoders raise
+            # ParcelDecodeError; anything else they raise on untrusted
+            # bytes is counted the same way.
+            self.__count_decode_failure(topic, ex)
+            return
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # Issue #4: a redelivery, e.g. a QoS 1 resend of a message
+            # whose acknowledgement was lost across a reconnect.
+            logger.debug(self.M(f"Dropped a redelivered message on {topic!r} ({pcl.message_id!r})."))
+            return
+
         # RFC-003 R-fallback-silent: only topics with a specifically
         # registered handler in __topic_handlers may trigger an
         # auto-reply.
@@ -1729,52 +2213,112 @@ class Agent(BrokerNotifier):
                 f"Withheld the reply to {topic!r}: topic_return "
                 f"{pcl.topic_return!r} is a holon control topic.")
 
-        def handle_message():
-            if should_auto_reply:
-                try:
-                    logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
-                    data_resp = topic_handler(topic, pcl)
-                except Exception as ex:
-                    logger.exception(ex)
-                    # RFC-003 R-exception-fresh: build a new parcel for
-                    # the error echo; do NOT mutate or reuse pcl.
-                    err_pcl = Parcel.from_content(None)
-                    err_pcl.error = str(ex)
-                    data_resp = err_pcl
-                    logger.debug(data_resp)
-                # RFC-003 R-strip-topic_return: the auto-reply must
-                # never carry topic_return. RFC-014 (issue #36): it
-                # carries the request's correlation id. If the handler
-                # returned a Parcel that differs in either, reply with a
-                # shallow copy instead of mutating the caller's object;
-                # a copy keeps a subclass's own state and never calls
-                # its constructor.
-                if not isinstance(data_resp, Parcel):
-                    data_resp = Parcel.from_content(data_resp)
-                elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
-                    data_resp = copy.copy(data_resp)
-                    data_resp.topic_return = None
-                data_resp.correlation_id = pcl.correlation_id
-                self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
-            else:
-                try:
-                    topic_handler(topic, pcl)
-                except Exception as ex:
-                    logger.exception(ex)
+        if should_auto_reply:
+            try:
+                logger.debug(f"topic: {topic}, topic_return: {pcl.topic_return}")
+                data_resp = topic_handler(topic, pcl)
+            except Exception as ex:
+                logger.exception(ex)
+                # RFC-003 R-exception-fresh: build a new parcel for
+                # the error echo; do NOT mutate or reuse pcl.
+                err_pcl = Parcel.from_content(None)
+                # Issue #68: the type only, unless errors.expose_details;
+                # the message was just logged.
+                err_pcl.error = str(ex) if self._expose_error_details else _withheld_error(ex)
+                data_resp = err_pcl
+                logger.debug(data_resp)
+            # RFC-003 R-strip-topic_return: the auto-reply must
+            # never carry topic_return. RFC-014 (issue #36): it
+            # carries the request's correlation id. If the handler
+            # returned a Parcel that differs in either, reply with a
+            # shallow copy instead of mutating the caller's object;
+            # a copy keeps a subclass's own state and never calls
+            # its constructor.
+            if not isinstance(data_resp, Parcel):
+                data_resp = Parcel.from_content(data_resp)
+            elif data_resp.topic_return or data_resp.correlation_id != pcl.correlation_id:
+                data_resp = copy.copy(data_resp)
+                data_resp.topic_return = None
+            data_resp.correlation_id = pcl.correlation_id
+            self.publish(pcl.topic_return, data_resp, qos=_CONTROL_QOS)
+        else:
+            try:
+                topic_handler(topic, pcl)
+            except Exception as ex:
+                logger.exception(ex)
 
-        # RFC-004: dispatch via the bounded message dispatcher instead
-        # of spawning one Thread per message. enqueue() never raises
-        # (broker-callback safety invariant, §7.3).
-        if not self._get_dispatcher().enqueue(handle_message, topic=topic) and should_auto_reply:
-            # Issue #4: the dispatcher dropped a request (queue full, or
-            # stopping); the dispatcher has counted and logged it. Tell
-            # the requester now rather than let it wait for its timeout.
-            # publish never raises and does not block on the broker.
-            dropped = Parcel.from_content(None)
-            dropped.error = ("overloaded: the request was dropped before it was handled "
-                             "(dispatcher queue full or stopping)")
-            dropped.correlation_id = pcl.correlation_id
-            self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS)
+
+    def __drop(self, topic, data, size, is_specific_handler, *, over_byte_budget):
+        """A message the queue could not take (queue full or stopping, or
+        over dispatch.max_queued_bytes).
+
+        Issue #4: a dropped request is answered "overloaded" at once so
+        that its requester fails fast. That needs its topic_return and
+        correlation id, so it is decoded here, on the receiving thread,
+        only when small enough (_DROP_REPLY_DECODE_LIMIT) and only when
+        it would have been auto-replied to (RFC-003)."""
+        if over_byte_budget:
+            with self._queued_bytes_lock:
+                self._byte_budget_drops += 1
+                drops = self._byte_budget_drops
+            level = logging.WARNING if drops & (drops - 1) == 0 else logging.DEBUG
+            logger.log(level, self.M(
+                f"Dropped a message of {size} bytes on {ensure_size(repr(topic), 200)}: "
+                f"dispatch.max_queued_bytes={self._max_queued_bytes} would be exceeded "
+                f"({drops} dropped so far)."))
+        if not is_specific_handler or size > _DROP_REPLY_DECODE_LIMIT:
+            return
+        try:
+            pcl = Parcel.from_payload(data, **self._codec_options)
+        except Exception as ex:
+            self.__count_decode_failure(topic, ex)
+            return
+        if not pcl.topic_return or _is_holon_control_topic(pcl.topic_return):
+            return
+        if pcl.message_id is not None and self.__seen_before(pcl.message_id):
+            # A redelivered copy of a request that was handled, answered,
+            # or is still waiting in the queue. Recording the id here
+            # makes "overloaded" true (within the _DEDUP_WINDOW ids): a
+            # waiting original, or a later redelivery, is then dropped
+            # as a duplicate instead of run.
+            return
+        dropped = Parcel.from_content(None)
+        dropped.error = ("overloaded: the request was dropped before it was handled "
+                         "(dispatcher queue or byte budget full, or stopping)")
+        dropped.correlation_id = pcl.correlation_id
+        if not self.publish(pcl.topic_return, dropped, qos=_CONTROL_QOS) and pcl.message_id is not None:
+            # The requester was not told: let a redelivery run it.
+            with self._dedup_lock:
+                self._recent_message_ids.pop(pcl.message_id, None)
+
+
+    def __reserve_queued_bytes(self, size, reply=False) -> bool:
+        """Issue #34: account `size` against dispatch.max_queued_bytes.
+        Returns False, reserving nothing, if it does not fit. Issue #7:
+        publish_sync replies (`reply`) have a budget of their own."""
+        with self._queued_bytes_lock:
+            if reply:
+                if self._reply_queued_bytes + size > self._max_queued_bytes:
+                    return False
+                self._reply_queued_bytes += size
+                return True
+            if self._queued_bytes + size > self._max_queued_bytes:
+                return False
+            self._queued_bytes += size
+            return True
+
+
+    def __queued_bytes_fit(self, size) -> bool:
+        with self._queued_bytes_lock:
+            return self._queued_bytes + size <= self._max_queued_bytes
+
+
+    def __release_queued_bytes(self, size, reply=False) -> None:
+        with self._queued_bytes_lock:
+            if reply:
+                self._reply_queued_bytes -= size
+            else:
+                self._queued_bytes -= size
 
 
     def __has_handler(self, topic) -> bool:
@@ -1782,20 +2326,23 @@ class Agent(BrokerNotifier):
             return topic in self.__topic_handlers
 
 
-    def __hold(self, topic, pcl) -> None:
-        """Follow-up of #17: keep a message for release by __hook_done.
-        Called under _early_lock. Beyond _EARLY_MESSAGE_LIMIT the message
-        is dropped and counted; logged at WARNING on the 1st, 2nd, 4th,
-        ... drop."""
-        if len(self._early_messages) >= _EARLY_MESSAGE_LIMIT:
+    def __hold(self, topic, data, size) -> None:
+        """Follow-up of #17: keep a message, undecoded, for release by
+        __hook_done. Called under _early_lock. Beyond _EARLY_MESSAGE_LIMIT
+        messages or dispatch.max_queued_bytes (issue #34) the message is
+        dropped and counted; logged at WARNING on the 1st, 2nd, 4th, ...
+        drop."""
+        if (len(self._early_messages) >= _EARLY_MESSAGE_LIMIT
+                or self._held_bytes + size > self._max_queued_bytes):
             self._early_dropped += 1
             dropped = self._early_dropped
             level = logging.WARNING if dropped & (dropped - 1) == 0 else logging.DEBUG
             logger.log(level, self.M(
                 f"Dropped a message on {topic!r} that arrived before the handlers were "
-                f"registered: {_EARLY_MESSAGE_LIMIT} already held ({dropped} dropped so far)."))
+                f"registered: the hold is full ({dropped} dropped so far)."))
             return
-        self._early_messages.append((topic, pcl))
+        self._early_messages.append((topic, data, size))
+        self._held_bytes += size
 
 
     def __subscribed_in_session(self, topic) -> bool:
@@ -1832,6 +2379,7 @@ class Agent(BrokerNotifier):
                 return
             held = list(self._early_messages)
             self._early_messages.clear()
+            self._held_bytes = 0
             timer, self._gate_timer = self._gate_timer, None
         if timer is not None:
             timer.cancel()
@@ -1849,6 +2397,7 @@ class Agent(BrokerNotifier):
             self._awaiting_hooks.clear()
             held = list(self._early_messages)
             self._early_messages.clear()
+            self._held_bytes = 0
             self._gate_timer = None
         logger.warning(self.M(
             f"Stopped holding early messages after {_EARLY_MESSAGE_MAX_HOLD_S:g} s although "
@@ -1859,10 +2408,10 @@ class Agent(BrokerNotifier):
     def __replay(self, held) -> None:
         """Follow-up of #17: route held messages, in arrival order, on a
         background thread so that the hook that opened the gate is not
-        delayed. They skip deduplication, which recorded their ids when
-        they arrived. Each one waits for room in the dispatcher queue,
-        so that the release does not burst past it and turn requests
-        into 'overloaded' drops."""
+        delayed. Each one waits for room in the dispatcher queue and in
+        the byte budget (#34), so that the release does not burst past
+        them and turn requests into 'overloaded' drops. Deduplication
+        runs when each is handled."""
         if not held:
             return
         logger.info(self.M(
@@ -1871,25 +2420,87 @@ class Agent(BrokerNotifier):
         def run():
             dispatcher = self._get_dispatcher()
             capacity = getattr(dispatcher, 'queue_capacity', None)
-            throttle = capacity is not None
-            for topic, pcl in held:
+            throttle = True
+            for topic, data, size in held:
                 if throttle:
-                    throttle = self.__wait_for_queue_room(dispatcher, capacity)
-                self.__route(topic, pcl)
+                    throttle = self.__wait_for_room(dispatcher, capacity, size)
+                self.__route(topic, data, size)
         threading.Thread(target=run, name=f'{self.name_tag}-early-replay', daemon=True).start()
 
 
-    @staticmethod
-    def __wait_for_queue_room(dispatcher, capacity, timeout=1.0) -> bool:
-        """Wait until the dispatcher queue has room. Returns False if it
-        stayed full for `timeout` (its consumers are stuck), so that the
-        caller stops waiting."""
-        deadline = time.monotonic() + timeout
-        while dispatcher.queue_depth >= capacity:
+    def __wait_for_room(self, dispatcher, capacity, size) -> bool:
+        """Wait until the dispatcher queue has room for one more message
+        (if it is bounded) and the byte budget for `size` more bytes.
+        Returns False if there was none for _REPLAY_ROOM_TIMEOUT_S (the
+        consumers are stuck), so that the caller stops waiting."""
+        deadline = time.monotonic() + _REPLAY_ROOM_TIMEOUT_S
+        while ((capacity is not None and dispatcher.queue_depth >= capacity)
+               or not self.__queued_bytes_fit(size)):
             if time.monotonic() >= deadline or dispatcher.is_stopped:
                 return False
             time.sleep(0.002)
         return True
+
+
+    def __count_late_reply(self, topic) -> int:
+        """Issue #21: if `topic` is a reply topic publish_sync generated
+        and has left, which nobody has subscribed since, count a late
+        reply and return the count; else 0."""
+        with self._handlers_lock:
+            retired = (topic in self._retired_reply_topics
+                       and topic not in self.__topic_handlers)
+        if not retired or self.__subscribed_exactly(topic):
+            return 0
+        return self.__note_late_reply()
+
+
+    def __subscribed_exactly(self, topic) -> bool:
+        """Whether Agent.subscribe(topic) was called in this process, for
+        this exact topic: a caller may subscribe a retired reply topic,
+        without a handler, to catch a late answer in on_message."""
+        with self._early_lock:
+            return topic in self._session_topics
+
+
+    def __note_late_reply(self) -> int:
+        with self._handlers_lock:
+            self._late_replies += 1
+            return self._late_replies
+
+
+    @property
+    def late_reply_count(self) -> int:
+        """Issue #21: messages dropped because they arrived on a reply
+        topic publish_sync generated after the call had returned
+        (typically late replies, after its timeout), counted undecoded."""
+        with self._handlers_lock:
+            return self._late_replies
+
+
+    @property
+    def decode_failure_count(self) -> int:
+        """Issue #15: how many received messages were dropped because
+        they could not be decoded as an AgentFlow Parcel, including those
+        refused undecoded for exceeding codec.max_payload_bytes (#34)."""
+        with self._decode_lock:
+            return self._decode_failures
+
+
+    def __count_decode_failure(self, topic, ex) -> None:
+        """Issue #15: count an undecodable message and log it at WARNING
+        on the 1st, 2nd, 4th, ... failure and at DEBUG otherwise, without
+        a traceback, so that a stream of foreign or malformed messages
+        cannot flood the log."""
+        with self._decode_lock:
+            self._decode_failures += 1
+            count = self._decode_failures
+        level = logging.WARNING if count & (count - 1) == 0 else logging.DEBUG
+        # The reason may carry sender-controlled text (e.g. a refused
+        # pickle global's name): escape it and bound its length.
+        reason = ensure_size(repr(f"{type(ex).__name__}: {ex}"), 300)
+        logger.log(level, self.M(
+            f"Dropped an undecodable message on {ensure_size(repr(topic), 200)}: "
+            f"{reason} ({count} so far)."))
 
 
     def __seen_before(self, message_id: str) -> bool:
@@ -1935,6 +2546,34 @@ class Agent(BrokerNotifier):
                 if self._dispatcher is None:
                     self._dispatcher = self.__create_dispatcher()
         return self._dispatcher
+
+
+    def _get_reply_dispatcher(self):
+        """Issue #7: the lane for publish_sync replies, a one-consumer
+        MessageDispatcher. It only decodes a reply and wakes the waiting
+        call (_ReplyRouter), never a user handler, so a handler waiting
+        in publish_sync cannot starve its own reply. Replies also have a
+        byte budget of their own (see __reserve_queued_bytes) and a
+        queue of at least 1024, so neither other messages nor a small
+        dispatch.queue_capacity can get them dropped. Created on the
+        first reply. The legacy per-message-thread mode cannot starve
+        and uses its own dispatcher; so does an Agent after terminate()."""
+        dispatcher = self._get_dispatcher()
+        if not isinstance(dispatcher, MessageDispatcher):
+            return dispatcher
+        if self._reply_dispatcher is None:
+            with self._dispatcher_init_lock:
+                if self._reply_lane_closed:
+                    return dispatcher
+                if self._reply_dispatcher is None:
+                    dispatch_cfg = self.config.get('dispatch', {}) or {}
+                    self._reply_dispatcher = MessageDispatcher(
+                        workers=1,
+                        queue_capacity=max(int(dispatch_cfg.get('queue_capacity', 1024)), 1024),
+                        shutdown_timeout_s=float(dispatch_cfg.get('shutdown_timeout_s', 5.0)),
+                        name=f'ReplyDispatcher-{self.tag}',
+                    )
+        return self._reply_dispatcher
 
 
     def on_connected(self):

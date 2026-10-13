@@ -46,6 +46,8 @@ from agentflow.broker.message_broker import MessageBroker
 from agentflow.broker.mqtt_broker import MqttBroker
 from agentflow.core.agent_worker import WorkerState
 
+from tests.helpers.source_checks import identifiers
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,6 +117,46 @@ def _fire_connect_success(broker, fake_client):
         client=fake_client, userdata=None, flags={},
         reasonCode=0, properties=None,
     )
+
+
+def _record_calling_thread(mock_call) -> list:
+    """Make a fake paho method record the thread that calls it."""
+    threads = []
+    mock_call.side_effect = (
+        lambda *args, **kwargs: threads.append(threading.current_thread())
+    )
+    return threads
+
+
+class _TimeWithoutSleep:
+    """Stands in for the `time` module inside agentflow.core.agent, with
+    sleep() a no-op, so the pauses between broker start attempts in
+    Agent.__activating cost nothing."""
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    @staticmethod
+    def sleep(_seconds):
+        pass
+
+
+def _make_activating_agent(monkeypatch, make_broker):
+    """An Agent whose __activating builds its brokers with
+    `make_broker(notifier)` and does not pause between attempts."""
+    from agentflow.broker.broker_maker import BrokerMaker
+    from agentflow.core import agent as agent_module
+    monkeypatch.setattr(
+        BrokerMaker, 'create_broker',
+        lambda self, broker_type, notifier: make_broker(notifier),
+    )
+    monkeypatch.setattr(agent_module, 'time', _TimeWithoutSleep())
+    agent = agent_module.Agent('activating', {
+        'broker': {'broker_name': 'x', 'x': {'broker_type': 'mqtt'}},
+    })
+    # Normally created by Agent._activate, which runs __activating.
+    agent._Agent__terminate_event = threading.Event()
+    return agent
 
 
 # ===========================================================================
@@ -341,10 +383,28 @@ def test_B17_startup_timeout_s_bounds_BOTH_connect_and_callback_wait(
     fake_client, notifier, monkeypatch,
 ):
     """RFC-011 §7.10: single shared monotonic deadline covers BOTH
-    helper (connect + loop_start) AND `_connected_evt.wait`."""
-    src = inspect.getsource(MqttBroker.start)
-    assert 'deadline = time.monotonic() + startup_timeout_s' in src
-    assert 'remaining = max(0.0, deadline - time.monotonic())' in src
+    helper (connect + loop_start) AND `_connected_evt.wait`.
+
+    Observed by timing: connect uses most of the budget and no CONNACK
+    arrives, so start() must give up when that ONE budget runs out,
+    not after a fresh budget for the callback wait."""
+    budget_s, connect_s = 1.2, 0.9
+    slow_client = MagicMock(name='PahoMqttClient')
+    slow_client.connect.side_effect = lambda *a, **kw: time.sleep(connect_s)
+    slow = _make_broker_wait_true(slow_client, notifier, monkeypatch,
+                                  timeout=budget_s)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        slow.start({})
+    elapsed = time.monotonic() - t0
+    # connect + loop_start completed; the callback wait ran out.
+    slow_client.loop_start.assert_called_once()
+    assert slow.state is WorkerState.START_TIMEOUT
+    # A fresh budget for the callback wait would end at
+    # connect_s + budget_s (2.1s).
+    assert budget_s - 0.1 <= elapsed < connect_s + budget_s - 0.2, (
+        f"start() took {elapsed:.2f}s with a {budget_s}s budget"
+    )
 
     # Runtime: wait=True + wedged connect + short timeout → bounded.
     b = _make_broker_wait_true(fake_client, notifier, monkeypatch, timeout=0.3)
@@ -363,23 +423,68 @@ def test_B17_startup_timeout_s_bounds_BOTH_connect_and_callback_wait(
         b.stop(graceful_timeout_s=2.0)
 
 
-def test_B18_agent_activating_bounded_when_broker_start_wedges_source_x_ref():
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, '_Agent__activating'))
-    assert 'self._broker.start' in src
+def test_B18_agent_activating_bounded_when_broker_start_wedges_source_x_ref(
+    monkeypatch,
+):
+    """RFC-011 §7.21 runtime cross-check: Agent.__activating starts its
+    broker through the bounded `MqttBroker.start`, so a wedged paho
+    connect no longer hangs it — each attempt times out and activation
+    gives up (pauses between attempts skipped)."""
+    release = threading.Event()
+    clients = []
+
+    def client_factory(*args, **kwargs):
+        client = MagicMock(name='PahoMqttClient')
+        client.connect.side_effect = lambda *a, **kw: release.wait(timeout=30.0)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr('agentflow.broker.mqtt_broker.Client', client_factory)
+    agent = _make_activating_agent(
+        monkeypatch,
+        lambda notifier: MqttBroker(notifier, wait=True, timeout=0.3),
+    )
+    try:
+        t0 = time.monotonic()
+        assert agent._Agent__activating() is False
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"__activating took {elapsed:.2f}s"
+        # Every attempt reached paho's (wedged) connect.
+        assert sum(c.connect.call_count for c in clients) == 3
+    finally:
+        release.set()
 
 
 def test_B19_thread_worker_activate_call_site_source_check():
+    """ThreadWorker's thread runs the initiator's `_activate` (which
+    calls the bounded broker.start) with the shared config."""
     from agentflow.core.agent_worker import ThreadWorker
-    src = inspect.getsource(ThreadWorker._run_target)
-    assert 'self.initiator_agent._activate' in src
+    calls = []
+
+    class _Initiator:
+        def __init__(self):
+            self.config = {}
+
+        def _activate(self, cfg):
+            calls.append((threading.current_thread(), cfg))
+
+        def M(self, message=None):
+            return f'b19 {message or ""}'
+
+    initiator = _Initiator()
+    worker = ThreadWorker(initiator)
+    thread = worker.start()
+    thread.join(2.0)
+    assert len(calls) == 1
+    assert calls[0][0] is thread
+    assert calls[0][1] is initiator.config
+    assert worker.stop(graceful_timeout_s=2.0) is True
 
 
-def test_B20_process_worker_hard_containment_source_check():
-    from agentflow.core.agent_worker import ProcessWorker
-    src = inspect.getsource(ProcessWorker.stop)
-    assert 'terminate()' in src
-    assert 'kill()' in src
+# test_B20_process_worker_hard_containment_source_check: removed in #74,
+# a duplicate source pin. ProcessWorker's terminate() / kill() escalation
+# is tested by test_F44 in core/test_thread_worker_process_exit.py and
+# the escalation tests in core/test_process_worker_lifecycle.py.
 
 
 # ===========================================================================
@@ -508,9 +613,17 @@ def test_C33_wait_true_callback_timeout_cleanup_now_bounded_via_primitive_source
     fake_client, notifier, monkeypatch,
 ):
     """RFC-011 §F: cleanup is now on a daemon helper — bounded even
-    if disconnect/loop_stop wedge."""
-    src = inspect.getsource(MqttBroker.start)
-    assert '_run_client_shutdown_primitive_and_cache' in src
+    if disconnect/loop_stop wedge (that bound: test_F55).
+
+    Observed: after the callback wait times out, paho's disconnect()
+    runs on a daemon thread, not on the caller of start()."""
+    b = _make_broker_wait_true(fake_client, notifier, monkeypatch, timeout=0.1)
+    cleanup_threads = _record_calling_thread(fake_client.disconnect)
+    with pytest.raises(TimeoutError):
+        b.start({})
+    assert len(cleanup_threads) == 1
+    assert cleanup_threads[0] is not threading.current_thread()
+    assert cleanup_threads[0].daemon is True
 
 
 # ===========================================================================
@@ -858,17 +971,23 @@ def test_E50_failed_instance_is_terminal_no_second_round_possible(
         b.start({})
 
 
-def test_E51_start_generation_is_diagnostic_only_source_check():
+def test_E51_start_generation_is_diagnostic_only_source_check(broker):
     """RFC-011 Appendix C: `_start_generation` exists as a diagnostic
     counter but is NOT used for callback filtering. Any test that
     would rely on generation-based fencing must switch to the terminal
-    state approach (§7.5)."""
-    src = inspect.getsource(MqttBroker)
-    # generation is exposed
-    assert 'start_generation' in src
+    state approach (§7.5; fencing itself: test_E47-test_E49, test_E52).
+
+    The callbacks are checked on the AST: no identifier they use names
+    a generation (comments and docstrings may)."""
+    # generation is exposed, read-only
+    assert broker.start_generation == 0
+    with pytest.raises(AttributeError):
+        broker.start_generation = 7
     # but callbacks do NOT check generation
-    on_connect = inspect.getsource(MqttBroker._on_connect)
-    assert 'generation' not in on_connect.lower()
+    for callback in (MqttBroker._on_connect, MqttBroker._on_disconnect,
+                     MqttBroker._on_message):
+        used = [n for n in identifiers(callback) if 'generation' in n.lower()]
+        assert used == [], f"{callback.__name__} reads {used}"
 
 
 def test_E52_late_on_message_after_start_failure_silently_dropped(
@@ -924,9 +1043,18 @@ def test_F53_rollback_bounded_when_disconnect_wedges(
         release.set()
 
 
-def test_F54_failed_start_rollback_uses_daemon_helper_source_check():
-    src = inspect.getsource(MqttBroker._run_client_shutdown_primitive)
-    assert 'daemon=True' in src
+def test_F54_failed_start_rollback_uses_daemon_helper_source_check(
+    broker, fake_client,
+):
+    """Observed: when loop_start() raises, the rollback's paho
+    disconnect() runs on a daemon helper thread, not on the caller."""
+    fake_client.loop_start.side_effect = RuntimeError("boom")
+    cleanup_threads = _record_calling_thread(fake_client.disconnect)
+    with pytest.raises(RuntimeError):
+        broker.start({})
+    assert len(cleanup_threads) == 1
+    assert cleanup_threads[0] is not threading.current_thread()
+    assert cleanup_threads[0].daemon is True
 
 
 def test_F55_wait_true_callback_timeout_rollback_is_bounded(
@@ -949,15 +1077,32 @@ def test_F55_wait_true_callback_timeout_rollback_is_bounded(
         release.set()
 
 
-def test_F56_start_body_uses_bounded_rollback_primitive_source():
-    src = inspect.getsource(MqttBroker.start)
-    assert '_run_client_shutdown_primitive_and_cache' in src
+def test_F56_start_body_uses_bounded_rollback_primitive_source(
+    broker, fake_client,
+):
+    """Observed: when connect() raises, start() rolls back through the
+    bounded primitive — paho's disconnect() runs on a daemon helper,
+    not on the caller (bounded even if it wedges: test_F53)."""
+    fake_client.connect.side_effect = RuntimeError("boom")
+    cleanup_threads = _record_calling_thread(fake_client.disconnect)
+    with pytest.raises(RuntimeError):
+        broker.start({})
+    assert len(cleanup_threads) == 1
+    assert cleanup_threads[0] is not threading.current_thread()
+    assert cleanup_threads[0].daemon is True
 
 
-def test_F57_start_uses_daemon_startup_helper_source():
-    src = inspect.getsource(MqttBroker.start)
-    assert 'threading.Thread' in src
-    assert 'daemon=True' in src
+def test_F57_start_uses_daemon_startup_helper_source(broker, fake_client):
+    """Observed: paho's connect() and loop_start() run on one daemon
+    helper thread, not on the caller (who joins it against the
+    deadline: test_B13)."""
+    connect_threads = _record_calling_thread(fake_client.connect)
+    loop_start_threads = _record_calling_thread(fake_client.loop_start)
+    assert broker.start({}) is True
+    assert len(connect_threads) == 1
+    assert loop_start_threads == connect_threads
+    assert connect_threads[0] is not threading.current_thread()
+    assert connect_threads[0].daemon is True
 
 
 def test_F58_paho_client_reused_after_failed_start_no_fresh_client(broker, fake_client):
@@ -1211,10 +1356,30 @@ def test_I72_empty_broker_start_is_bounded_by_construction():
     assert time.monotonic() - t0 < 0.05
 
 
-def test_I73_agent_activating_source_unchanged():
+def test_I73_agent_activating_source_unchanged(monkeypatch):
     """RFC-011 §7.21: Agent.__activating unchanged; retry loop
-    constructs fresh broker per iteration via BrokerMaker."""
-    from agentflow.core.agent import Agent
-    src = inspect.getsource(getattr(Agent, '_Agent__activating'))
-    assert 'BrokerMaker().create_broker' in src
-    assert 'max_retries' in src
+    constructs fresh broker per iteration via BrokerMaker, up to
+    max_retries=3 attempts (pauses between attempts skipped)."""
+    brokers = []
+
+    class _TimingOutBroker:
+        def __init__(self):
+            self.start_calls = 0
+
+        def start(self, options):
+            self.start_calls += 1
+            raise TimeoutError("no CONNACK")
+
+        def stop(self):
+            return True
+
+    def make_broker(notifier):
+        brokers.append(_TimingOutBroker())
+        return brokers[-1]
+
+    agent = _make_activating_agent(monkeypatch, make_broker)
+    assert agent._Agent__activating() is False
+    # One fresh broker per attempt, each started once.
+    assert len(brokers) == 3
+    assert [b.start_calls for b in brokers] == [1, 1, 1]
+    assert agent._broker is brokers[-1]

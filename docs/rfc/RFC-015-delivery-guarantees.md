@@ -1,6 +1,6 @@
 # RFC-015 — Delivery guarantees: QoS, message ids, reported losses
 
-- **Status**: **Implemented** (2026-10-12, issue #4)
+- **Status**: **Implemented** (2026-10-12, issue #4; §6 issue #17, §7 issue #35)
 - **Author**: Audit follow-up
 - **Depends on**:
   - [RFC-002](RFC-002-publish-error-propagation.md) (publish errors) and [RFC-012](RFC-012-mqtt-publish-result-contract.md) (MQTT publish result);
@@ -14,8 +14,8 @@
   - An error reply for requests the dispatcher drops.
 - **Explicitly out of scope**:
   - Persistent sessions and stable client ids were out of scope at first; issue #17 added them (§6).
-  - Bounding the outbound buffer (#35).
-  - Decode-failure observability (#15).
+  - Bounding the outbound buffer was out of scope at first; issue #35 added it (§7).
+  - Decode-failure observability (#15; since resolved, see the risk register's R-19).
   - Retained / last-will messages and membership expiry (R-18).
   - The envelope redesign (P2-1).
 
@@ -75,7 +75,7 @@ MessageBroker.subscribe(topic, data_type, *, qos: int = 0)
 ### 2.5 Reported losses
 
 - `Agent.publish(...)` returns `True` when the broker accepted the message and `False` when it did not. It still never raises for broker errors (RFC-002 / RFC-012 fire-and-forget), and callers that ignore the result are unaffected.
-- When the dispatcher drops a message (`enqueue()` returns `False`: queue full or stopping) that would have been auto-replied to (RFC-003), `_on_message` publishes an error reply at once. The reply has `error` set to `"overloaded: the request was dropped before it was handled (dispatcher queue full or stopping)"`, no content, and the request's correlation id. `publish_sync` returns that error Parcel quickly instead of raising `TimeoutError`.
+- When the dispatcher drops a message (`enqueue()` returns `False`: queue full or stopping) that would have been auto-replied to (RFC-003), `_on_message` publishes an error reply at once. The reply has `error` set to `"overloaded: the request was dropped before it was handled (dispatcher queue or byte budget full, or stopping)"` (the byte budget since #34), no content, and the request's correlation id. `publish_sync` returns that error Parcel quickly instead of raising `TimeoutError`.
   - It runs on the broker callback thread. `Agent.publish` never raises there, and `MqttBroker.publish` only checks paho's immediate return code (RFC-012), so it never waits for the broker.
 
 ## 3. What is guaranteed now
@@ -88,6 +88,7 @@ MessageBroker.subscribe(topic, data_type, *, qos: int = 0)
 | Publishing in the moment between paho losing the socket and reporting the disconnect | QoS 0: lost and reported as failed | QoS 0: still reported as failed. QoS ≥ 1: paho keeps the message and sends it after the reconnect, so it is reported as accepted; reporting a failure would make callers retry and the receiver run the request twice |
 | Subscriber disconnected while the broker holds a message for it | lost | default (clean session): still lost. With `clean_session: false` (§6), the broker keeps QoS ≥ 1 messages for the client and delivers them when it reconnects, including after a restart with a stable `client_id` (see §6 "Persistence" and "Early messages") |
 | Request dropped by a full dispatcher | requester times out | requester gets an "overloaded" error reply at once |
+| Publishing faster than the link drains (slow or stalled link) | QoS 0: paho queued it without limit, so memory grew | refused once `max_pending_bytes` (default 64 MiB) are pending: `publish` → `False`, counted; `publish_sync` raises (§7) |
 
 Delivery is therefore **at least once with deduplication** for QoS 1 traffic between connected peers. It is not end-to-end exactly-once: duplicates beyond the window, or from senders without ids, still reach handlers. Handlers with side effects should stay idempotent; the holon operations are (#5, #6).
 
@@ -144,3 +145,24 @@ Before #17 the paho Client had no client id, so every connection sent a zero-len
   - **Scope.** Handlers registered after these hooks, for example from a timer, can still miss queued messages. Only agents started through the normal lifecycle (`start()` / `start_thread()` → `_activate`) are gated.
 - **Start timeouts.** A start that ends in `START_TIMEOUT` (connect still blocked) leaves a client behind. With a stable or shared id it would keep taking over its replacement's session. The startup helper therefore rolls its client back itself when connect finally returns.
 - **Refusals.** A refused CONNACK raises `MqttConnectRefused`, a `ConnectionError` with the reason code. `start()` waits for a dedicated CONNACK event that `on_disconnect` does not clear. Before, a refusal followed at once by its disconnect could surface only as a timeout. It is not retryable when connecting again with the same configuration cannot succeed: unsupported protocol, client id rejected, bad user name or password, not authorised. That is MQTT 3.1.1 codes 1 / 2 / 4 / 5 and paho's MQTT 5 codes for them, plus 138 / 140. `Agent.__activating` then gives up at once instead of retrying three times, 5 s apart.
+
+## 7. Outbound limit (issue #35)
+
+paho queues QoS 0 messages without any limit (`max_queued_messages` applies only to QoS ≥ 1), so over a slow or stalled link every publish succeeded while memory grew.
+
+**Option** (`broker` section, MQTT):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `max_pending_bytes` | `67108864` (64 MiB) | Estimated bytes that may be pending: not yet written to the socket (QoS 0) or not yet acknowledged (QoS ≥ 1). Each publish counts its payload, its topic and 2 KiB for paho's bookkeeping. A positive int; a malformed value raises at `start()` and leaves the broker NEW. |
+
+- **Tracking.** A publish is pending from the paho call until paho's `on_publish` reports it.
+  - Its bytes are reserved before the call, so a report that arrives before `publish()` returns is handled.
+  - Pending publishes are kept per mid in publish order, because paho reuses a mid after 65535, possibly while an older publish with it is still pending. A report releases the oldest one.
+  - The broker's lock is never held across a paho call, because paho runs `on_publish` while holding its own message lock.
+- **Cost.** Each publish counts its payload and topic plus `_PENDING_MESSAGE_OVERHEAD` (2 KiB). That covers what paho holds per queued message: the packet dict and buffer, and an `MQTTMessageInfo` with its Condition. It was measured with tracemalloc at about 2 KB per 100-byte message on CPython 3.11 and 3.13.
+- **Refusal.** A publish that would take the pending bytes past the limit raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` (reason `backpressure`) and a transport-neutral `PublishBackpressureError` from `agentflow.broker`.
+  - `Agent.publish` returns `False`, counts it in `publish_backpressure_count`, and logs it without a traceback (WARNING on the 1st, 2nd, 4th, ... refusal, DEBUG otherwise).
+  - `publish_sync` raises it, so a requester fails fast.
+- **Connection loss.** paho drops the QoS 0 messages it has not written, without reporting them, so they are forgotten. QoS ≥ 1 ones stay pending until paho resends them and they are acknowledged.
+- **Metrics.** `recovery_metrics()` reports `pending_publish_count` and `pending_publish_bytes`.

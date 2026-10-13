@@ -22,7 +22,7 @@ AgentFlow is a Multi-Agent System (MAS)-based framework for scalable, fault-tole
   Supports agent-level fault containment and task reassignment under node failures.
 
 - **Modular Architecture**  
-  Holonic agent structure with loosely coupled communication layers (e.g., MQTT, DDS).
+  Holonic agent structure over a pub/sub communication layer. MQTT is the only transport today; DDS and ROS are planned (see `contrib/brokers/`).
 
 ## 🧱 Architecture Overview
 
@@ -32,7 +32,7 @@ AgentFlow is a Multi-Agent System (MAS)-based framework for scalable, fault-tole
 +----------------------------+
 |         Agent Layer        | <-- Holonic agents: Perception, Decision, Action
 +----------------------------+
-|     Communication Layer    | <-- MQTT / DDS pub-sub abstraction
+|     Communication Layer    | <-- MQTT pub/sub (DDS, ROS planned)
 +----------------------------+
 ```
 
@@ -75,15 +75,19 @@ Tested using a swarm of 50–500 autonomous mobile robots (AMRs):
 - Intelligent grid and healthcare logistics
 - Programmable, real-time distributed systems
 
+## 🐍 Requirements
+
+Python 3.11 or newer. CI tests CPython 3.11 and 3.13 on Linux and Windows; the package depends on `paho-mqtt` 2.x.
+
 ## 📦 Repository Structure
 
 ```bash
 AgentFlow/
 ├── src/agentflow/
-│          ├── broker/    # MQTT/DDS brokers
+│          ├── broker/    # MQTT broker (Redis/ROS names reserved)
 │          ├── core/    # Holonic agent definitions
-│          └── logistics/    # Request/response/election logistics
-├── unittest/    # AgentFlow unittests
+│          └── logistic/    # Logistics interface (stub; planned)
+├── tests/    # pytest suite (unit and wire tests)
 └── README.md
 ```
 

@@ -141,7 +141,7 @@ def test_auto_reply_echoes_the_request_correlation_id(agent_and_broker, kind):
     assert reply.correlation_id == 'c-1'
     assert returned.correlation_id == 'handler-own'     # the handler's Parcel is not modified
     if kind == 'error':
-        assert reply.error == 'boom'
+        assert 'ValueError' in reply.error          # issue #68: the type, not 'boom'
 
 
 def test_auto_reply_to_an_uncorrelated_request_is_unchanged(agent_and_broker):

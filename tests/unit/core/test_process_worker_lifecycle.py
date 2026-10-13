@@ -38,22 +38,15 @@ import time
 import pytest
 
 # --------------------------------------------------------------------------
-# Ensure spawned children can import module-level helpers from this file.
+# Spawned children import module-level helpers from this file.
 # --------------------------------------------------------------------------
 # multiprocessing spawn launches a fresh Python interpreter and unpickles
-# the target by qualified name. That requires the target's module
-# ('tests.unit.core.test_process_worker_lifecycle') to be importable in
-# the child. Pytest's pyproject `pythonpath = ["src"]` puts only `src`
-# on the child's PYTHONPATH env, so we prepend the repo root here so
-# `tests.*` resolves in the child.
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', '..', '..')
-)
-_existing_pp = os.environ.get('PYTHONPATH', '')
-if _REPO_ROOT not in _existing_pp.split(os.pathsep):
-    os.environ['PYTHONPATH'] = (
-        _REPO_ROOT + (os.pathsep + _existing_pp if _existing_pp else '')
-    )
+# the target by qualified name, so the target's module
+# ('tests.unit.core.test_process_worker_lifecycle') must be importable in
+# the child. Spawn hands the parent's sys.path to the child, and pytest
+# puts the repository root on it (pyproject `pythonpath`), so `tests.*`
+# resolves there. Issue #76: this module used to prepend the root to
+# PYTHONPATH on import, for the rest of the session.
 
 from agentflow.core.agent import (
     Agent,
@@ -159,13 +152,13 @@ def test_setstate_reinstates_fresh_handlers_lock_and_dispatcher_init_lock():
         pass
 
 
-def test_setstate_reinstates_None_broker_dispatcher_agent_worker_message_broker():
+def test_setstate_reinstates_None_broker_dispatcher_agent_worker():
+    # Issue #75: the unused _message_broker attribute was removed.
     agent = Agent(name='runtime-fresh', agent_config={})
     revived = pickle.loads(pickle.dumps(agent))
     assert revived._broker is None
     assert revived._dispatcher is None
     assert revived._agent_worker is None
-    assert revived._message_broker is None
 
 
 def test_setstate_reinstates_empty_children_and_parents():

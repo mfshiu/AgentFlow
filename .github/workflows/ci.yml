@@ -74,6 +74,22 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install build
       - run: python -m build
+      # Issue #50: the wheel carries a non-empty license file and
+      # declares the MIT license.
+      - name: Check the wheel's license
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          wheel = zipfile.ZipFile(glob.glob('dist/*.whl')[0])
+          names = wheel.namelist()
+          licenses = [n for n in names if '.dist-info/licenses/' in n]
+          assert licenses and all(wheel.read(n).strip() for n in licenses), licenses
+          metadata = wheel.read(next(n for n in names if n.endswith('.dist-info/METADATA'))).decode()
+          # License-Expression (PEP 639) or the older License field,
+          # depending on the setuptools version.
+          assert {'License-Expression: MIT', 'License: MIT'} & set(metadata.splitlines()), metadata[:500]
+          print('wheel license OK:', licenses)
+          PY
       # Install the wheel into a clean venv and import the public entry
       # points from outside the source tree, so missing install_requires
       # (#45) or import-time dependencies show up here.
@@ -89,3 +105,17 @@ jobs:
           from agentflow.broker.mqtt_broker import MqttBroker
           print('wheel import OK')
           "
+      # Issues #41, #42: every module the wheel ships must import.
+      - name: Import every module in the wheel
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" - <<'PY'
+          import importlib, pkgutil
+          import agentflow
+          assert 'site-packages' in agentflow.__path__[0], agentflow.__path__
+          names = [m.name for m in pkgutil.walk_packages(agentflow.__path__, 'agentflow.')]
+          for name in names:
+              importlib.import_module(name)
+          assert 'agentflow.core.agent' in names, names
+          print('imported', len(names), 'modules')
+          PY

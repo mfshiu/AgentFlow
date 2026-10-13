@@ -19,6 +19,15 @@ Failure injection:
                             immediately without a CONNACK
                             (simulates a broker that is down)
   - connack_rc              return code sent in every CONNACK
+  - reject_topics           topic filters refused with SUBACK 0x80
+                            (an ACL denying them)
+  - connack_gate            a threading.Event; when set to one, each
+                            CONNACK waits until it is set (a slow
+                            broker: the client stays STARTING)
+  - stall(index)            stops reading one client connection, so that
+                            its TCP buffers, then the client's own
+                            outgoing queue, fill up (a slow or stuck
+                            link); resume(index) reads it again
 
 All threads are daemon threads; close() tears everything down.
 """
@@ -60,11 +69,15 @@ def _encode_str(s: str) -> bytes:
 class MiniMqttServer:
     def __init__(self, *, connack_rc: int = 0):
         self.connack_rc = connack_rc
+        self.connack_gate: Optional[threading.Event] = None
         self.reject_connections = False
         self.withhold_puback = False
+        self.reject_topics: Set[str] = set()
         self.deliver_on_connect: List[Tuple[str, bytes]] = []
 
         self._lock = threading.Lock()
+        self._unstalled = threading.Condition(self._lock)
+        self._stalled: Set[int] = set()
         self._closed = False
         self._conns: List[_Conn] = []
         # Observations (read via the snapshot helpers below).
@@ -130,6 +143,18 @@ class MiniMqttServer:
             self._conns = [c for c in self._conns if c.index != index]
         for c in conns:
             self._hard_close(c.sock)
+
+    def stall(self, index: int) -> None:
+        """Stop reading the client connection with this index (after the
+        packet being read, if any)."""
+        with self._lock:
+            self._stalled.add(index)
+
+    def resume(self, index: int) -> None:
+        """Read the client connection with this index again."""
+        with self._unstalled:
+            self._stalled.discard(index)
+            self._unstalled.notify_all()
 
     def publish(self, topic: str, payload: bytes) -> int:
         """Send a QoS 0 PUBLISH to every connection subscribed to
@@ -236,6 +261,9 @@ class MiniMqttServer:
     def _serve(self, conn: _Conn) -> None:
         try:
             while True:
+                with self._unstalled:
+                    while conn.index in self._stalled and not self._closed:
+                        self._unstalled.wait(0.1)
                 first, body = self._read_packet(conn.sock)
                 ptype = first >> 4
                 if ptype == 1:      # CONNECT
@@ -272,6 +300,8 @@ class MiniMqttServer:
         with self._lock:
             self.connects.append((conn.index, conn.client_id))
             self.clean_sessions.append((conn.index, clean_session))
+        if self.connack_gate is not None:
+            self.connack_gate.wait(10)
         conn.send(bytes([0x20, 0x02, 0x00, self.connack_rc]))
         if self.connack_rc == 0:
             for topic, payload in list(self.deliver_on_connect):
@@ -285,10 +315,11 @@ class MiniMqttServer:
             topic = body[pos + 2:pos + 2 + tlen].decode('utf-8')
             pos += 2 + tlen + 1     # skip requested QoS byte
             topics.append(topic)
-            granted.append(0)
+            granted.append(0x80 if topic in self.reject_topics else 0)
+        accepted = [t for t, g in zip(topics, granted) if g != 0x80]
         with self._lock:
-            conn.topics.update(topics)
-            self.subscriptions.extend((conn.index, t) for t in topics)
+            conn.topics.update(accepted)
+            self.subscriptions.extend((conn.index, t) for t in accepted)
         conn.send(bytes([0x90]) + _encode_remaining_length(2 + len(granted))
                   + pid + bytes(granted))
 

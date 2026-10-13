@@ -2,7 +2,9 @@ from setuptools import setup, find_packages
 
 setup(
     name="mas-agentflow",  
-    version="2025.8.22.1933",
+    # Issue #50: date-based (YYYY.M.D); see CHANGES.md.
+    version="2026.10.13",
+    license="MIT",
     packages=find_packages(where="src"),  # Tell setuptools to look for packages in 'src'
     package_dir={"": "src"},  # Set 'src' as the root directory for the package
     include_package_data=True,  # If you have any data files (e.g., non-Python files)
@@ -17,5 +19,14 @@ setup(
         #     'agentflow-cli=agentflow.cli:main',
         # ],
     },
-    python_requires='>=3.11',  # Specify the Python version you require
+    # Issue #77: the floor is the lowest Python the CI matrix tests
+    # (.github/workflows/ci.yml), and the classifiers name the versions it
+    # tests; tests/unit/test_packaging_metadata.py keeps them in step.
+    python_requires='>=3.11',
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.13",
+    ],
 )

@@ -13,8 +13,9 @@ that _record() is never reached.
 Contracts verified:
   - Payloads that reference any non-allowlisted global (functions,
     classes, modules) are rejected with ParcelDecodeError, a TypeError
-    subclass, before anything is called — directly and via
-    Agent._on_message.
+    subclass, before anything is called. Agent._on_message drops them
+    without dispatching and, since issue #15, counts them in
+    decode_failure_count instead of raising into the broker callback.
   - Plain data (dict / list / tuple / set / frozenset / str / bytes /
     bytearray / int / float / complex / bool / None) still round-trips
     for pickle protocols 3-5, including payloads produced by the
@@ -27,6 +28,7 @@ Contracts verified:
 import datetime
 import pickle
 import threading
+import time
 
 import pytest
 
@@ -75,6 +77,15 @@ def _global_ref_payload(module, name):
     body = (b'\x80\x02}X\x07\x00\x00\x00content'
             + b'c' + f'{module}\n{name}\n'.encode() + b's.')
     return BinaryParcel.HEAD + body
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def _agent(config=None):
@@ -213,8 +224,8 @@ def test_gadget_delivered_to_agent_is_not_executed_and_not_dispatched():
     agent, broker = _agent()
     got, done = _subscribe_recorder(agent)
     try:
-        with pytest.raises(TypeError):
-            broker.deliver('svc/in', _binary_payload(_managed(_Gadget())))
+        broker.deliver('svc/in', _binary_payload(_managed(_Gadget())))
+        assert _wait_for(lambda: agent.decode_failure_count == 1)   # #15: counted, not raised
         assert not done.wait(0.3)
         assert got == []
         assert _GADGET_CALLS == []
@@ -324,8 +335,8 @@ def test_agent_can_refuse_pickle_payloads_entirely():
     agent, broker = _agent({'codec': {'accept_pickle': False}})
     got, done = _subscribe_recorder(agent)
     try:
-        with pytest.raises(parcel_mod.ParcelDecodeError):
-            broker.deliver('svc/in', BinaryParcel({'content': b'x'}).payload())
+        broker.deliver('svc/in', BinaryParcel({'content': b'x'}).payload())
+        assert _wait_for(lambda: agent.decode_failure_count == 1)   # #15: counted, not raised
         assert not done.wait(0.3)
         broker.deliver('svc/in', TextParcel({'ok': 1}).payload())
         assert done.wait(3)

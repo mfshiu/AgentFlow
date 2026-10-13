@@ -116,6 +116,11 @@ Confidence legend: **High** = directly observable in code; **Medium** = plausibl
 - **Known issues NOT resolved by this fix** (tracked separately, out of RFC-001 scope):
   - **R-13** (this register) — `Agent.publish` still swallows broker exceptions; `publish_sync` surfaces them as `TimeoutError` rather than the original exception.
   - **R-04** (this register) — `Agent._on_message` still spawns one short-lived thread per received message.
+  - **Side effects of `publish_sync`** (issue #21, found 2026-10-09): it wrote its reply topic into the caller's Parcel, asked the worker for an event, waited forever on `timeout=None` silently, and handed late replies to `on_message`. *Resolved 2026-10-13 (#21):*
+    - *The caller's Parcel is untouched, and the waiter is a `threading.Event`.*
+    - *`timeout=None` is deprecated.*
+    - *Late replies on generated topics are dropped and counted.*
+    - *See RFC-014 §2.2 and `tests/unit/core/test_publish_sync_side_effects.py`. The retry returning an earlier call's late reply was already fixed by correlation ids (#36).*
   - **Concurrent same-`topic_wait` race** — two `publish_sync` calls using the same explicit `topic_wait` still collide (`Agent.subscribe` silently overwrites). The new identity guard prevents this fix from making the collision *worse*, but does not resolve the underlying race. **Resolved 2026-07-27 (RFC-006 + RFC-007)**: RFC-006 turned publish_sync-vs-publish_sync collision into a fail-fast `TopicWaitCollisionError`; RFC-007 extended the fail-fast policy to direct `Agent.subscribe` / `Agent.unsubscribe` racing against a `publish_sync` waiter. See [R-14](#r-14--shared-dictionaries-without-locks) for details. **Superseded 2026-10-12 ([RFC-014 §8](../rfc/RFC-014-request-reply-correlation.md), #36)**: concurrent `publish_sync` calls now share the `topic_wait` and each takes the reply carrying its own correlation id. The fail-fast remains against normal subscribe handlers.
 
 ---
@@ -254,7 +259,14 @@ Callers that read `broker._connect_ok` as "was ever successfully connected" woul
 
 - **W-24 / issue #60.** If start() hits START_TIMEOUT while the startup helper is still wedged in `connect()`, and that helper later succeeds, the orphaned client now keeps reconnecting in the background. Previously it died at its first connection loss. Its callbacks stay fenced.
 - `register_child` is still sent only on the first connection (issue #6).
-- Subscriptions made before the first CONNACK are still not sent (issue #54).
+- Subscriptions made before the first CONNACK are still not sent (issue #54). *Resolved 2026-10-12 (#54): every CONNACK, the first included, replays the registry. See RFC-005 §7.3 / §7.5 and `tests/unit/test_mqtt_broker_first_connect.py` / `tests/wire/test_first_connect_subscriptions_wire.py`. `recovery_run_count` now also counts a first connection that had topics to replay. This holds inside MqttBroker: `Agent.subscribe` still does nothing at the broker before the Agent has one (for example in `on_activating`), and each start retry builds a new broker without the old one's registry (issue #18).*
+- Subscription results were never checked (issue #53). *Resolved 2026-10-12 (#53):*
+  - *A SUBACK refusal is logged at WARNING. It is counted in `failed_subscriptions` instead of `active_subscriptions`, and retried on the next CONNACK.*
+  - *A resubscribe's paho rc is checked.*
+  - *An invalid filter raises before it enters the registry, and before `Agent.subscribe` registers anything.*
+  - *A failed topic counts as active again only once a SUBACK grants it.*
+  - *SUBACKs are matched to their topic only on the connection their SUBSCRIBE went out on.*
+  - *See RFC-005 §7.12, `tests/unit/test_mqtt_broker_subscribe_results.py` and `tests/wire/test_suback_wire.py`.*
 - Publishes made while disconnected are still dropped by `Agent.publish` (issue #4).
 
 ---
@@ -352,7 +364,10 @@ The first `_on_message` call constructs the dispatcher under the lock; concurren
 - **Per-topic serial queue** (RFC-004 Option E): same-topic ordering is not enforced. Deferred to a follow-up RFC iff ordering becomes required.
 - **ProcessWorker dispatcher semantics**: dispatcher is per-Agent-instance; in a hypothetical ProcessWorker future, dispatcher would live in the child process. Out of RFC-004 scope.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process attributes + log lines are exposed.
-- **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`.
+- **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`. *Since issue #75 (2026-10-13), its `stop()` reports whether its handler threads have finished, instead of always `True`; it waits for them only when given a timeout. A handler thread is tracked from before it starts until its task returns, so concurrent enqueues cannot hide one, and `stop()` from a handler leaves that handler out.*
+- **`publish_sync` inside a handler** (issue #7, found 2026-10-09): the reply was queued for the same consumers, one of which the waiting handler held, so nested calls timed out. *Resolved 2026-10-12 (#7):*
+  - *Replies have their own one-consumer lane (RFC-004 §9 amended), with a byte budget of their own and a queue of at least 1024.*
+  - *Verified by `tests/unit/core/test_publish_sync_in_handlers.py` and `tests/wire/test_publish_sync_in_handler_wire.py`.*
 
 ---
 
@@ -385,8 +400,12 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 - **Scope of change**: `src/agentflow/core/agent.py` — `Agent._on_message` (`@final`, public signature unchanged). Three rules now hold together:
   - **R-fallback-silent**: `is_specific_handler = topic in self.__topic_handlers` is computed at dispatch. Auto-reply is emitted **iff** `pcl.topic_return` is truthy AND `is_specific_handler` is `True`. Fall-through to `on_message` still runs the handler but never publishes an implicit reply.
   - **R-strip-topic_return**: before publishing an auto-reply, if `data_resp` is a `Parcel` whose `topic_return` is truthy, the framework reconstructs a fresh parcel via `type(data_resp)(data_resp.content)`, copies `.error`, and uses it as the reply. The handler's returned object is not mutated.
-  - **R-exception-fresh**: on handler exception, the reply is a new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming parcel `p` is not mutated; handlers that store a reference to `p` observe its original state.
-- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
+  - **R-exception-fresh**: on handler exception, the reply is a new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming parcel `p` is not mutated; handlers that store a reference to `p` observe its original state. *Amended 2026-10-13 (issue #68):*
+    - *`.error` names the exception type only; the message stays in the responder's log. `errors.expose_details` restores `str(ex)`.*
+    - *`publish_sync(..., raise_on_error=True)` raises `RemoteError`.*
+    - *Verified by `tests/unit/core/test_error_replies.py`.*
+    - *A structured error (code, retryable) stays with the envelope redesign (P2-1).*
+- **Public API impact**: none. `Agent.publish` / `subscribe` / `unsubscribe` / `publish_sync` / `_publish_or_raise` all unchanged. *(As of RFC-003. Since #68, `publish_sync` takes `raise_on_error`, `RemoteError` is new, and the Agent config has an `errors` section; see the amendment above.)* `Parcel` / `TextParcel` / `BinaryParcel` / `HEAD` / envelope fields unchanged. Wire format unchanged. `MessageBroker` / `MqttBroker` API unchanged.
 - **Observable behavioural changes** (three; all narrow, all in the loop-prevention direction):
   1. A topic that is subscribed but has no specific handler no longer produces an implicit auto-reply when a message with `topic_return` arrives; the message dispatches to `on_message` default (no-op) and no publish is emitted.
   2. Auto-reply parcels never carry `topic_return` on the wire. A handler that returns a `Parcel` with `topic_return` set observes the reply carrying `topic_return=None` after reconstruction, while the handler's own returned object is left intact.
@@ -445,9 +464,9 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 **Agent pickle protocol** (`src/agentflow/core/agent.py`):
 
-- `Agent.__getstate__` / `__setstate__` implement the pickle protocol. A `_RUNTIME_ONLY_FIELDS` whitelist excludes non-picklable / not-meaningful-in-child fields: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`.
-- `__getstate__` **probes every remaining field for picklability**: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests moving the handler / callback into `on_activate()`. **Fail-fast** — no silent omission.
-- `__setstate__` reinstates every runtime-only field fresh: new `threading.RLock` × 2, `None` for `_broker` / `_dispatcher` / `_agent_worker` / `_message_broker`, empty `{}` for `_children` / `_parents`. The RFC-006 / RFC-007 `_HandlerRecord` ownership shape survives pickle; only the guarding lock is rebuilt.
+- `Agent.__getstate__` / `__setstate__` implement the pickle protocol. A `_RUNTIME_ONLY_FIELDS` whitelist excludes non-picklable / not-meaningful-in-child fields: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`. *Since issue #75 (2026-10-13) `_message_broker` no longer exists, and later issues added more fields; `Agent._RUNTIME_ONLY_FIELDS` is the current list.*
+-  `__getstate__` **probes every remaining field for picklability**: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests moving the handler / callback into `on_activate()`. **Fail-fast** — no silent omission.
+- `__setstate__` reinstates every runtime-only field fresh: new `threading.RLock` × 2, `None` for `_broker` / `_dispatcher` / `_agent_worker` / `_message_broker`, empty `{}` for `_children` / `_parents`. *Since issue #75, `_dispatcher_init_lock` is rebuilt as a `Lock`, as in `__init__`, and `_message_broker` is gone.* The RFC-006 / RFC-007 `_HandlerRecord` ownership shape survives pickle; only the guarding lock is rebuilt.
 
 **ProcessWorker lifecycle** (`src/agentflow/core/agent_worker.py`):
 
@@ -472,7 +491,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 ### Pickle contract (R-06.1)
 
-- Runtime-only fields (`_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`) are **excluded** from `__getstate__` and reinstated fresh in `__setstate__`.
+- Runtime-only fields (`_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker` *(removed in #75)*, `_children`, `_parents`) are **excluded** from `__getstate__` and reinstated fresh in `__setstate__`.
 - `_children` / `_parents` are rebuilt as empty `{}` in the child. Populated by broker callbacks after the child's `_activate` runs.
 - Non-picklable handler in `__topic_handlers` → `TypeError` at `start()` naming the offending topic.
 - Non-picklable value in `config` → `TypeError` at `start()` naming `Agent.config`.
@@ -547,6 +566,14 @@ Four narrow, all in the correctness / bounded-shutdown direction:
 - **Impact**: Publish emits `logger.error("Cannot publish: _broker is None.")` and returns `None`. Caller cannot detect the failure. `agent._children` returns empty in parent even after children register.
 - **Confidence**: High
 - **Recommended verification test**: Start an agent with process mode, call `agent.publish('test', 'x')` from the main thread of the parent, and observe with a second subscribed agent that no message arrives.
+- **Partially resolved 2026-10-13 (issue #9, roadmap P0-5: warnings only):**
+  - Agent's docstring describes the controller contract.
+  - On the controller, `publish`, `publish_sync`, `subscribe`, `unsubscribe`, `start_interval_loop` and the data API warn (`RuntimeWarning`).
+  - `start()` in the default process mode warns that the default will become `'thread'` (`FutureWarning`).
+  - Unpicklable attributes are named in a note on the original exception when the start fails, and `start_thread()` then works on the same object.
+  - `unsubscribe` and `start_interval_loop` warn on the controller too.
+  - Verified by `tests/unit/core/test_process_controller.py`.
+  - **Still open (P1-5):** refusing these calls, and switching the default mode.
 
 ---
 
@@ -1150,7 +1177,11 @@ Signature and return type unchanged; **never-raise preserved** — the diagnosti
 
 ## R-14 — Shared dictionaries without locks
 
-- **Status**: **PARTIALLY RESOLVED** (2026-07-27) — `__topic_handlers` fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md); `_children` / `_parents` remain Open (not addressed in this RFC).
+- **Status**: **RESOLVED** (2026-10-13). `__topic_handlers` was fully synchronised via [RFC-007](../rfc/RFC-007-handler-registry-ownership.md) on 2026-07-27. `_children` / `_parents` followed:
+  - **Issues #6 / #13:** writes happen under `_holon_lock`.
+  - **Issue #57, copy-on-write:** a new member replaces the dict instead of growing it. Code iterating one, such as a user hook while other members register, never sees it change size, and readers need no lock. A known member's re-registration (#6) updates its entry in place: the keys do not change, and no copy is made, so a round of re-registrations stays linear.
+  - **Issue #57, hooks:** a raising `on_register_child` no longer skips the `register_parent` answer, and a raising `on_register_parent` no longer escapes the handler. Both are logged.
+  - **Verification:** `tests/unit/core/test_holon_registry_concurrency.py`.
 - **Severity**: Medium
 - **Category**: Concurrency
 - **File / Function / Line** (historical): `__topic_handlers`, `_children`, `_parents` in `agent.py`
@@ -1348,6 +1379,20 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Impact**: Schema drift is silent; no error, no upgrade path.
 - **Confidence**: High
 - **Recommended verification test**: Feed a parcel with `version=1` — expect no error.
+- **Status**: **RESOLVED** (2026-10-12, issue #15).
+  - Decoding requires the envelope's `version` to be an int from 1 to `VERSION`, in both encodings. A missing, future, malformed or boolean version raises `ParcelDecodeError` (a `TypeError`). So does a payload without an AgentFlow prefix.
+  - Unknown envelope keys are ignored on purpose: additive optional fields (RFC-014 `correlation_id`, RFC-015 `message_id`) must not break older receivers.
+  - `Agent._on_message` counts undecodable messages (`decode_failure_count`) and logs them at a rate-limited WARNING without a traceback. Before, each one escaped into `MqttBroker._on_message` and was logged with a full traceback.
+  - Hostile envelopes stay on that path:
+    - the rejected version is never printed in full, because an int too large to print would make the message itself raise;
+    - deeply nested JSON is a decode failure;
+    - anything else a decoder raises is counted the same way;
+    - the logged reason and topic are escaped and length-capped, so a sender cannot forge or flood log lines.
+  - Still open, for the envelope redesign (roadmap P2-1):
+    - a version in the prefix, checked before the body is parsed or unpickled;
+    - a raw codec for consuming non-AgentFlow MQTT traffic;
+    - a size limit before decoding (#34).
+  - Verification: `tests/unit/core/test_parcel_decoding.py`.
 
 ---
 
@@ -1384,6 +1429,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-22 — Stub / broken broker implementations reachable via `BrokerType`
 
+- **Status**: **RESOLVED** (2026-10-13) — GitHub issue #42. `RedisBroker` and `RosBroker` now derive from `PlaceholderBroker`, whose `start` / `publish` / `subscribe` raise `BrokerNotAvailableError` (a `NotImplementedError`); `Agent.__activating` logs "Broker not available" as an error, does not retry and skips `on_activate`, and the worker thread or child process ends. The caller is not told: in process mode the child exits with code 0 and `ProcessWorker.state` stays RUNNING until `terminate()`, as for any failed activation (issue #8). `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/` (outside the wheel), and CI imports every module of the installed wheel. Covered by `tests/unit/test_placeholder_brokers.py`. A real DDS / ROS backend waits for the transport interface of issue #69.
 - **Severity**: Low
 - **Category**: Correctness / Documentation
 - **File / Function / Line**:
@@ -1404,7 +1450,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Severity**: Low
 - **Category**: Documentation
 - **File / Function / Line**:
-  - `README.md` mentions `logistics/`, `unittest/`
+  - `README.md` mentions `logistics/`, `unittest/` *(since issue #42 (2026-10-13) the README says `logistic/` and `tests/`)*
   - Reality: `src/agentflow/logistic/`, `unit_test/`
 - **Trigger**: New contributor follows README paths.
 - **Impact**: Confusion; commands like `python -m unittest discover -s unittest` fail.
@@ -1518,7 +1564,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-27 — At-most-once delivery (QoS 0) with silent losses and no message id
 
-- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issue #4, [RFC-015](../rfc/RFC-015-delivery-guarantees.md)). Persistent sessions (#17) and the outbound buffer bound (#35) remain **Open**.
+- **Status**: **PARTIALLY RESOLVED** (2026-10-12, issues #4, #17 and #35, [RFC-015](../rfc/RFC-015-delivery-guarantees.md)). Persistent sessions are opt-in (#17) and the outbound buffer is bounded (#35, see R-29). With the default clean session the broker still keeps nothing for a disconnected subscriber.
 - **Severity**: High
 - **Category**: Message reliability
 - **File / Function / Line**:
@@ -1550,9 +1596,99 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 **Still open**:
 - Persistent sessions and stable client ids: available since #17 (RFC-015 §6), opt-in. With the default clean session the broker still keeps nothing for a disconnected subscriber.
-- Bounding the outbound buffer (#35).
-- Decode-failure observability (#15).
+- Bounding the outbound buffer: resolved by #35 (see R-29).
+- Decode-failure observability: resolved by #15 (see R-19).
 - Duplicates beyond the window, or from senders without ids, still reach handlers, which should stay idempotent.
+
+---
+
+## R-28 — Payloads decoded on the network thread, without size or byte limits
+
+- **Status**: **RESOLVED** (2026-10-12, issue #34). The outbound direction is resolved by #35 (see R-29).
+- **Severity**: Medium
+- **Category**: Resource management
+- **File / Function / Line**:
+  - `src/agentflow/core/agent.py` `_on_message`, which decoded before enqueuing;
+  - `src/agentflow/core/dispatcher.py`, whose queue was bounded by count only;
+  - `src/agentflow/core/parcel.py`, where TextParcel made a sliced copy before decoding.
+- **Trigger**: a large or slow-to-decode payload; a stream of large messages while the dispatcher is saturated.
+- **Impact**:
+  - The paho network thread was blocked while decoding, delaying every subscription and PINGREQ.
+  - Messages the full queue was about to drop were decoded anyway.
+  - Up to 1024 large messages could sit in memory, against CLAUDE.md invariant 5.
+- **Confidence**: High (reproduced; see the issue).
+
+### Payload limits and off-thread decoding (2026-10-12, issue #34)
+
+**Change.**
+- `_on_message` (network thread) only does cheap, topic-based work:
+  - the size gate: a payload over `codec.max_payload_bytes`, default 16 MiB, is dropped undecoded and counted in `decode_failure_count`;
+  - the early-message gate (#17);
+  - the handler lookup;
+  - enqueuing the raw bytes.
+- `__handle` on a dispatcher thread decodes, deduplicates (#4) and handles the message.
+- `dispatch.max_queued_bytes` (default 256 MiB) bounds the payload bytes waiting for a dispatcher thread, and the bytes held by the early-message gate.
+- A message the queue cannot take is dropped without decoding. A request (RFC-003) of at most 64 KiB is decoded on the receiving thread only to answer it "overloaded" (#4). Its message id is recorded then, so neither a copy still waiting in the queue nor a later redelivery runs a request whose requester was told it was dropped. This holds within the 4096-id deduplication window. If the reply cannot be sent, the id is released, so that a redelivery runs.
+- Held messages are released within the byte budget as well as the queue capacity.
+- TextParcel decodes from a `memoryview`, without a sliced copy.
+
+**Compatibility.**
+- Payloads over 16 MiB are now dropped. Raise `codec.max_payload_bytes` if a deployment sends larger messages.
+- Decode failures and deduplication now happen on dispatcher threads, so their counters update asynchronously.
+
+**Verification**: `tests/unit/core/test_payload_limits.py`:
+- oversized payloads not decoded, and the default limit;
+- decoding off the receiving thread;
+- no decode for queue-full drops;
+- byte budget, for queued and held messages;
+- config validation.
+
+**Outbound direction**: resolved by #35 (see R-29).
+
+---
+
+## R-29 — Unbounded outbound queue on a slow or stalled link
+
+- **Status**: **RESOLVED** (2026-10-12, issue #35).
+- **Severity**: Medium
+- **Category**: Resource management
+- **File / Function / Line**:
+  - `src/agentflow/broker/mqtt_broker.py` `publish`, which set no limit and exposed no pending count;
+  - paho's outgoing packet queue, to which `max_queued_messages` does not apply at QoS 0.
+- **Trigger**: publishing faster than the link drains: a slow network, a stalled broker, a full TCP window.
+- **Impact**:
+  - Every publish "succeeded" while paho's queue, and the process's memory, grew without bound (CLAUDE.md invariant 5).
+  - Nothing reported the backlog.
+- **Confidence**: High (reproduced over a stalled loopback link: 100 MiB accepted).
+
+### Outbound limit (2026-10-12, issue #35)
+
+**Change.**
+- MqttBroker tracks each publish from the paho call until paho reports it sent: QoS 0 once written to the socket, QoS ≥ 1 once acknowledged. It is kept per mid in publish order, because paho reuses mids after 65535.
+- Each pending publish counts its payload, its topic and a fixed 2 KiB for paho's bookkeeping. That overhead was measured with tracemalloc at about 2 KB per queued 100-byte message, so counting payloads alone understated memory 10–20× for small messages.
+- A publish that would take the pending bytes past the `max_pending_bytes` broker option (default 64 MiB) raises `MqttBackpressureError` before paho is called. It is a `MqttPublishError` with reason `backpressure`, and a transport-neutral `PublishBackpressureError`.
+- `Agent.publish` returns `False`, counts it in `publish_backpressure_count` and logs it without a traceback (WARNING on the 1st, 2nd, 4th, ... refusal). `publish_sync` raises it.
+- A connection loss forgets unsent QoS 0 messages, as paho drops them. QoS ≥ 1 ones stay pending until paho resends them and they are acknowledged.
+- `recovery_metrics()` reports `pending_publish_count` and `pending_publish_bytes`.
+
+**Compatibility.**
+- A publisher that outruns its link by more than 64 MiB now gets `False` (or an exception from `publish_sync`) instead of growing memory. Raise `max_pending_bytes` for bursty, high-volume senders.
+- A single payload larger than `max_pending_bytes` can never be sent.
+- At the default limit, at most about 32 000 small messages can be pending.
+
+**Verification**:
+- `tests/unit/test_mqtt_broker_backpressure.py` covers:
+  - tracking by mid, including reused mids;
+  - the cost per message, the limit and its default;
+  - a report that arrives before `publish()` returns;
+  - disconnects;
+  - a paho call that raises;
+  - option validation;
+  - `Agent.publish`.
+- `tests/wire/test_outbound_backpressure_wire.py`: stalls the loopback server and expects backpressure, then a backlog that stays while the link is stalled and drains once it moves again.
+- A review probe published 150 000 messages over a stalled link. The tracked count matched paho's queue exactly, far beyond 65 535, and returned to 0 after the drain.
+
+**Not covered**: the per-message overhead is an estimate for CPython 3.11–3.13 and paho 2.1. Only MqttBroker enforces the limit.
 
 ---
 
@@ -1568,22 +1704,24 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-09 | High | High | **Partially resolved 2026-10-11 (#38)**: same-name replica / grandchild addressing fixed; name validation and namespace still open | Topic derived from unsanitised `Agent.name`; naming collisions |
 | R-10 | High | High | **Resolved 2026-08-03 (RFC-008 + RFC-009 + RFC-010 + RFC-011 + RFC-012 + RFC-013)** — worker layer bounded (RFC-008/009); broker stop bounded (RFC-010); broker start bounded (RFC-011); broker publish result validated + gated (RFC-012); `Agent.terminate` / `Agent.__activating` / `publish_sync` all bounded with RFC-002 fast-fail restored; R-10.5 made observable + operationally mitigated (RFC-013). Residuals: R-10.5 non-daemon interpreter-exit (**Partially Resolved / Operationally Mitigated** — in-process residual is permanent by design; hard containment is a supervisor responsibility) + publish-vs-stop full linearisation barrier (**Open / Documented**). | `Worker.stop()` / `MqttBroker.start()` / `MqttBroker.stop()` / `MqttBroker.publish()` observability + boundedness |
 | R-18 | High | High | **Partially resolved 2026-10-11 (#6)**: membership converges; expiry still open | No child/parent unregister / heartbeat |
-| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions (#17) and outbound bound (#35) still open | At-most-once delivery, silent losses |
+| R-27 | High | High | **Partially resolved 2026-10-12 (#4, RFC-015)**: QoS 1 for control / RPC, message ids with deduplication, `publish` returns bool, dropped requests answered; persistent sessions opt-in (#17), outbound buffer bounded (#35); the default clean session still loses messages for a disconnected subscriber | At-most-once delivery, silent losses |
 | R-05 | High | Medium | **Resolved 2026-07-26 (RFC-003)** | Suspected reply loop |
 | R-06 | High | High | **Partially Resolved 2026-07-28 (RFC-008)** — R-06.1 pickle / R-06.2 unbounded join / R-06.4 parent-child contract done; R-06.3 heartbeat + child-exception IPC still Open | Process-mode pickling + ProcessWorker lifecycle |
 | R-07 | High | Medium | Open | BaseException handlers |
 | R-11 | Medium | Medium | Open | `_on_connect` `setattr(...None...)` overwrites methods |
 | R-13 | Medium | High | **Resolved 2026-07-26 (RFC-002)** | publish result discarded |
-| R-14 | Medium | Medium | **Partially Resolved 2026-07-27 (RFC-007)** — `__topic_handlers` done; `_children` / `_parents` open | Shared dicts without locks |
+| R-14 | Medium | Medium | **Resolved 2026-10-13** — `__topic_handlers` (RFC-007); `_children` / `_parents` locked writes (#6 / #13), copy-on-write and contained hooks (#57) | Shared dicts without locks |
 | R-15 | Medium | High | Open | `ConfigName` referenced but missing |
 | R-16 | Medium | Medium | **Resolved 2026-10-11 (#47)** | `from tkinter import N` |
-| R-19 | Medium | High | Open | Parcel `version` never validated |
+| R-19 | Medium | High | **Resolved 2026-10-12 (#15)**: version validated, undecodable messages counted with rate-limited logging | Parcel `version` never validated |
 | R-20 | Medium | High | **Partially resolved 2026-10-12 (#36 RFC-014, #4 RFC-015)**: request/reply `correlation_id` and `message_id`; timestamp, source, trace context still open | No message metadata for tracing |
 | R-25 | Medium | High | Open | Broker config default shape mismatch |
+| R-28 | Medium | High | **Resolved 2026-10-12 (#34)**: payload size limit before decoding, decoding on dispatcher threads, byte-bounded queue; outbound bounded by #35 (R-29) | Payloads decoded on the network thread without limits |
+| R-29 | Medium | High | **Resolved 2026-10-12 (#35)**: `max_pending_bytes` outbound limit (default 64 MiB); backpressure reported as `publish` → `False` | Unbounded outbound queue on a slow or stalled link |
 | R-26 | Medium | High | **Partially resolved 2026-10-12 (#13)**: registered-parent terminate, `max_children`, opt-in HMAC, auto-reply guard; reply forgery and TLS / ACL still open | Holon control messages unauthenticated |
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
-| R-22 | Low | High | Open | Stub / broken broker implementations |
+| R-22 | Low | High | **Resolved 2026-10-13 (issue #42)** | Stub / broken broker implementations |
 | R-23 | Low | High | Open | README / directory drift |
 | R-24 | Low | Medium | Open | Unexplained sleep in `_on_connect` |

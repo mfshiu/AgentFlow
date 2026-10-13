@@ -2,11 +2,12 @@ from paho.mqtt.client import Client, MQTTv311
 from paho.mqtt.enums import CallbackAPIVersion
 import logging, math, os, socket, threading, time, uuid
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Optional, Set, Tuple
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from agentflow.core.agent_worker import WorkerState
-from .message_broker import MessageBroker, check_qos
+from .message_broker import MessageBroker, PublishBackpressureError, check_filter, check_qos
 from .notifier import BrokerNotifier
 
 
@@ -37,6 +38,8 @@ class MqttPublishReason(Enum):
     BROKER_DISCONNECTED = 'broker_disconnected'
     PAHO_REJECTED = 'paho_rejected'
     UNSUPPORTED_RESULT = 'unsupported_result'
+    # Issue #35: the max_pending_bytes outbound limit was reached.
+    BACKPRESSURE = 'backpressure'
 
 
 class MqttPublishError(RuntimeError):
@@ -104,6 +107,62 @@ class MqttPublishError(RuntimeError):
         super().__init__("MQTT publish failed: " + ", ".join(parts))
 
 
+class MqttBackpressureError(MqttPublishError, PublishBackpressureError):
+    """Issue #35: raised by MqttBroker.publish, before paho is called,
+    when this publish would take the estimated bytes of those still
+    pending (QoS 0: not yet written to the socket; QoS >= 1: not yet
+    acknowledged) past the `max_pending_bytes` start() option. reason
+    is BACKPRESSURE."""
+
+
+# Issue #35: the memory paho holds for a queued message besides its
+# topic and payload: the packet dict and buffer, and an MQTTMessageInfo
+# with its Condition. Measured with tracemalloc over a stalled link:
+# about 2 KB per 100-byte message on CPython 3.11 and 3.13.
+_PENDING_MESSAGE_OVERHEAD = 2048
+
+
+def _encoded_size(value) -> int:
+    """The bytes paho sends for a topic or payload (it encodes str and
+    numbers as UTF-8 text, and None as an empty payload)."""
+    if value is None:
+        return 0
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    if isinstance(value, memoryview):
+        return value.nbytes
+    return len(str(value).encode("utf-8"))
+
+
+def _publish_cost(topic, payload) -> int:
+    """Issue #35: an estimate of the memory paho holds for one queued
+    publish, counted against max_pending_bytes."""
+    return _encoded_size(topic) + _encoded_size(payload) + _PENDING_MESSAGE_OVERHEAD
+
+
+def _subscribe_result(result) -> Tuple[Optional[int], Optional[int]]:
+    """Issue #53: (rc, mid) from paho's subscribe() result, a
+    (MQTTErrorCode, mid) tuple. Any other shape (a test double) gives
+    (None, None) and is not checked."""
+    if isinstance(result, tuple) and result and isinstance(result[0], int):
+        mid = result[1] if len(result) > 1 and isinstance(result[1], int) else None
+        return int(result[0]), mid
+    return None, None
+
+
+def _suback_refused(reason_codes) -> bool:
+    """Issue #53: whether a SUBACK refuses its subscription (a reason
+    code >= 0x80; paho 2 reports MQTT 3.1.1 granted QoS as ReasonCode)."""
+    for code in reason_codes:
+        failure = getattr(code, "is_failure", None)
+        if isinstance(failure, bool):
+            if failure:
+                return True
+        elif int(code) >= 0x80:
+            return True
+    return False
+
+
 # Issue #17: CONNACK refusals that connecting again with the same
 # configuration cannot fix. MQTT 3.1.1 return codes 1 / 2 / 4 / 5 and
 # the MQTT 5 reason codes paho 2 reports for them (132 / 133 / 134 / 135),
@@ -167,6 +226,18 @@ class MqttBroker(MessageBroker):
     With `wait=False` a refused or dropped FIRST connection is not
     retried (nobody awaits it and stop() refuses STARTING).
 
+    Outbound limit (issue #35): paho queues QoS 0 messages without any
+    limit, so over a slow or stalled link publishing grew memory without
+    bound. A publish is now pending from the paho call until paho
+    reports it sent (on_publish: QoS 0 written to the socket, QoS 1
+    acknowledged). Each counts its payload and topic plus about 2 KiB
+    of paho bookkeeping (_PENDING_MESSAGE_OVERHEAD); one that would take
+    the pending bytes past `max_pending_bytes` (default 64 MiB) raises
+    MqttBackpressureError.
+    A connection loss forgets unsent QoS 0 messages, as paho drops
+    them; QoS >= 1 ones stay pending until paho resends them.
+    `recovery_metrics()` reports pending_publish_count / _bytes.
+
     Each TCP connect attempt is bounded by `connect_timeout` (default
     2 s, paho's own default is 5 s) so that a reconnect blocked by a
     network partition fits inside the 5 s stop budgets. Not bounded by
@@ -181,6 +252,7 @@ class MqttBroker(MessageBroker):
     # UTF-8 string.
     _DEFAULT_CLIENT_ID = "{name}-{agent_id:.12}"
     _MAX_CLIENT_ID_BYTES = 65535
+    _DEFAULT_MAX_PENDING_BYTES = 64 * 1024 * 1024
 
     def __init__(self, notifier: BrokerNotifier, *, wait: bool = True, timeout: float = 10.0):
         """建立 MQTT Broker 包裝類別
@@ -230,6 +302,21 @@ class MqttBroker(MessageBroker):
         # topic -> (data_type, qos); issue #4 added the QoS so that the
         # resubscribe after a reconnect keeps it.
         self._registry: Dict[str, Tuple[Any, int]] = {}
+        # Issue #53: registry topics known not to be in effect at the
+        # broker (refused by SUBACK, or their SUBSCRIBE could not be
+        # sent); the next CONNACK retries them. _suback_topics maps the
+        # mid of each SUBSCRIBE awaiting its SUBACK to its topic.
+        # _early_subacks holds SUBACKs (mid -> refused) that arrived
+        # before _client_subscribe recorded their mid; it is kept only
+        # while a subscribe is in progress (_subscribing).
+        self._failed_topics: Set[str] = set()
+        self._suback_topics: Dict[int, str] = {}
+        self._early_subacks: Dict[int, bool] = {}
+        self._subscribing = 0
+        # Counts connection losses: a mid is matched to its SUBACK on
+        # the connection its SUBSCRIBE went out on only, because paho
+        # reuses mids (review of #53).
+        self._subscribe_epoch = 0
         self._connected: bool = False
         self._ever_connected: bool = False
         self._stopping: bool = False
@@ -238,6 +325,25 @@ class MqttBroker(MessageBroker):
         self._resubscribe_success_count: int = 0
         self._resubscribe_error_count: int = 0
         self._recovery_run_count: int = 0
+
+        # Issue #35: publishes paho has not reported sent, by mid, as
+        # (cost, QoS) in publish order: paho reuses a mid after 65535,
+        # possibly while an older publish with it is still pending.
+        # _pending_bytes also counts publishes in progress (reserved
+        # before the paho call). _reported holds
+        # mids whose on_publish came before publish() recorded them;
+        # it is kept only while a publish() is in progress. _link_epoch
+        # counts connection losses. All guarded by _pending_lock, which
+        # is never held across a paho call: paho runs on_publish while
+        # holding its own message lock.
+        self._pending_lock = threading.Lock()
+        self._pending: Dict[int, Deque[Tuple[int, int]]] = {}
+        self._pending_count = 0
+        self._pending_bytes = 0
+        self._publishing = 0
+        self._reported: Set[int] = set()
+        self._link_epoch = 0
+        self._max_pending_bytes = self._DEFAULT_MAX_PENDING_BYTES
 
         # RFC-010 state machine + helper-thread coordination.
         self._state: WorkerState = WorkerState.NEW
@@ -328,7 +434,6 @@ class MqttBroker(MessageBroker):
                     self._connect_ok = True
                     self._connack_ok = True
                     self._connect_err = None
-                    is_first = not self._ever_connected
                     self._ever_connected = True
                     self._connected = True
                     # NEW / STARTING → RUNNING; other states leave
@@ -337,8 +442,12 @@ class MqttBroker(MessageBroker):
                     # was before). RUNNING → RUNNING is a no-op.
                     if self._state in (WorkerState.NEW, WorkerState.STARTING):
                         self._state = WorkerState.RUNNING
-                    if not is_first:
-                        snapshot = dict(self._registry)
+                    # Every CONNACK, the first included (issue #54):
+                    # subscribe() only records a topic while not
+                    # connected. Taken with _connected under this lock,
+                    # so each topic is either sent by subscribe() or
+                    # replayed here.
+                    snapshot = dict(self._registry)
             if skip:
                 logger.info(
                     "on_connect(rc=0) after stop; fencing "
@@ -413,19 +522,44 @@ class MqttBroker(MessageBroker):
                 continue
             qos = entry[1]
             try:
-                self._client_subscribe(topic, qos)
-                successes += 1
+                result = self._client_subscribe(topic, qos)
             except Exception as ex:
                 failures += 1
                 logger.exception(
                     f"recovery: resubscribe failed for topic {topic!r}: {ex}"
                 )
+            else:
+                # Issue #53: paho's rc, not just the absence of an
+                # exception (_client_subscribe logged a failed one).
+                rc, _ = _subscribe_result(result)
+                if rc is None or rc == MQTT_ERR_SUCCESS:
+                    successes += 1
+                else:
+                    failures += 1
+            self._withdraw_if_unsubscribed(topic)
         with self._state_lock:
             self._resubscribe_success_count += successes
             self._resubscribe_error_count += failures
         logger.info(
             f"recovery complete: {successes} succeeded, {failures} failed"
         )
+
+
+    def _withdraw_if_unsubscribed(self, topic: str) -> None:
+        """RFC-005 §7.10 (issue #54 review): an unsubscribe() between
+        the recovery loop's registry check and its client.subscribe has
+        already sent its UNSUBSCRIBE, so the SUBSCRIBE would win. Send
+        another UNSUBSCRIBE after it: paho sends packets in call order."""
+        with self._state_lock:
+            withdrawn = (topic not in self._registry and self._connected
+                         and not self._stopping)
+        if withdrawn:
+            try:
+                self._client.unsubscribe(topic)
+            except Exception as ex:
+                logger.exception(
+                    f"recovery: unsubscribe of withdrawn topic {topic!r} failed: {ex}"
+                )
 
 
     def _on_disconnect(self, client, userdata, _flags, reasonCode, _properties):
@@ -435,6 +569,19 @@ class MqttBroker(MessageBroker):
         # SHOULD still update diagnostics (planned classification)
         # and clear `_connected` so any later observer sees the truth.
         # It does NOT clear `_stopping` and does NOT trigger recovery.
+        # Issue #35: paho drops the QoS 0 messages it has not written
+        # (without on_publish) and resends QoS >= 1 ones after the
+        # reconnect.
+        with self._pending_lock:
+            self._link_epoch += 1
+            for mid, entries in list(self._pending.items()):
+                kept = deque(entry for entry in entries if entry[1] > 0)
+                self._pending_count -= len(entries) - len(kept)
+                self._pending_bytes -= sum(size for size, qos in entries if qos == 0)
+                if kept:
+                    self._pending[mid] = kept
+                else:
+                    del self._pending[mid]
         planned = False
         with self._state_lock:
             stopping = self._stopping
@@ -445,6 +592,10 @@ class MqttBroker(MessageBroker):
             )
             self._last_disconnect_was_planned = planned
             self._connected = False
+            # Issue #53: paho does not resend a SUBSCRIBE; the next
+            # CONNACK replays the registry instead.
+            self._suback_topics.clear()
+            self._subscribe_epoch += 1
         self._connect_ok = False
         self._connected_evt.clear()
         if planned:
@@ -533,6 +684,7 @@ class MqttBroker(MessageBroker):
         # Issue #17: parsed before any state change, so that a malformed
         # option raises ValueError and leaves the broker NEW.
         client_id, clean_session = self._session_options(options)
+        max_pending_bytes = self._max_pending_bytes_option(options)
 
         # -- Phase 0: linearization under _state_lock.
         # RFC-011 modification 5: check state BEFORE modifying flags.
@@ -558,6 +710,7 @@ class MqttBroker(MessageBroker):
                     protocol=MQTTv311, reconnect_on_failure=True,
                 )
                 self.client_id = client_id
+                self._max_pending_bytes = max_pending_bytes
                 self._connected_evt.clear()
                 self._connack_evt.clear()
                 self._connack_ok = False
@@ -622,6 +775,8 @@ class MqttBroker(MessageBroker):
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
+        self._client.on_publish = self._on_publish
+        self._client.on_subscribe = self._on_subscribe
         self.host = options.get("host", "localhost")
         self.port = int(options.get("port", 1883))
         self.keepalive = int(options.get("keepalive", 60))
@@ -803,6 +958,17 @@ class MqttBroker(MessageBroker):
         if isinstance(clean_session, str):
             clean_session = clean_session.strip().lower() not in ("false", "0", "no", "off")
         return client_id, bool(clean_session)
+
+    @classmethod
+    def _max_pending_bytes_option(cls, options: dict) -> int:
+        """Issue #35: the outbound limit, from the `max_pending_bytes`
+        option. Raises TypeError / ValueError on a malformed value."""
+        value = options.get("max_pending_bytes", cls._DEFAULT_MAX_PENDING_BYTES)
+        if type(value) is not int:
+            raise TypeError(f"MQTT option 'max_pending_bytes' must be a positive int, got {value!r}")
+        if value <= 0:
+            raise ValueError(f"MQTT option 'max_pending_bytes' must be a positive int, got {value!r}")
+        return value
 
     @classmethod
     def _reconnect_delays(cls, options: dict):
@@ -1346,6 +1512,9 @@ class MqttBroker(MessageBroker):
         Raises MqttPublishError when:
           - the pre-call state gate rejects (state != RUNNING, or
             _stopping=True, or _connected=False);
+          - (issue #35) the publish would take the pending bytes past
+            max_pending_bytes: MqttBackpressureError, before paho is
+            called;
           - paho returned an unsupported result shape;
           - paho's immediate result rc != MQTT_ERR_SUCCESS.
 
@@ -1401,19 +1570,44 @@ class MqttBroker(MessageBroker):
                 state=state,
             )
 
+        # -- Issue #35: reserve the payload's bytes against the
+        # outbound limit.
+        size = _publish_cost(topic, payload)
+        with self._pending_lock:
+            pending_bytes = self._pending_bytes
+            fits = pending_bytes + size <= self._max_pending_bytes
+            if fits:
+                self._pending_bytes += size
+                self._publishing += 1
+                epoch = self._link_epoch
+        if not fits:
+            raise MqttBackpressureError(
+                topic=topic,
+                reason=MqttPublishReason.BACKPRESSURE,
+                state=state,
+                detail=(f"{pending_bytes} bytes pending + {size} > "
+                        f"max_pending_bytes={self._max_pending_bytes}"),
+            )
+
         # -- paho call OUTSIDE the state lock.
         # A raise from paho itself propagates unchanged (RFC-002
         # convention preserved for Exception paths).
-        if qos or retain:
-            result = self._client.publish(topic=topic, payload=payload,
-                                          qos=qos, retain=bool(retain))
-        else:
-            result = self._client.publish(topic=topic, payload=payload)
+        queued = False
+        mid: Optional[int] = None
+        try:
+            if qos or retain:
+                result = self._client.publish(topic=topic, payload=payload,
+                                              qos=qos, retain=bool(retain))
+            else:
+                result = self._client.publish(topic=topic, payload=payload)
 
-        # -- Result normalisation + rc validation (authoritative
-        # layer; catches races where stop() started after our
-        # snapshot).
-        rc, mid = self._normalise_publish_result(topic, result)
+            # -- Result normalisation + rc validation (authoritative
+            # layer; catches races where stop() started after our
+            # snapshot).
+            rc, mid = self._normalise_publish_result(topic, result)
+            queued = rc == MQTT_ERR_SUCCESS or (rc == MQTT_ERR_NO_CONN and qos > 0)
+        finally:
+            self._settle_publish(mid if queued else None, size, qos, epoch)
         if rc == MQTT_ERR_NO_CONN and qos > 0:
             # Issue #4: paho closes the socket before it reports the
             # disconnect, so the gate above can pass with no socket.
@@ -1431,6 +1625,39 @@ class MqttBroker(MessageBroker):
             )
         return result
 
+
+    def _settle_publish(self, mid: Optional[int], size: int, qos: int, epoch: int) -> None:
+        """Issue #35: after the paho call, record publish `mid` as
+        pending, or release its reservation when paho did not queue it
+        (mid None), has already reported it sent, or (QoS 0) dropped it
+        in a connection loss since the reservation."""
+        with self._pending_lock:
+            self._publishing -= 1
+            if (mid is None or mid in self._reported
+                    or (qos == 0 and epoch != self._link_epoch)):
+                self._pending_bytes -= size
+            else:
+                self._pending.setdefault(mid, deque()).append((size, qos))
+                self._pending_count += 1
+            self._reported.discard(mid)
+            if not self._publishing:
+                self._reported.clear()
+
+    def _on_publish(self, client, userdata, mid, reason_code, properties):
+        """Issue #35: paho has written a QoS 0 message to the socket, or
+        received the acknowledgement of a QoS >= 1 one."""
+        with self._pending_lock:
+            entries = self._pending.get(mid)
+            if entries:
+                # The oldest with this mid: paho writes QoS 0 packets in
+                # order, and a reused mid's older publish was queued first.
+                size, _ = entries.popleft()
+                if not entries:
+                    del self._pending[mid]
+                self._pending_count -= 1
+                self._pending_bytes -= size
+            elif self._publishing:
+                self._reported.add(mid)     # publish() has not recorded it yet
 
     def _normalise_publish_result(self, topic: str, result):
         """RFC-012 §C: parse the paho publish() return into (rc, mid).
@@ -1509,9 +1736,11 @@ class MqttBroker(MessageBroker):
 
     def subscribe(self, topic: str, data_type, *, qos: int = 0):
         # RFC-005 §7.3: desired-state first; only forward when currently
-        # connected. Disconnected-time subscribes rely on the next
+        # connected. Disconnected-time subscribes, including those made
+        # before the first CONNACK (issue #54), rely on the next
         # _on_connect to run recovery from the registry.
         check_qos(qos)      # issue #4
+        check_filter(topic)     # issue #53: before the registry
         with self._state_lock:
             if self._stopping:
                 logger.info(f"subscribe after stop; dropping topic {topic!r}")
@@ -1523,10 +1752,100 @@ class MqttBroker(MessageBroker):
         return None
 
     def _client_subscribe(self, topic: str, qos: int):
-        # Issue #4: QoS 0 keeps the pre-#4 paho call shape.
-        if qos:
-            return self._client.subscribe(topic=topic, qos=qos)
-        return self._client.subscribe(topic=topic)
+        """Send one SUBSCRIBE and return paho's result. Issue #53: a
+        topic whose SUBSCRIBE paho raised on or did not send (rc not
+        success) is counted in failed_subscriptions until a SUBACK
+        grants it; one that was sent awaits its SUBACK (_on_subscribe)."""
+        with self._state_lock:
+            self._subscribing += 1
+            epoch = self._subscribe_epoch
+        rc: Optional[int] = None
+        mid: Optional[int] = None
+        sent = False
+        try:
+            # Issue #4: QoS 0 keeps the pre-#4 paho call shape.
+            if qos:
+                result = self._client.subscribe(topic=topic, qos=qos)
+            else:
+                result = self._client.subscribe(topic=topic)
+            rc, mid = _subscribe_result(result)
+            sent = rc is None or rc == MQTT_ERR_SUCCESS
+            return result
+        finally:
+            early_refusal = self._settle_subscribe(topic, mid if sent else None, sent, epoch)
+            if rc is not None and not sent:
+                logger.warning(
+                    f"SUBSCRIBE to {topic!r} was not sent (paho rc={rc}); "
+                    f"the next CONNACK retries it."
+                )
+            if early_refusal:
+                self._log_refused_subscription(topic, mid)
+
+    def _settle_subscribe(self, topic: str, mid: Optional[int], sent: bool,
+                          epoch: int) -> bool:
+        """Issue #53: record the outcome of a SUBSCRIBE. A failed topic
+        counts as active again only once a SUBACK grants it, or at once
+        when there is no mid to await one for. Returns True if its
+        SUBACK, which arrived before this, refused a topic still wanted."""
+        with self._state_lock:
+            self._subscribing -= 1
+            refused = granted = False
+            if not sent:
+                refused = True
+            elif mid is None:
+                granted = True
+            elif epoch != self._subscribe_epoch:
+                # The connection it went out on is gone; the CONNACK
+                # replay sends it again. Its mid may already be reused.
+                self._early_subacks.pop(mid, None)
+            else:
+                early = self._early_subacks.pop(mid, None)
+                if early is None:
+                    self._suback_topics[mid] = topic
+                elif early:
+                    refused = True
+                else:
+                    granted = True
+            wanted = topic in self._registry and not self._stopping
+            if refused and wanted:
+                self._failed_topics.add(topic)
+            elif granted:
+                self._failed_topics.discard(topic)
+            if not self._subscribing:
+                self._early_subacks.clear()
+        return sent and refused and wanted
+
+    def _on_subscribe(self, client, userdata, mid, reason_code_list, properties):
+        """Issue #53: the broker's SUBACK. A reason code >= 0x80 means it
+        refused the subscription (an ACL, a resource limit). Never raises:
+        paho would let the exception end its network thread."""
+        try:
+            refused = _suback_refused(reason_code_list)
+            with self._state_lock:
+                topic = self._suback_topics.pop(mid, None)
+                if topic is None:
+                    if self._subscribing:
+                        # _client_subscribe has not recorded the mid yet.
+                        self._early_subacks[mid] = refused
+                    return
+                wanted = topic in self._registry and not self._stopping
+                if refused and wanted:
+                    self._failed_topics.add(topic)
+                elif not refused:
+                    self._failed_topics.discard(topic)
+            if refused and wanted:
+                self._log_refused_subscription(topic, mid)
+            elif refused:
+                logger.debug(f"SUBACK refused {topic!r}, which is no longer wanted.")
+        except Exception as ex:
+            logger.exception(f"on_subscribe failed for mid {mid!r}: {ex!r}")
+
+    @staticmethod
+    def _log_refused_subscription(topic: str, mid: Optional[int]) -> None:
+        logger.warning(
+            f"The broker refused the subscription to {topic!r} (SUBACK for mid {mid}); "
+            f"it stays registered and the next CONNACK retries it."
+        )
 
     def unsubscribe(self, topic: str):
         # RFC-005 §7.4: symmetric with subscribe.
@@ -1535,6 +1854,7 @@ class MqttBroker(MessageBroker):
                 logger.info(f"unsubscribe after stop; dropping topic {topic!r}")
                 return None
             self._registry.pop(topic, None)
+            self._failed_topics.discard(topic)      # issue #53
             connected = self._connected
         if connected:
             return self._client.unsubscribe(topic)
@@ -1549,13 +1869,23 @@ class MqttBroker(MessageBroker):
     def recovery_metrics(self) -> Dict[str, Any]:
         """Coherent snapshot of subscription + recovery state, taken
         under a single _state_lock acquisition."""
+        with self._pending_lock:
+            pending = {
+                # Issue #35: publishes paho has not reported sent.
+                "pending_publish_count": self._pending_count,
+                "pending_publish_bytes": self._pending_bytes,
+            }
         with self._state_lock:
+            # Issue #53: registry topics known not to be in effect.
+            failed = len(self._failed_topics & self._registry.keys())
             return {
                 "resubscribe_success_count": self._resubscribe_success_count,
                 "resubscribe_error_count": self._resubscribe_error_count,
                 "recovery_run_count": self._recovery_run_count,
-                "active_subscriptions": len(self._registry),
+                "active_subscriptions": len(self._registry) - failed,
+                "failed_subscriptions": failed,
                 "connected": self._connected,
                 "stopping": self._stopping,
                 "ever_connected": self._ever_connected,
+                **pending,
             }

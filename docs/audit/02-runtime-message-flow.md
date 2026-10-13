@@ -76,7 +76,7 @@ def subscribe(self, topic, data_type:str="str", topic_handler=None):
 
 Observed:
 - Duplicate subscribe on the same **NORMAL-owned** topic still warns and overwrites the handler; no rejection (RFC-006 §7.11 / RFC-007 §7.5 — legitimate rebind).
-- `data_type` is a string ("str" by default) and is passed through to `MessageBroker.subscribe`. `MqttBroker.subscribe` ignores it (records it in the RFC-005 registry only). Only `RosNoeticBroker` would use it — but that broker is unregistered.
+- `data_type` is a string ("str" by default) and is passed through to `MessageBroker.subscribe`. `MqttBroker.subscribe` ignores it (records it in the RFC-005 registry only). Only `RosNoeticBroker` would use it — but that broker is unregistered. *Since issue #42 (2026-10-13) it lives in `contrib/brokers/`, outside the package.*
 - ~~`__topic_handlers` is a plain dict with no synchronization~~ — **Post-RFC-007 (2026-07-27)**: `__topic_handlers` values are now `_HandlerRecord(owner_type, handler)` where `owner_type ∈ {NORMAL, PUBLISH_SYNC}`. All mutations and reads happen under `_handlers_lock` (a `threading.RLock` introduced by RFC-006 and generalised by RFC-007). Direct `Agent.subscribe` / `Agent.unsubscribe` on a `PUBLISH_SYNC`-owned topic raise `TopicWaitCollisionError`; `publish_sync` on a `NORMAL`-registered topic also raises. `_on_message` reads `__topic_handlers` under `_handlers_lock` in a single snapshot, closing the pre-RFC-007 TOCTOU. Broker I/O (`broker.subscribe`, `broker.unsubscribe`, `dispatcher.enqueue`, handler invocation) always happens **outside** the lock. See [`docs/audit/05-risk-register.md` R-14](05-risk-register.md#r-14--shared-dictionaries-without-locks) for the full contract, collision table, and lock-hygiene tests. `_children` / `_parents` remain unlocked (R-14 residual, deferred to a future RFC). `Agent.subscribe` / `Agent.unsubscribe` public signatures are unchanged.
 - **Broker-side subscription recovery (post-RFC-005, 2026-07-27)**: `MqttBroker.subscribe` now maintains a thread-safe `_registry: dict[topic, data_type]`. When connected, the call forwards to `client.subscribe` as before; when disconnected, only the registry is updated. On the next successful `_on_connect`, the broker snapshots the registry and re-emits `client.subscribe(topic=topic)` for each entry (per-topic try/except; recheck `_stopping` and live-registry membership between iterations). `MqttBroker.unsubscribe` mirrors this: it deletes the registry entry so recovery does not resurrect it. `stop()` sets `_stopping=True` before `client.disconnect()`, so any late `_on_connect` callback observes the flag and skips both recovery and notifier delegation. See [`docs/audit/05-risk-register.md` R-03](05-risk-register.md#r-03--mqtt-reconnect-and-subscription-recovery-are-not-implemented) for the full contract and race analysis; `Agent.subscribe` / `Agent.unsubscribe` public signatures are unchanged.
 
@@ -126,7 +126,7 @@ def _on_message(self, topic:str, data):
 
 Observed:
 - ~~One new `threading.Thread` per received message, no daemon flag, no pool, no upper bound~~ — **RESOLVED 2026-07-26 (RFC-004)**. `_on_message` now enqueues `handle_message` onto a bounded `MessageDispatcher` (`src/agentflow/core/dispatcher.py`) drained by a fixed pool of **daemon** consumer threads (default `workers=8`, `queue_capacity=1024`, overflow policy `drop_newest`). `enqueue()` is linearized under `_state_lock`; the paho callback thread never sees `queue.Full` (RFC-004 §7.3 broker-callback safety invariant). See [`docs/audit/05-risk-register.md` R-04](05-risk-register.md#r-04--per-message-unbounded-thread-creation) for the full contract, race fixes (enqueue check-then-put linearization + concurrent-stop `_stop_complete_event`), and runtime evidence.
-- `Parcel.from_payload` raises `TypeError` on unknown HEAD (`parcel.py:89`); the raise happens on the broker's paho loop thread, then it is caught by `MqttBroker._on_message`.
+- `Parcel.from_payload` raises `TypeError` on unknown HEAD (`parcel.py:89`); the raise happens on the broker's paho loop thread, then it is caught by `MqttBroker._on_message`. *Since issues #15 / #34 (2026-10-12): decoding happens on a dispatcher thread (only a request of at most 64 KiB that the queue drops is decoded on the receiving thread, to answer it "overloaded"), after a payload size check (`codec.max_payload_bytes`) and a byte budget (`dispatch.max_queued_bytes`) on the receiving thread. Decode failures raise `ParcelDecodeError` and are counted in `Agent.decode_failure_count`, without a traceback.*
 - **BinaryParcel triggers `pickle.loads` on wire bytes** (`parcel.py:146`) → Risk R-01.
 - Auto-reply eligibility (**post-RFC-003, 2026-07-26**): an auto-reply is emitted only when both (a) the incoming `pcl.topic_return` is truthy AND (b) the dispatched handler was a **specifically registered** entry in `__topic_handlers` (not the fall-through to `on_message`). See [RFC-003](../rfc/RFC-003-auto-reply-contract.md) and R-05 in the risk register. The pre-RFC-003 behaviour where a fall-through `on_message` also generated an implicit reply is no longer the case.
 
@@ -191,6 +191,8 @@ Observations:
 
 ## 2.7 Sync request/response — `publish_sync`
 
+> **Update (2026-10-13, issue #68)**: `publish_sync(..., raise_on_error=True)` raises `RemoteError` for a reply carrying a non-empty error; by default the reply Parcel is returned as before.
+
 > **Update (2026-07-26)**: sections 2.7's "Explicit lifecycle gaps" #1 and #2 were **Resolved by [RFC-001](../rfc/RFC-001-publish-sync-subscription-lifecycle.md)** — see [`docs/audit/05-risk-register.md` R-02](05-risk-register.md#r-02--publish_sync-leaks-handler-entries-and-broker-subscriptions). Gaps #3 and #4 remain open. The sequence diagram and narrative below have been updated to reflect the resolved cleanup path.
 
 `Agent.publish_sync` (`src/agentflow/core/agent.py:321–353`):
@@ -205,7 +207,7 @@ sequenceDiagram
     participant HR as Response handler
     Note over AS: publish_sync(topic, data, topic_wait=None, timeout=30)
     AS->>AS: generate return_topic = tag-<10 alnum>/topic
-    AS->>AS: create DataEvent(worker.create_event())
+    AS->>AS: create DataEvent() (a threading.Event; worker.create_event() before #21)
     AS->>AS: subscribe(return_topic, handle_response)<br/>__topic_handlers[return_topic] = handler
     rect rgba(220, 245, 220, 0.5)
       Note over AS: try:
@@ -239,7 +241,7 @@ For every `publish_sync` call, regardless of exit path (success, `TimeoutError`,
 
 - `return_topic not in agent._Agent__topic_handlers`
 - `broker.unsubscribe_calls` grew by exactly one entry equal to `return_topic`
-- Any late or duplicate response arriving after cleanup is routed to the default `Agent.on_message` (no-op) via fall-through, not to the completed `handle_response`.
+- Any late or duplicate response arriving after cleanup is routed to the default `Agent.on_message` (no-op) via fall-through, not to the completed `handle_response`. *Since issue #21 (2026-10-13): only on a caller's own `topic_wait`, or on a topic the caller has since subscribed; one on a reply topic `publish_sync` generated is dropped and counted in `Agent.late_reply_count` (RFC-014 §2.2).*
 
 The one exception is the **identity-guard bypass**: if a foreign handler races onto the same topic between `subscribe` and `finally`, the guard skips both the pop and the unsubscribe. In that case the foreign handler is preserved and the (already lost) subscription is not torn down. Verified by `test_identity_guard_preserves_foreign_handler_on_same_topic`.
 
@@ -257,7 +259,7 @@ Post-RFC-003 dispatch (`agent.py:_on_message`, `@final`, public signature unchan
 
 - **R-fallback-silent**: auto-reply is emitted only when `topic in self.__topic_handlers` (i.e. a specifically registered handler) AND `pcl.topic_return` is truthy. A subscribed-but-unhandled topic no longer generates implicit replies.
 - **R-strip-topic_return**: if `data_resp` is a `Parcel` whose `topic_return` is truthy, the framework reconstructs a fresh parcel of the same subclass (`type(data_resp)(data_resp.content)`), copies `.error`, and uses it as the reply. The handler's original returned object is not mutated.
-- **R-exception-fresh**: on handler exception the reply is a brand-new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming `p` is not mutated; handlers holding a reference to `p` observe its original `content`, `error`, and `topic_return`.
+- **R-exception-fresh**: on handler exception the reply is a brand-new `Parcel.from_content(None)` with `.error = str(ex)`. The incoming `p` is not mutated; handlers holding a reference to `p` observe its original `content`, `error`, and `topic_return`. *Since issue #68 (2026-10-13): `.error` names the exception type only, unless `errors.expose_details`; the message stays in the responder's log (RFC-003 §3).*
 
 `publish_sync` is unaffected: `handle_response` returns `None`, so `Parcel.from_content(None)` produces a reply with `topic_return=None` and R-strip-topic_return is a no-op for the request-response path. `publish_sync`'s specific handler on `return_topic` also prevents R-fallback-silent from ever applying during its lifetime. Verified by `test_publish_sync_happy_path_still_works_under_RFC_003` and `test_publish_sync_late_reply_after_cleanup_is_silently_dropped`.
 
@@ -302,9 +304,9 @@ A transparent parent-side publish/subscribe proxy is explicitly out of RFC-008 s
 
 `Agent.__getstate__` / `__setstate__` (`src/agentflow/core/agent.py`) implement the pickle protocol:
 
-- **Runtime-only fields excluded** from `__getstate__`: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`.
+- **Runtime-only fields excluded** from `__getstate__`: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`. *Since issue #75 (2026-10-13) `_message_broker` no longer exists, and later issues added more fields; `Agent._RUNTIME_ONLY_FIELDS` is the current list.*
 - **Picklability probe** in `__getstate__`: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests registering the handler / binding the callback inside `on_activate()` (which runs in the child, avoiding the pickle boundary).
-- `__setstate__` reinstates every runtime-only field fresh in the child: new `threading.RLock` × 2, `None` for the broker / dispatcher / worker back-references, empty `{}` for `_children` / `_parents`.
+- `__setstate__` reinstates every runtime-only field fresh in the child: new `threading.RLock` × 2, `None` for the broker / dispatcher / worker back-references, empty `{}` for `_children` / `_parents`. *Since issue #75, `_dispatcher_init_lock` is rebuilt as a `Lock`, as `__init__` creates it.*
 - The RFC-006 / RFC-007 `_HandlerRecord(owner_type, handler)` shape survives pickle intact; only the guarding `_handlers_lock` is rebuilt.
 
 ### ProcessWorker state machine

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agentflow.broker.empty_broker import EmptyBroker
+from agentflow.broker.placeholder_broker import BrokerNotAvailableError
 from agentflow.broker.redis_broker import RedisBroker
 from agentflow.broker.ros_broker import RosBroker
 from agentflow.core.agent import Agent
@@ -68,6 +69,14 @@ def test_backend_publish_logs_only_metadata(
 ) -> None:
     caplog.set_level(logging.DEBUG)
     broker = broker_type(MagicMock())
+    if broker_type in (RedisBroker, RosBroker):
+        with pytest.raises(BrokerNotAvailableError) as raised:
+            broker.publish("orders", payload)
+        assert "PAYLOAD-PLANTED" not in str(raised.value)
+        assert "PAYLOAD-PLANTED" not in caplog.text
+        assert not caplog.records
+        return
+
     broker.publish("orders", payload)
     assert "PAYLOAD-PLANTED" not in caplog.text
     records = [record for record in caplog.records if "orders" in record.getMessage()]
