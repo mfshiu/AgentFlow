@@ -28,9 +28,6 @@ import pytest
 import agentflow
 from agentflow.core.agent import Agent
 
-xfail_70 = pytest.mark.xfail(strict=True, reason='issue #70: deprecated aliases')
-
-
 def _config():
     return {
         'CONCURRENCY_TYPE': 'thread',
@@ -83,7 +80,6 @@ class _Current(Agent):
         self.activated.set()
 
 
-@xfail_70
 def test_get_logger_warns_and_returns_the_framework_logger():
     with pytest.warns(DeprecationWarning, match='get_logger'):
         log = agentflow.get_logger()
@@ -91,7 +87,6 @@ def test_get_logger_warns_and_returns_the_framework_logger():
     assert log is logging.getLogger(os.getenv('LOGGER_NAME'))
 
 
-@xfail_70
 def test_ensure_size_warns_and_truncates_as_before():
     with pytest.warns(DeprecationWarning, match='ensure_size'):
         assert agentflow.ensure_size('x' * 400) == 'x' * 298 + '..'
@@ -105,7 +100,6 @@ def test_ensure_size_warns_and_truncates_as_before():
         assert agentflow.ensure_size('') == ''
 
 
-@xfail_70
 def test_an_overridden_on_begining_runs_once_between_on_activating_and_on_activate(caplog):
     caplog.set_level(logging.WARNING)
 

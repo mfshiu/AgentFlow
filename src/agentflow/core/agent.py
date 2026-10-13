@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, final, Optional
 import uuid
+import weakref
 
 from agentflow.core import holon_auth
 from agentflow.core.parcel import Parcel, ensure_size, parse_pickle_globals
@@ -76,6 +77,10 @@ _RETIRED_REPLY_TOPICS = 1024
 # Issue #21: publish_sync(timeout=None) is also logged, once per process,
 # since Python hides its DeprecationWarning outside __main__.
 _TIMEOUT_NONE_LOGGED = False
+# Issue #70: classes whose deprecated on_begining() override has been
+# reported in this process.
+_LEGACY_HOOK_WARNED: 'weakref.WeakSet[type]' = weakref.WeakSet()
+_LEGACY_HOOK_LOCK = threading.Lock()
 # Follow-up of #17: at most this many messages with no handler are held
 # while the lifecycle hooks are still registering handlers.
 _EARLY_MESSAGE_LIMIT = 4096
@@ -1032,6 +1037,38 @@ class Agent(BrokerNotifier):
 
     def on_activating(self):
         pass
+
+
+    def on_begining(self):
+        """Deprecated name of on_activating (issue #70). A subclass
+        written for 2025.5.24 that overrides it still has it called,
+        right after on_activating, with a warning."""
+        pass
+
+
+    def __call_legacy_on_begining(self):
+        # Issue #70: 2025.5.24 called on_begining() here. It became
+        # on_activating() without a warning, so overrides silently
+        # stopped running.
+        cls = type(self)
+        if cls.on_begining is Agent.on_begining:
+            return
+        with _LEGACY_HOOK_LOCK:
+            first = cls not in _LEGACY_HOOK_WARNED
+            _LEGACY_HOOK_WARNED.add(cls)
+        if first:
+            message = (f"{cls.__qualname__}.on_begining() is deprecated; "
+                       f"rename it to on_activating()")
+            code = getattr(cls.on_begining, '__code__', None)
+            if code is not None:
+                # Point at the override, so the default filters show it
+                # when the class is defined in __main__.
+                warnings.warn_explicit(message, DeprecationWarning, code.co_filename,
+                                       code.co_firstlineno, module=cls.__module__)
+            else:
+                warnings.warn(message, DeprecationWarning, stacklevel=2)
+            logger.warning(self.M(message))
+        self.on_begining()
     
     
     def on_activate(self, config=None):
@@ -1073,6 +1110,7 @@ class Agent(BrokerNotifier):
         self.__connected_event = threading.Event()
 
         self.on_activating()
+        self.__call_legacy_on_begining()
 
         # Create broker with retry
         broker_config_all = self.get_config("broker", {'broker_type': BrokerType.Empty})
