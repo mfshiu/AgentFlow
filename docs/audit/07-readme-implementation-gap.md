@@ -27,7 +27,7 @@ Each row cites the README line and the code location that supports or contradict
 | "Dynamic Service Election — real-time load and responsiveness" | 15–16 | No load metric collection, propagation, comparison, election protocol, timeout, or tiebreak in the code. |
 | "Many-to-Many Coordination Model" | 18–19 | Only emergent behaviour from topic naming collisions (agents with the same name share topics — see R-09). Not an explicit coordination mechanism. |
 | "Resilience and Fault Tolerance — agent-level fault containment and task reassignment" | 21–22 | No task model, no reassignment path, no unregister / heartbeat (R-18). Broker disconnect is not recovered (R-03). |
-| "Modular Architecture — Holonic agents; MQTT/DDS communication" | 24–25 | Parent-child (holonic-like) relationships exist via `_children`/`_parents`. MQTT works. **DDS does not** (`dds_broker.py` is incomplete and not registered in the factory — R-22). |
+| "Modular Architecture — Holonic agents; MQTT/DDS communication" | 24–25 | Parent-child (holonic-like) relationships exist via `_children`/`_parents`. MQTT works. **DDS does not** (`dds_broker.py` is incomplete and not registered in the factory — R-22). *Since issue #42 (2026-10-13) the README says MQTT is the only transport and DDS / ROS are planned; the drafts are in `contrib/brokers/`.* |
 
 ---
 
@@ -67,7 +67,7 @@ flowchart TB
 
 - **Orchestration Layer**: nothing in the code corresponds to this. There is no orchestrator, load balancer, or scheduling component.
 - **Agent Layer**: exists as `Agent` (`agent.py:26`), but there is no separation of Perception / Decision / Action. `Agent` is a single God-Object class (Section 1.3 of `01-current-architecture.md`).
-- **Communication Layer**: only MQTT is functional. DDS/ROS/Redis are stubs or broken (R-22).
+- **Communication Layer**: only MQTT is functional. DDS/ROS/Redis are stubs or broken (R-22). *Since issue #42, selecting Redis or ROS stops the agent with an error instead of dropping messages.*
 
 ---
 

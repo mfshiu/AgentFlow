@@ -1429,6 +1429,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-22 — Stub / broken broker implementations reachable via `BrokerType`
 
+- **Status**: **RESOLVED** (2026-10-13) — GitHub issue #42. `RedisBroker` and `RosBroker` now derive from `PlaceholderBroker`, whose `start` / `publish` / `subscribe` raise `NotImplementedError`; `Agent.__activating` logs "Broker not available" as an error, does not retry, skips `on_activate` and the agent stops. `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/` (outside the wheel), and CI imports every module of the installed wheel. Covered by `tests/unit/test_placeholder_brokers.py`. A real DDS / ROS backend waits for the transport interface of issue #69.
 - **Severity**: Low
 - **Category**: Correctness / Documentation
 - **File / Function / Line**:
@@ -1449,7 +1450,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Severity**: Low
 - **Category**: Documentation
 - **File / Function / Line**:
-  - `README.md` mentions `logistics/`, `unittest/`
+  - `README.md` mentions `logistics/`, `unittest/` *(since issue #42 (2026-10-13) the README says `logistic/`)*
   - Reality: `src/agentflow/logistic/`, `unit_test/`
 - **Trigger**: New contributor follows README paths.
 - **Impact**: Confusion; commands like `python -m unittest discover -s unittest` fail.
@@ -1721,6 +1722,6 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 | R-12 | Low | High | Open | Dead signature branch in `_activate` |
 | R-17 | Low | High | Open | `dict[str, function]` |
 | R-21 | Low | High | **Resolved 2026-10-10 (issue #1)** | `wrapper.py` `VERSION` undefined |
-| R-22 | Low | High | Open | Stub / broken broker implementations |
+| R-22 | Low | High | **Resolved 2026-10-13 (issue #42)** | Stub / broken broker implementations |
 | R-23 | Low | High | Open | README / directory drift |
 | R-24 | Low | Medium | Open | Unexplained sleep in `_on_connect` |

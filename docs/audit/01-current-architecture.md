@@ -44,13 +44,15 @@ AgentFlow/
 └── AgentFlow-v20.pdf
 ```
 
+*Since issue #42 (2026-10-13): `redis_broker.py` and `ros_broker.py` derive from the new `placeholder_broker.py` and refuse to start, so an agent that selects them stops with an error; `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/`, outside the wheel. With the same change, `logistic.py` imports `agentflow.core.agent` (issue #41).*
+
 ### Naming inconsistencies
 
 | README says | Reality |
 |---|---|
 | `src/agentflow/logistics/` | `src/agentflow/logistic/` |
 | `unittest/` | `unit_test/` |
-| MQTT/DDS brokers | Only MQTT is functional; DDS/ROS/Redis are stubs or broken |
+| MQTT/DDS brokers | Only MQTT is functional; DDS/ROS/Redis are stubs or broken *(since #42: Redis/ROS refuse to start; DDS/ROS Noetic drafts in `contrib/brokers/`)* |
 
 Additional in-tree naming drift:
 - `src/agentflow/core/config.py` exposes only the module-level constant `CONCURRENCY_TYPE` (`config.py:24`), but `exe_test/*.py` and `agent_worker.py` comments refer to a `ConfigName` class and `ConfigName.START_METHOD` / `ConfigName.CONCURRENCY_TYPE` that do not exist (`exe_test/1pmc.py:8`, `exe_test/1csp.py:8`, `exe_test/mp1c.py:8`, `exe_test/mpmc.py:8`, `exe_test/mpmc-sp.py:8`, `exe_test/1psc.py:8`, `exe_test/test1.py:14`).
@@ -106,7 +108,7 @@ flowchart TD
 
 Notes:
 - `broker/__init__.py` only exposes `BrokerType`. `BrokerMaker`, `MessageBroker`, `BrokerNotifier`, `MqttBroker`, `RedisBroker`, `RosBroker`, `EmptyBroker` are imported by relative paths inside `broker_maker.py`.
-- `RosNoeticBroker` is commented out in `broker_maker.py:26–27` and has `from .. import LOGGER_NAME` (`ros_noetic_broker.py:4`) which resolves against `src/agentflow/__init__.py` (empty), so the symbol does not exist → import would fail. Not reachable from the factory.
+- `RosNoeticBroker` is commented out in `broker_maker.py:26–27` and has `from .. import LOGGER_NAME` (`ros_noetic_broker.py:4`) which resolves against `src/agentflow/__init__.py` (empty), so the symbol does not exist → import would fail. Not reachable from the factory. *Since issue #42 (2026-10-13) the file lives in `contrib/brokers/` and the commented-out factory lines are gone.*
 
 ---
 
@@ -126,11 +128,11 @@ Notes:
 | `BrokerMaker` | `src/agentflow/broker/broker_maker.py:16` | Factory from `BrokerType` to concrete broker subclass |
 | `MqttBroker` | `src/agentflow/broker/mqtt_broker.py:10` | paho-mqtt v2 wrapper; only broker with concrete behaviour |
 | `EmptyBroker` | `src/agentflow/broker/empty_broker.py:8` | No-op broker |
-| `RedisBroker` | `src/agentflow/broker/redis_broker.py:8` | Stub only |
-| `RosBroker` | `src/agentflow/broker/ros_broker.py:8` | Stub only |
-| `DdsBroker` | `src/agentflow/broker/dds_broker.py:10` | Incomplete; references undefined `_client`, `Client` symbol not imported |
-| `RosNoeticBroker` | `src/agentflow/broker/ros_noetic_broker.py:13` | Broken import; not registered in factory |
-| `Logistic` (ABC) | `src/agentflow/logistic/logistic.py:7` | 20-line skeleton; `from agent import Agent` (line 5) is not a valid import path from this package |
+| `RedisBroker` | `src/agentflow/broker/redis_broker.py:8` | Stub only *(since #42: a `PlaceholderBroker` that refuses to start)* |
+| `RosBroker` | `src/agentflow/broker/ros_broker.py:8` | Stub only *(since #42: a `PlaceholderBroker` that refuses to start)* |
+| `DdsBroker` | `src/agentflow/broker/dds_broker.py:10` | Incomplete; references undefined `_client`, `Client` symbol not imported *(since #42: moved to `contrib/brokers/`)* |
+| `RosNoeticBroker` | `src/agentflow/broker/ros_noetic_broker.py:13` | Broken import; not registered in factory *(since #42: moved to `contrib/brokers/`)* |
+| `Logistic` (ABC) | `src/agentflow/logistic/logistic.py:7` | 20-line skeleton; `from agent import Agent` (line 5) is not a valid import path from this package *(since #41: imports `agentflow.core.agent`)* |
 | `Wrapper` | `src/agentflow/core/wrapper.py:6` | Uses `VERSION` symbol never defined in module → `TextWrapper.wrap` raises `NameError` on invocation; likely dead code |
 
 ---
@@ -210,6 +212,8 @@ From `requirements.txt`:
 Not declared but referenced in code:
 - `rticonnextdds_connector` (imported at top of `broker/dds_broker.py:1`; the module is unusable without it, and even with it, the class body references `_client`/`Client` that are never defined)
 - `rospy`, `std_msgs.msg` (imported at top of `broker/ros_noetic_broker.py:1–2`)
+
+*Since issue #42 (2026-10-13) both modules live in `contrib/brokers/`, outside the wheel.*
 
 Stdlib usage of note: `multiprocessing` with `spawn` start method forced in `Worker.__init__` (`agent_worker.py:13–14`), `pickle` in `BinaryParcel` / legacy `Wrapper`.
 
