@@ -152,13 +152,13 @@ def test_setstate_reinstates_fresh_handlers_lock_and_dispatcher_init_lock():
         pass
 
 
-def test_setstate_reinstates_None_broker_dispatcher_agent_worker_message_broker():
+def test_setstate_reinstates_None_broker_dispatcher_agent_worker():
+    # Issue #75: the unused _message_broker attribute was removed.
     agent = Agent(name='runtime-fresh', agent_config={})
     revived = pickle.loads(pickle.dumps(agent))
     assert revived._broker is None
     assert revived._dispatcher is None
     assert revived._agent_worker is None
-    assert revived._message_broker is None
 
 
 def test_setstate_reinstates_empty_children_and_parents():
