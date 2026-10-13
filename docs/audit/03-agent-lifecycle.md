@@ -132,7 +132,7 @@ Observations:
 - The signature branch `elif isinstance(sig.parameters.get('self'), Agent)` (`agent.py:222`) is **always false** — `sig.parameters['self']` returns a `Parameter` object, not an Agent. Dead branch (Risk R-12).
 - User exceptions in `on_activate` are not caught — they propagate up and kill the worker without notifying the parent process (Risk R-07 related).
 - `KeyboardInterrupt` inside `work_queue.get` triggers `self._terminate()` (agent.py:236). No other exception is caught in the loop.
-- *Since issue #70 (2026-10-13), a subclass that overrides the 2025.5.24 hook `on_begining()` has it called right after `on_activating()`; the first time per class a `DeprecationWarning` and a WARNING log say to rename it.*
+- *Since issue #70 (2026-10-13), a subclass that overrides the 2025.5.24 hook `on_begining()` has it called right after `on_activating()`; the first time per class and process a WARNING log and a `DeprecationWarning` (pointing at the override) say to rename it. A class that defines `on_activating` next to its `on_begining` was written for both versions, and only `on_activating` runs.*
 
 ### Broker retry policy
 
