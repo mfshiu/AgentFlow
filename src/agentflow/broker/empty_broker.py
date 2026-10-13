@@ -1,4 +1,6 @@
 import logging, os
+from agentflow.logging import log_publish, redact_config
+
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 from .message_broker import MessageBroker
@@ -16,7 +18,8 @@ class EmptyBroker(MessageBroker):
     
     
     def start(self, options:dict):
-        logger.info(f"Empty broker is starting. options:{options}")
+        logger.info("Empty broker is starting.")
+        logger.debug("Empty broker options: %s", redact_config(options))
        
 
     def stop(self):
@@ -24,7 +27,7 @@ class EmptyBroker(MessageBroker):
 
 
     def publish(self, topic:str, payload, *, qos: int = 0, retain: bool = False):
-        logger.info(f"topic: {topic}, payload: {payload}")
+        log_publish(logger, topic, payload)
         
     
     def subscribe(self, topic:str, data_type, *, qos: int = 0):

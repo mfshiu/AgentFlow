@@ -31,6 +31,7 @@ from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker, WorkerState
 from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
+from agentflow.logging import redact_config
 
 
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -158,15 +159,6 @@ class _HolonOptions:
     control_max_age: float = _DEFAULT_CONTROL_MAX_AGE_S
     max_children: Optional[int] = None
     trust_unregistered_parents: bool = False
-
-
-def _config_for_log(cfg):
-    """Issue #13: `cfg` with holon.control_secret masked, for logging.
-    Other credentials in the config are #14."""
-    holon = cfg.get('holon') if isinstance(cfg, dict) else None
-    if isinstance(holon, dict) and holon.get('control_secret') is not None:
-        return {**cfg, 'holon': {**holon, 'control_secret': '***'}}
-    return cfg
 
 
 class TopicWaitCollisionError(RuntimeError):
@@ -327,7 +319,7 @@ class Agent(BrokerNotifier):
         # Issue #75: None, not a mutable default shared by every Agent.
         if agent_config is None:
             agent_config = {}
-        logger.debug(f'name: {name}, agent_config: {_config_for_log(agent_config)}')
+        logger.debug('name: %s, agent_config: %s', name, redact_config(agent_config))
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
         logger.debug(f'agent_id: {self.agent_id}')
@@ -590,7 +582,7 @@ class Agent(BrokerNotifier):
         # change of default.
         self.config.pop(config.CONCURRENCY_TYPE, None)
         self.config.update(agent_config)
-        logger.debug(f'self.config: {_config_for_log(self.config)}')
+        logger.debug('self.config: %s', redact_config(self.config))
 
 
     def __parse_codec_config(self):
@@ -810,7 +802,8 @@ class Agent(BrokerNotifier):
             # with a fresh worker (e.g. start_thread() after start_process()
             # failed), instead of refusing to restart the failed one.
             self._agent_worker = None
-        logger.info(self.M(f"self.config: {_config_for_log(self.config)}"))
+        logger.info(self.M("Starting agent."))
+        logger.debug(self.M("self.config: %s"), redact_config(self.config))
         self.work_process = self._get_worker().start()
         
         self._on_start()
@@ -1150,7 +1143,7 @@ class Agent(BrokerNotifier):
         if not broker_config_all or not isinstance(broker_config_all, dict):
             logger.error(self.M("Broker configuration is missing or invalid."))
             return False
-        logger.debug(self.M(f"broker_config_all: {broker_config_all}"))
+        logger.debug(self.M("broker_config_all: %s"), redact_config(broker_config_all))
         broker_name = broker_config_all['broker_name']
         broker_config = broker_config_all[broker_name]
         
