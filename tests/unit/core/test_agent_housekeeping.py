@@ -24,33 +24,26 @@ from agentflow.core.agent import Agent
 from agentflow.core.dispatcher import LegacyPerMessageDispatcher
 from tests.fakes.fake_bus import FakeBus
 
-xfail_75 = pytest.mark.xfail(strict=True, reason='issue #75: dead code')
 
-
-@xfail_75
 def test_agent_config_defaults_to_none_not_a_shared_dict():
     assert inspect.signature(Agent.__init__).parameters['agent_config'].default is None
     assert Agent('a').config == Agent('b').config
 
 
-@xfail_75
 def test_the_unused_message_broker_attribute_is_gone():
     assert not hasattr(Agent('a', {}), '_message_broker')
 
 
-@xfail_75
 def test_the_dispatcher_init_lock_keeps_its_type_across_pickling():
     agent = Agent('a', {})
     revived = pickle.loads(pickle.dumps(agent))
     assert type(revived._dispatcher_init_lock) is type(agent._dispatcher_init_lock)
 
 
-@xfail_75
 def test_the_on_start_hook_is_documented():
     assert Agent._on_start.__doc__
 
 
-@xfail_75
 def test_the_legacy_dispatcher_stop_reports_running_handlers():
     dispatcher = LegacyPerMessageDispatcher()
     release = threading.Event()

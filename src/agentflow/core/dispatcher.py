@@ -366,15 +366,32 @@ class LegacyPerMessageDispatcher:
     scheduled for removal in the release after next.
     """
 
+    def __init__(self) -> None:
+        # Issue #75: the handler threads still running, so that stop()
+        # can report them.
+        self._threads: List[threading.Thread] = []
+        self._threads_lock = threading.Lock()
+
     def enqueue(self, task: Callable[[], None], *, topic: Any = None) -> bool:
-        threading.Thread(target=task).start()
+        thread = threading.Thread(target=task)
+        with self._threads_lock:
+            self._threads = [t for t in self._threads if t.is_alive()]
+            self._threads.append(thread)
+        thread.start()
         return True
 
     def stop(self, timeout_s: Optional[float] = None) -> bool:
-        # Pre-RFC-004 Agent.terminate did not join handler threads;
-        # preserved here as no-op. Returns True unconditionally so
-        # callers cannot distinguish this from a clean shutdown.
-        return True
+        """Returns whether every handler thread has finished (issue #75;
+        it used to return True regardless). Without `timeout_s` it does
+        not wait, as pre-RFC-004 Agent.terminate never joined handler
+        threads; with one, it waits for them up to that long."""
+        with self._threads_lock:
+            threads = list(self._threads)
+        if timeout_s is not None:
+            deadline = time.monotonic() + timeout_s
+            for thread in threads:
+                thread.join(max(0.0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in threads)
 
     def metrics_snapshot(self) -> Dict[str, int]:
         return {
