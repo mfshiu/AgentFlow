@@ -31,7 +31,6 @@ def _setup_keyword(name):
     return values[0] if values else None
 
 
-@xfail_50
 def test_the_license_is_mit_and_names_its_holder():
     text = (REPO_ROOT / 'LICENSE.md').read_text(encoding='utf-8')
     assert text.lstrip().startswith('MIT License')
@@ -39,7 +38,6 @@ def test_the_license_is_mit_and_names_its_holder():
     assert 'Permission is hereby granted, free of charge' in text
 
 
-@xfail_50
 def test_setup_declares_the_mit_license():
     assert _setup_keyword('license') == 'MIT'
 
