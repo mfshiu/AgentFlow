@@ -75,8 +75,9 @@ source = ["agentflow"]
 branch = true
 
 [tool.coverage.report]
-# Measured 72% on 2026-10-11 and 89.6% in CI (ubuntu, Python 3.13) on
-# 2026-10-13 (issue #12); the margin absorbs platform differences.
+# Measured 72% on 2026-10-11, and 89.6% by CI on main (ubuntu, Python
+# 3.13) on 2026-10-13; raised by issue #12. The margin absorbs platform
+# differences.
 # Raise it as coverage grows.
 fail_under = 85
 skip_covered = true

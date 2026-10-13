@@ -30,7 +30,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-*Issue #12 (2026-10-14): `tests/wire/test_downstream_usage_wire.py` runs FlowDepot's request style (`subscribe(topic, "str", handler)`, a `BinaryParcel` with `topic_return`, the reply in `on_message`) and process-mode (spawned) agents, a service and a holon child, against the loopback server. `unit_test/README.md` marks that folder as quarantined. The coverage floor (`fail_under` in `pyproject.toml`) is 85%; CI measured 89.6% on ubuntu / Python 3.13.*
+*Issue #12 (2026-10-14): `tests/wire/test_downstream_usage_wire.py` runs FlowDepot's request style (`subscribe(topic, "str", handler)`, a `BinaryParcel` with `topic_return`, the reply in `on_message`) and process-mode (spawned) agents, a service and a holon child, against the loopback server. `unit_test/README.md` marks that folder as quarantined. The coverage floor (`fail_under` in `pyproject.toml`) is now 85%; CI had measured 89.6% on main (ubuntu / Python 3.13) just before.*
 
 Historical command (single Linux conda environment):
 
