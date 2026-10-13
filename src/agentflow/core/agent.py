@@ -1108,6 +1108,11 @@ class Agent(BrokerNotifier):
                 for _ in range(interval):
                     if self.__terminate_event.is_set(): return False
                     time.sleep(1)
+            except NotImplementedError as e:
+                # Issue #42: a reserved broker type (redis, ros). The
+                # same configuration can never start, so stop now.
+                logger.error(self.M(f"Broker not available: {e}"))
+                return False
             except Exception as e:
                 logger.exception(self.M(f"Unexpected error starting broker: {e}"))
                 return False

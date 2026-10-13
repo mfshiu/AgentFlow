@@ -31,8 +31,6 @@ from agentflow.broker.redis_broker import RedisBroker
 from agentflow.broker.ros_broker import RosBroker
 from agentflow.core.agent import Agent
 
-xfail_42 = pytest.mark.xfail(strict=True, reason='issue #42: placeholder brokers')
-xfail_41_42 = pytest.mark.xfail(strict=True, reason='issues #41, #42: modules that cannot be imported')
 
 PLACEHOLDERS = [('redis', RedisBroker), ('ros', RosBroker)]
 
@@ -55,7 +53,6 @@ def _wait_until(predicate, timeout_s):
     return predicate()
 
 
-@xfail_42
 @pytest.mark.parametrize('broker_type', [name for name, _ in PLACEHOLDERS])
 def test_an_agent_on_a_placeholder_broker_stops_instead_of_running(broker_type, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
@@ -84,7 +81,6 @@ def test_an_agent_on_a_placeholder_broker_stops_instead_of_running(broker_type, 
         _wait_until(lambda: not agent.is_active(), 5.0)
 
 
-@xfail_42
 @pytest.mark.parametrize('broker_class', [cls for _, cls in PLACEHOLDERS])
 def test_a_placeholder_broker_refuses_to_start_publish_or_subscribe(broker_class):
     broker = broker_class(mock.Mock())
@@ -97,7 +93,6 @@ def test_a_placeholder_broker_refuses_to_start_publish_or_subscribe(broker_class
     broker.stop()  # deactivation still calls stop(); it must not raise
 
 
-@xfail_41_42
 def test_every_module_in_the_package_can_be_imported():
     failures = {}
     for info in pkgutil.walk_packages(agentflow.__path__, 'agentflow.'):

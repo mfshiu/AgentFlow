@@ -8,6 +8,8 @@ from .message_broker import PublishBackpressureError
 
 
 class BrokerType(Enum):
+    """Only MQTT carries messages. Empty is a no-op for tests; Redis
+    and ROS are reserved names whose brokers refuse to start (#42)."""
     Redis = "redis"
     MQTT = "mqtt"
     ROS = "ros"
