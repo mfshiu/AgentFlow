@@ -37,9 +37,6 @@ import agentflow.core.agent as agent_module
 from agentflow.core.agent import Agent
 from agentflow.core.agent_worker import WorkerState
 
-xfail_70r = pytest.mark.xfail(strict=True, reason='issue #70 review')
-
-
 def _config():
     return {
         'CONCURRENCY_TYPE': 'thread',
@@ -105,7 +102,6 @@ def _on_begining_warnings(caught):
             and 'on_begining' in str(w.message)]
 
 
-@xfail_70r
 def test_get_logger_warns_and_returns_the_framework_logger(monkeypatch):
     monkeypatch.setenv('LOGGER_NAME', 'renamed_after_import')
     with pytest.warns(DeprecationWarning, match='get_logger') as record:
@@ -153,7 +149,6 @@ def test_an_overridden_on_begining_runs_once_between_on_activating_and_on_activa
     assert 'on_activating' in logged[0].getMessage()
 
 
-@xfail_70r
 def test_the_warning_passes_the_main_filter_in_a_spawned_child():
     class Legacy(_Recording):
         def on_begining(self):
@@ -182,7 +177,6 @@ class _Delegating(_Recording):
         self.on_activating()
 
 
-@xfail_70r
 @pytest.mark.parametrize('cls', [_Alias, _Delegating])
 def test_a_class_written_for_both_versions_runs_on_activating_once(cls, caplog):
     caplog.set_level(logging.WARNING)
@@ -195,7 +189,6 @@ def test_a_class_written_for_both_versions_runs_on_activating_once(cls, caplog):
     assert 'on_begining' not in caplog.text
 
 
-@xfail_70r
 def test_under_an_error_filter_every_agent_of_the_class_fails_alike():
     class Legacy(_Legacy):
         pass
@@ -223,7 +216,6 @@ class _HashlessMeta(type(Agent)):
     __hash__ = None  # type: ignore[assignment]
 
 
-@xfail_70r
 def test_an_unhashable_class_still_activates():
     class Legacy(_Legacy, metaclass=_HashlessMeta):
         pass

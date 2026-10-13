@@ -1,5 +1,4 @@
 import logging
-import os
 import warnings
 
 
@@ -8,21 +7,25 @@ import warnings
 # later release.
 
 def get_logger() -> logging.Logger:
-    """Deprecated: AgentFlow's modules log to
-    `logging.getLogger(os.getenv('LOGGER_NAME'))`, the root logger when
-    LOGGER_NAME is unset (2025.5.24 defaulted to 'agentflow'). This
-    returns that logger."""
+    """Deprecated: returns the logger AgentFlow's modules log to,
+    `logging.getLogger(os.getenv('LOGGER_NAME'))` as read when they were
+    imported. With LOGGER_NAME unset that is the root logger (2025.5.24
+    defaulted to 'agentflow'), so changing its level or handlers affects
+    every library. It has no `verbose()` method: 2025.5.24 patched one
+    onto logging.Logger for the whole process, and this does not."""
     warnings.warn(
         "agentflow.get_logger() is deprecated; AgentFlow logs to "
         "logging.getLogger(os.getenv('LOGGER_NAME')), use that",
         DeprecationWarning, stacklevel=2)
-    return logging.getLogger(os.getenv('LOGGER_NAME'))
+    from agentflow.core import agent
+    return agent.logger
 
 
 def ensure_size(text, max_length: int = 300):
     """Deprecated: use agentflow.core.parcel.ensure_size, which also
     turns None into ''. As in 2025.5.24, falsy input is returned
-    unchanged."""
+    unchanged; other input is converted with str() first, where
+    2025.5.24 returned or rejected non-str input as it was."""
     warnings.warn(
         "agentflow.ensure_size() is deprecated; use agentflow.core.parcel.ensure_size",
         DeprecationWarning, stacklevel=2)
