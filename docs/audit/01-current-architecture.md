@@ -44,7 +44,7 @@ AgentFlow/
 └── AgentFlow-v20.pdf
 ```
 
-*Since issue #42 (2026-10-13): `redis_broker.py` and `ros_broker.py` derive from the new `placeholder_broker.py` and refuse to start, so an agent that selects them stops with an error; `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/`, outside the wheel. With the same change, `logistic.py` imports `agentflow.core.agent` (issue #41).*
+*Since issue #42 (2026-10-13): `redis_broker.py` and `ros_broker.py` derive from the new `placeholder_broker.py` and refuse to start, so an agent that selects them logs an error and does not activate; `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/`, outside the wheel. With the same change, `logistic.py` imports `agentflow.core.agent` (issue #41).*
 
 ### Naming inconsistencies
 

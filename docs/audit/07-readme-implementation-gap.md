@@ -67,7 +67,7 @@ flowchart TB
 
 - **Orchestration Layer**: nothing in the code corresponds to this. There is no orchestrator, load balancer, or scheduling component.
 - **Agent Layer**: exists as `Agent` (`agent.py:26`), but there is no separation of Perception / Decision / Action. `Agent` is a single God-Object class (Section 1.3 of `01-current-architecture.md`).
-- **Communication Layer**: only MQTT is functional. DDS/ROS/Redis are stubs or broken (R-22). *Since issue #42, selecting Redis or ROS stops the agent with an error instead of dropping messages.*
+- **Communication Layer**: only MQTT is functional. DDS/ROS/Redis are stubs or broken (R-22). *Since issue #42, an agent that selects Redis or ROS logs an error and does not activate, instead of dropping messages.*
 
 ---
 

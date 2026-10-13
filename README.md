@@ -87,7 +87,7 @@ AgentFlow/
 │          ├── broker/    # MQTT broker (Redis/ROS names reserved)
 │          ├── core/    # Holonic agent definitions
 │          └── logistic/    # Logistics interface (stub; planned)
-├── unittest/    # AgentFlow unittests
+├── tests/    # pytest suite (unit and wire tests)
 └── README.md
 ```
 

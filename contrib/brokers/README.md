@@ -17,4 +17,4 @@ plug-in with its own tests.
 
 Today only the MQTT broker carries messages. `broker_type: redis` and
 `broker_type: ros` are reserved names: an agent that selects either
-stops at start with an error.
+logs an error and does not activate.

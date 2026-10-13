@@ -1429,7 +1429,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 
 ## R-22 — Stub / broken broker implementations reachable via `BrokerType`
 
-- **Status**: **RESOLVED** (2026-10-13) — GitHub issue #42. `RedisBroker` and `RosBroker` now derive from `PlaceholderBroker`, whose `start` / `publish` / `subscribe` raise `NotImplementedError`; `Agent.__activating` logs "Broker not available" as an error, does not retry, skips `on_activate` and the agent stops. `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/` (outside the wheel), and CI imports every module of the installed wheel. Covered by `tests/unit/test_placeholder_brokers.py`. A real DDS / ROS backend waits for the transport interface of issue #69.
+- **Status**: **RESOLVED** (2026-10-13) — GitHub issue #42. `RedisBroker` and `RosBroker` now derive from `PlaceholderBroker`, whose `start` / `publish` / `subscribe` raise `BrokerNotAvailableError` (a `NotImplementedError`); `Agent.__activating` logs "Broker not available" as an error, does not retry and skips `on_activate`, and the worker thread or child process ends. The caller is not told: in process mode the child exits with code 0 and `ProcessWorker.state` stays RUNNING until `terminate()`, as for any failed activation (issue #8). `dds_broker.py` and `ros_noetic_broker.py` moved to `contrib/brokers/` (outside the wheel), and CI imports every module of the installed wheel. Covered by `tests/unit/test_placeholder_brokers.py`. A real DDS / ROS backend waits for the transport interface of issue #69.
 - **Severity**: Low
 - **Category**: Correctness / Documentation
 - **File / Function / Line**:
@@ -1450,7 +1450,7 @@ Fixing these would require a similar lock + accessor policy for `Agent._notify_c
 - **Severity**: Low
 - **Category**: Documentation
 - **File / Function / Line**:
-  - `README.md` mentions `logistics/`, `unittest/` *(since issue #42 (2026-10-13) the README says `logistic/`)*
+  - `README.md` mentions `logistics/`, `unittest/` *(since issue #42 (2026-10-13) the README says `logistic/` and `tests/`)*
   - Reality: `src/agentflow/logistic/`, `unit_test/`
 - **Trigger**: New contributor follows README paths.
 - **Impact**: Confusion; commands like `python -m unittest discover -s unittest` fail.
