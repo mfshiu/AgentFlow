@@ -21,7 +21,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -366,15 +366,45 @@ class LegacyPerMessageDispatcher:
     scheduled for removal in the release after next.
     """
 
+    def __init__(self) -> None:
+        # Issue #75: the handler threads that have not finished, so that
+        # stop() can report them. A thread is added before it starts and
+        # removes itself when its task returns.
+        self._running: Set[threading.Thread] = set()
+        self._changed = threading.Condition()
+
     def enqueue(self, task: Callable[[], None], *, topic: Any = None) -> bool:
-        threading.Thread(target=task).start()
+        def run() -> None:
+            try:
+                task()
+            finally:
+                with self._changed:
+                    self._running.discard(threading.current_thread())
+                    self._changed.notify_all()
+
+        thread = threading.Thread(target=run)
+        with self._changed:
+            self._running.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._changed:
+                self._running.discard(thread)
+            raise
         return True
 
     def stop(self, timeout_s: Optional[float] = None) -> bool:
-        # Pre-RFC-004 Agent.terminate did not join handler threads;
-        # preserved here as no-op. Returns True unconditionally so
-        # callers cannot distinguish this from a clean shutdown.
-        return True
+        """Returns whether every handler thread has finished (issue #75;
+        it used to return True regardless), the calling handler thread
+        excepted. Without `timeout_s` it does not wait, as pre-RFC-004
+        Agent.terminate never joined handler threads; with one, it waits
+        for them up to that long."""
+        me = threading.current_thread()
+        with self._changed:
+            if timeout_s is not None:
+                self._changed.wait_for(lambda: not (self._running - {me}),
+                                       timeout=max(0.0, timeout_s))
+            return not (self._running - {me})
 
     def metrics_snapshot(self) -> Dict[str, int]:
         return {

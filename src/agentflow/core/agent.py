@@ -5,6 +5,7 @@ from collections import OrderedDict, deque
 import inspect
 import logging
 import math
+import os
 import pickle
 import queue
 import re
@@ -30,7 +31,6 @@ from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker, Wor
 from agentflow.core.dispatcher import MessageDispatcher, LegacyPerMessageDispatcher
 
 
-import logging, os
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
 
 # Issue #1: keys accepted in the optional `codec` config section.
@@ -296,7 +296,10 @@ class Agent(BrokerNotifier):
     start() without an explicit CONCURRENCY_TYPE uses 'process' and warns
     (FutureWarning) that the default will become 'thread'."""
 
-    def __init__(self, name:str, agent_config:dict={}):
+    def __init__(self, name:str, agent_config: Optional[dict] = None):
+        # Issue #75: None, not a mutable default shared by every Agent.
+        if agent_config is None:
+            agent_config = {}
         logger.debug(f'name: {name}, agent_config: {_config_for_log(agent_config)}')
         
         self.agent_id = str(uuid.uuid4()).replace("-", "")
@@ -340,7 +343,6 @@ class Agent(BrokerNotifier):
         # Issue #13: refused holon messages per kind, for logging.
         self._holon_rejections: dict = {}
 
-        self._message_broker = None
         self.__topic_handlers: dict[str, _HandlerRecord] = {}
         # RFC-006: guards atomic collision-check-and-register and
         # atomic identity-check-and-pop for publish_sync. Uses RLock
@@ -447,7 +449,6 @@ class Agent(BrokerNotifier):
         '_reply_dispatcher',
         '_broker',
         '_agent_worker',
-        '_message_broker',
         '_children',
         '_parents',
         '_holon_lock',
@@ -531,13 +532,12 @@ class Agent(BrokerNotifier):
         self._early_messages = deque()
         self._awaiting_hooks = set()
         self._gate_timer = None
-        self._dispatcher_init_lock = threading.RLock()
+        self._dispatcher_init_lock = threading.Lock()     # as in __init__ (issue #75)
         self._dispatcher = None
         self._reply_dispatcher = None
         self._reply_lane_closed = False
         self._broker = None
         self._agent_worker = None
-        self._message_broker = None
         self._children = {}
         self._parents = {}
         self._holon_lock = threading.Lock()
@@ -790,6 +790,10 @@ class Agent(BrokerNotifier):
         
         
     def _on_start(self):
+        """Hook: runs in the caller's process right after start() has
+        started the worker (in process mode, the child process has been
+        spawned; on_activate runs there, not here). Override for
+        caller-side follow-up; the default does nothing."""
         pass
         
         
@@ -1124,11 +1128,12 @@ class Agent(BrokerNotifier):
         try:
             activated = self.__activating()
             if activated:
+                # on_activate() or on_activate(config). Issue #75: a branch
+                # meant to pass the agent itself never ran (a bound
+                # method's signature has no 'self') and was removed.
                 sig = inspect.signature(self.on_activate)
                 if len(sig.parameters) == 0:
                     self.on_activate()
-                elif isinstance(sig.parameters.get('self'), Agent):
-                    self.on_activate(self)
                 else:
                     self.on_activate(self.config)
         finally:
@@ -1280,7 +1285,6 @@ class Agent(BrokerNotifier):
 # =====================
     class DataEvent:
         def __init__(self, event=None):
-            import threading
             self.event = event if event is not None else threading.Event()
             self.data: 'Parcel' = None  # type: ignore
 

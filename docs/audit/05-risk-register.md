@@ -364,7 +364,7 @@ The first `_on_message` call constructs the dispatcher under the lock; concurren
 - **Per-topic serial queue** (RFC-004 Option E): same-topic ordering is not enforced. Deferred to a follow-up RFC iff ordering becomes required.
 - **ProcessWorker dispatcher semantics**: dispatcher is per-Agent-instance; in a hypothetical ProcessWorker future, dispatcher would live in the child process. Out of RFC-004 scope.
 - **External metrics export** (Prometheus / OpenTelemetry): only in-process attributes + log lines are exposed.
-- **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`.
+- **Legacy `per_message_thread` mode removal**: escape hatch is deprecated but still functional; RFC-004 §7.13 targets removal in Release N+2 with a hard `ValueError`. *Since issue #75 (2026-10-13), its `stop()` reports whether its handler threads have finished, instead of always `True`; it waits for them only when given a timeout. A handler thread is tracked from before it starts until its task returns, so concurrent enqueues cannot hide one, and `stop()` from a handler leaves that handler out.*
 - **`publish_sync` inside a handler** (issue #7, found 2026-10-09): the reply was queued for the same consumers, one of which the waiting handler held, so nested calls timed out. *Resolved 2026-10-12 (#7):*
   - *Replies have their own one-consumer lane (RFC-004 §9 amended), with a byte budget of their own and a queue of at least 1024.*
   - *Verified by `tests/unit/core/test_publish_sync_in_handlers.py` and `tests/wire/test_publish_sync_in_handler_wire.py`.*
@@ -464,9 +464,9 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 **Agent pickle protocol** (`src/agentflow/core/agent.py`):
 
-- `Agent.__getstate__` / `__setstate__` implement the pickle protocol. A `_RUNTIME_ONLY_FIELDS` whitelist excludes non-picklable / not-meaningful-in-child fields: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`.
-- `__getstate__` **probes every remaining field for picklability**: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests moving the handler / callback into `on_activate()`. **Fail-fast** — no silent omission.
-- `__setstate__` reinstates every runtime-only field fresh: new `threading.RLock` × 2, `None` for `_broker` / `_dispatcher` / `_agent_worker` / `_message_broker`, empty `{}` for `_children` / `_parents`. The RFC-006 / RFC-007 `_HandlerRecord` ownership shape survives pickle; only the guarding lock is rebuilt.
+- `Agent.__getstate__` / `__setstate__` implement the pickle protocol. A `_RUNTIME_ONLY_FIELDS` whitelist excludes non-picklable / not-meaningful-in-child fields: `_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`. *Since issue #75 (2026-10-13) `_message_broker` no longer exists, and later issues added more fields; `Agent._RUNTIME_ONLY_FIELDS` is the current list.*
+-  `__getstate__` **probes every remaining field for picklability**: `config` as a whole; every `_HandlerRecord.handler` in `__topic_handlers` individually. On failure, raises `TypeError` naming the offending topic (or `Agent.config`) and suggests moving the handler / callback into `on_activate()`. **Fail-fast** — no silent omission.
+- `__setstate__` reinstates every runtime-only field fresh: new `threading.RLock` × 2, `None` for `_broker` / `_dispatcher` / `_agent_worker` / `_message_broker`, empty `{}` for `_children` / `_parents`. *Since issue #75, `_dispatcher_init_lock` is rebuilt as a `Lock`, as in `__init__`, and `_message_broker` is gone.* The RFC-006 / RFC-007 `_HandlerRecord` ownership shape survives pickle; only the guarding lock is rebuilt.
 
 **ProcessWorker lifecycle** (`src/agentflow/core/agent_worker.py`):
 
@@ -491,7 +491,7 @@ R-05 was upgraded from "suspected" to "confirmed by runtime evidence" via `tests
 
 ### Pickle contract (R-06.1)
 
-- Runtime-only fields (`_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker`, `_children`, `_parents`) are **excluded** from `__getstate__` and reinstated fresh in `__setstate__`.
+- Runtime-only fields (`_handlers_lock`, `_dispatcher_init_lock`, `_dispatcher`, `_broker`, `_agent_worker`, `_message_broker` *(removed in #75)*, `_children`, `_parents`) are **excluded** from `__getstate__` and reinstated fresh in `__setstate__`.
 - `_children` / `_parents` are rebuilt as empty `{}` in the child. Populated by broker callbacks after the child's `_activate` runs.
 - Non-picklable handler in `__topic_handlers` → `TypeError` at `start()` naming the offending topic.
 - Non-picklable value in `config` → `TypeError` at `start()` naming `Agent.config`.
