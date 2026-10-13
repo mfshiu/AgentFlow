@@ -84,6 +84,15 @@ def test_supported_versions_are_accepted(encode, version):
     assert (parcel.version, parcel.content) == (version, 'x')
 
 
+@pytest.mark.parametrize('parcel_class', [TextParcel, BinaryParcel])
+def test_non_ascii_text_and_bytes_round_trip(parcel_class):
+    # Issue #12: what the quarantined unit_test/test_parcel.py checked.
+    for content in ('早安, Anita.', {'greeting': 'Grüß dich', 'tags': ['ünïcödé']}):
+        assert Parcel.from_payload(parcel_class(content).payload()).content == content
+    if parcel_class is BinaryParcel:
+        assert Parcel.from_payload(parcel_class(b'Hello').payload()).content == b'Hello'
+
+
 @pytest.mark.parametrize('encode', [_text, _binary], ids=['text', 'binary'])
 def test_unknown_envelope_keys_are_ignored(encode):
     parcel = Parcel.from_payload(encode({'version': VERSION, 'content': 'x', 'added_later': 1}))

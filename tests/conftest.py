@@ -7,6 +7,11 @@ Design constraints (Phase 1):
     variable.
   - All paho.mqtt.client.Client interactions must go through a MagicMock
     injected by the `patched_client_class` fixture.
+
+These held for the first tests only. Tests marked `wire` run a real paho
+client against tests/fakes/mini_mqtt_server.py on 127.0.0.1, and some
+tests spawn worker processes (e.g. tests/wire/test_downstream_usage_wire.py,
+tests/unit/core/test_process_worker_lifecycle.py), issue #12.
 """
 
 from unittest.mock import MagicMock
