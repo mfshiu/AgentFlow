@@ -105,3 +105,17 @@ jobs:
           from agentflow.broker.mqtt_broker import MqttBroker
           print('wheel import OK')
           "
+      # Issues #41, #42: every module the wheel ships must import.
+      - name: Import every module in the wheel
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" - <<'PY'
+          import importlib, pkgutil
+          import agentflow
+          assert 'site-packages' in agentflow.__path__[0], agentflow.__path__
+          names = [m.name for m in pkgutil.walk_packages(agentflow.__path__, 'agentflow.')]
+          for name in names:
+              importlib.import_module(name)
+          assert 'agentflow.core.agent' in names, names
+          print('imported', len(names), 'modules')
+          PY

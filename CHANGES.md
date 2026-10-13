@@ -10,6 +10,25 @@ Versions are date-based: `YYYY.M.D`, the release date without leading zeros, opt
 coming from 2025.5.24, also read the notes under 2025.8.22.1933. Numbers such as (#4) are issues or pull requests in
 [mfshiu/AgentFlow](https://github.com/mfshiu/AgentFlow); RFC-0NN documents are in `docs/rfc/`.
 
+## Unreleased
+
+### Breaking changes
+
+- `broker_type: redis` and `broker_type: ros` name reserved brokers that refuse to start: the agent logs "Broker not available" and does not activate. Before, it activated, ran `on_activate` and silently dropped every message (#42).
+  Migration: use `mqtt`, or `empty` for a broker that drops everything (e.g. in tests).
+
+### Added
+
+- `BrokerNotAvailableError`, a `NotImplementedError`, exported from `agentflow.broker` (#42).
+
+### Fixed
+
+- `agentflow.logistic.logistic` can be imported; it imported a top-level `agent` module (#41).
+
+### Packaging
+
+- The wheel no longer ships `agentflow.broker.dds_broker` and `agentflow.broker.ros_noetic_broker`, which could not work; the drafts are in `contrib/brokers/` (#42). CI imports every module of the installed wheel.
+
 ## 2026.10.13 - 2026-10-13
 
 Changes since 2025.8.22.1933: the reliability work of RFC-001 to RFC-013 (July-August 2026) and the fixes from the

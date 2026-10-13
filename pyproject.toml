@@ -52,9 +52,6 @@ packages = ["agentflow"]
 ignore_missing_imports = true
 warn_unused_configs = true
 exclude = [
-    # Broken optional backends, tracked in #42.
-    '^src/agentflow/broker/dds_broker\.py$',
-    '^src/agentflow/broker/ros_noetic_broker\.py$',
     # Deleted by #82 (issue #1).
     '^src/agentflow/core/wrapper\.py$',
 ]
