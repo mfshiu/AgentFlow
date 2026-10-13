@@ -16,10 +16,6 @@ import ast
 import pathlib
 import re
 
-import pytest
-
-xfail_50 = pytest.mark.xfail(strict=True, reason='issue #50: license, version, changelog')
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
@@ -42,7 +38,6 @@ def test_setup_declares_the_mit_license():
     assert _setup_keyword('license') == 'MIT'
 
 
-@xfail_50
 def test_the_changelog_describes_the_declared_version():
     version = _setup_keyword('version')
     changes = (REPO_ROOT / 'CHANGES.md').read_text(encoding='utf-8')
