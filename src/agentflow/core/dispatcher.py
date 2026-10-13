@@ -21,7 +21,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 
 logger = logging.getLogger(os.getenv('LOGGER_NAME'))
@@ -367,31 +367,44 @@ class LegacyPerMessageDispatcher:
     """
 
     def __init__(self) -> None:
-        # Issue #75: the handler threads still running, so that stop()
-        # can report them.
-        self._threads: List[threading.Thread] = []
-        self._threads_lock = threading.Lock()
+        # Issue #75: the handler threads that have not finished, so that
+        # stop() can report them. A thread is added before it starts and
+        # removes itself when its task returns.
+        self._running: Set[threading.Thread] = set()
+        self._changed = threading.Condition()
 
     def enqueue(self, task: Callable[[], None], *, topic: Any = None) -> bool:
-        thread = threading.Thread(target=task)
-        with self._threads_lock:
-            self._threads = [t for t in self._threads if t.is_alive()]
-            self._threads.append(thread)
-        thread.start()
+        def run() -> None:
+            try:
+                task()
+            finally:
+                with self._changed:
+                    self._running.discard(threading.current_thread())
+                    self._changed.notify_all()
+
+        thread = threading.Thread(target=run)
+        with self._changed:
+            self._running.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._changed:
+                self._running.discard(thread)
+            raise
         return True
 
     def stop(self, timeout_s: Optional[float] = None) -> bool:
         """Returns whether every handler thread has finished (issue #75;
-        it used to return True regardless). Without `timeout_s` it does
-        not wait, as pre-RFC-004 Agent.terminate never joined handler
-        threads; with one, it waits for them up to that long."""
-        with self._threads_lock:
-            threads = list(self._threads)
-        if timeout_s is not None:
-            deadline = time.monotonic() + timeout_s
-            for thread in threads:
-                thread.join(max(0.0, deadline - time.monotonic()))
-        return not any(thread.is_alive() for thread in threads)
+        it used to return True regardless), the calling handler thread
+        excepted. Without `timeout_s` it does not wait, as pre-RFC-004
+        Agent.terminate never joined handler threads; with one, it waits
+        for them up to that long."""
+        me = threading.current_thread()
+        with self._changed:
+            if timeout_s is not None:
+                self._changed.wait_for(lambda: not (self._running - {me}),
+                                       timeout=max(0.0, timeout_s))
+            return not (self._running - {me})
 
     def metrics_snapshot(self) -> Dict[str, int]:
         return {

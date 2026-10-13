@@ -25,8 +25,6 @@ from agentflow.core.agent import Agent
 from agentflow.core.dispatcher import LegacyPerMessageDispatcher
 from tests.fakes.fake_bus import FakeBus
 
-xfail_75r = pytest.mark.xfail(strict=True, reason='issue #75 review: fixed in the next commit')
-
 
 def test_agent_config_defaults_to_none_not_a_shared_dict():
     assert inspect.signature(Agent.__init__).parameters['agent_config'].default is None
@@ -84,7 +82,6 @@ class _DelayedFirstStart:
         return getattr(threading, name)
 
 
-@xfail_75r
 def test_the_legacy_dispatcher_tracks_a_handler_enqueued_concurrently(monkeypatch):
     from agentflow.core import dispatcher as dispatcher_module
     delayed = _DelayedFirstStart()
@@ -107,7 +104,6 @@ def test_the_legacy_dispatcher_tracks_a_handler_enqueued_concurrently(monkeypatc
     assert dispatcher.stop(timeout_s=5.0) is True
 
 
-@xfail_75r
 def test_the_legacy_dispatcher_stop_from_a_handler_does_not_raise():
     dispatcher = LegacyPerMessageDispatcher()
     outcome = []
