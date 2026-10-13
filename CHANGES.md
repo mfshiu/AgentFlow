@@ -21,6 +21,13 @@ coming from 2025.5.24, also read the notes under 2025.8.22.1933. Numbers such as
 
 - `BrokerNotAvailableError`, a `NotImplementedError`, exported from `agentflow.broker` (#42).
 
+### Deprecated
+
+- `agentflow.get_logger()` and `agentflow.ensure_size()`, removed in 2025.8.22.1933 without notice, are back as aliases that raise `DeprecationWarning` (#70).
+  Migration: use `logging.getLogger(os.getenv('LOGGER_NAME'))` and `agentflow.core.parcel.ensure_size`. `Logger.verbose` is not restored.
+- `Agent.on_begining()`, renamed `on_activating()` in 2025.8.22.1933 without notice: an override runs again, right after `on_activating()`, with a WARNING log and a `DeprecationWarning` once per class and process. A class that also defines `on_activating()` runs only that (#70).
+  Migration: rename the override to `on_activating()`.
+
 ### Fixed
 
 - `agentflow.logistic.logistic` can be imported; it imported a top-level `agent` module (#41).
