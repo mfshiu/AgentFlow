@@ -39,8 +39,6 @@ from agentflow.broker.ros_broker import RosBroker
 from agentflow.core.agent import Agent
 
 
-xfail_42r = pytest.mark.xfail(strict=True, reason='issue #42 review: BrokerNotAvailableError')
-
 PLACEHOLDERS = [('redis', RedisBroker), ('ros', RosBroker)]
 
 
@@ -98,7 +96,6 @@ class _UnfinishedBroker(EmptyBroker):
         raise NotImplementedError('some broker feature')
 
 
-@xfail_42r
 def test_another_not_implemented_error_is_still_reported_as_unexpected(caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(BrokerMaker, 'create_broker',
@@ -120,7 +117,6 @@ def test_another_not_implemented_error_is_still_reported_as_unexpected(caplog, m
         _wait_until(lambda: not agent.is_active(), 5.0)
 
 
-@xfail_42r
 @pytest.mark.parametrize('broker_class', [cls for _, cls in PLACEHOLDERS])
 def test_a_placeholder_broker_refuses_to_start_publish_or_subscribe(broker_class):
     unavailable = placeholder_broker.BrokerNotAvailableError

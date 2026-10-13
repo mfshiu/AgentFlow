@@ -1,22 +1,28 @@
 from .message_broker import MessageBroker
 
 
+class BrokerNotAvailableError(NotImplementedError):
+    """The selected broker type is reserved but not implemented (issue
+    #42). The agent gives up its start: no retry, no traceback."""
+
+
 class PlaceholderBroker(MessageBroker):
     """A broker type that is reserved but not implemented (issue #42).
 
     These brokers used to log and drop every message while the agent
     reported the broker as started, so a misconfigured agent looked
     healthy and publish_sync only timed out. They now refuse to start,
-    publish or subscribe: an agent that selects one stops at once, with
-    an error naming the backend. Only the MQTT broker carries messages.
+    publish or subscribe: an agent that selects one fails to activate,
+    logs an error naming the backend, and its worker ends. Only the MQTT broker carries messages;
+    unsubscribe() stays the inherited no-op, as nothing was subscribed.
     """
 
     backend = 'placeholder'
 
-    def _not_implemented(self) -> NotImplementedError:
-        return NotImplementedError(
-            f"The '{self.backend}' broker is not implemented; "
-            f"use broker_type 'mqtt' (see issue #42).")
+    def _not_implemented(self) -> BrokerNotAvailableError:
+        return BrokerNotAvailableError(
+            f"The '{self.backend}' broker is not implemented; use broker_type "
+            f"'mqtt', or 'empty' for a broker that drops everything (see issue #42).")
 
 
     ###################################

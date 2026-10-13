@@ -25,6 +25,7 @@ from agentflow.broker import BrokerType
 from agentflow.broker.notifier import BrokerNotifier
 from agentflow.broker.broker_maker import BrokerMaker
 from agentflow.broker.message_broker import PublishBackpressureError, check_filter, check_qos
+from agentflow.broker.placeholder_broker import BrokerNotAvailableError
 from agentflow.core import config
 from agentflow.core.config import EventHandler
 from agentflow.core.agent_worker import Worker, ProcessWorker, ThreadWorker, WorkerState
@@ -1108,7 +1109,7 @@ class Agent(BrokerNotifier):
                 for _ in range(interval):
                     if self.__terminate_event.is_set(): return False
                     time.sleep(1)
-            except NotImplementedError as e:
+            except BrokerNotAvailableError as e:
                 # Issue #42: a reserved broker type (redis, ros). The
                 # same configuration can never start, so stop now.
                 logger.error(self.M(f"Broker not available: {e}"))
