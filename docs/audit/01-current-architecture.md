@@ -150,6 +150,7 @@ Name-mangled (double-underscore) methods and fields — treated as private:
 
 User-override hooks (documented behaviour is "override in subclass"):
 - `on_activating`, `on_activate`, `on_terminating`, `on_terminated`, `on_interval`
+- *`on_begining`: deprecated name of `on_activating`, restored by issue #70 (2026-10-13); an override is called after `on_activating` with a warning. `agentflow.get_logger()` / `agentflow.ensure_size()` are deprecated aliases too.*
 - `on_connected`, `on_message`
 - `on_register_child`, `on_register_parent`
 - `on_children_message`, `on_parents_message`
